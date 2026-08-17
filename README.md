@@ -27,6 +27,19 @@ Start with [the reproduction documentation](AUDIODSP_REPRODUCTION_DOCS/README.md
 
 The latest silent regression records are [SILENT_CALIBRATION_SELF_VALIDATION_20260818.md](AUDIODSP_REPRODUCTION_DOCS/SILENT_CALIBRATION_SELF_VALIDATION_20260818.md) and [MIMO_VALIDATION_REPORT_20260818.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_VALIDATION_REPORT_20260818.md). The algorithm, topology and correction limits are documented in [MIMO_ROOM_TUNING.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md).
 
+## References
+
+AudioDSP uses these publications and primary technical sources as design references. A reference does not imply that every method is implemented; adopted, adapted and deliberately deferred techniques are distinguished in [MIMO_ROOM_TUNING.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md).
+
+- Dirac Research, [Active Room Treatment technology overview](https://www.dirac.com/resources/art-technology) and [ART use-case definition and setup guidelines](https://www.dirac.com/wp-content/uploads/2025/05/ART_Use-case-definition-and-setup-guidelines.pdf), 2025.
+- *Compensation of Loudspeaker–Room Responses in a Robust MIMO Control Framework*, IEEE/ACM Transactions on Audio, Speech, and Language Processing, [doi:10.1109/TASL.2013.2245650](https://doi.org/10.1109/TASL.2013.2245650), 2013.
+- S. Koyama and K. Arikawa, *Weighted Pressure Matching Based on Kernel Interpolation for Sound Field Reproduction*, [arXiv:2210.14711](https://arxiv.org/abs/2210.14711), 2022.
+- Y. S. Chen and M. R. Bai, *Weighted Acoustic Model Matching with Kernel Interpolation for Acoustic Zone Control*, Journal of Sound and Vibration, [doi:10.1016/j.jsv.2025.119489](https://doi.org/10.1016/j.jsv.2025.119489), 2026.
+- W.-L. Lin, Y.-S. Chen, B.-R. Lai and M. R. Bai, *Multichannel Room Response Equalization with a Broadened Control Region Using a Linearly Constrained Approach and Sensor Interpolation*, Journal of the Acoustical Society of America, [doi:10.1121/10.0017721](https://doi.org/10.1121/10.0017721), 2023.
+- D. Wang, Z. Liu, Y. Han, K. Pan and Y. Shen, *Identification of Common Excess-Phase Zeros for Single-Input Multiple-Output Room Response Equalization via Ringing Quantification*, Applied Acoustics, [doi:10.1016/j.apacoust.2025.111153](https://doi.org/10.1016/j.apacoust.2025.111153), 2026.
+- T. Welti and A. Devantier, *Low-Frequency Optimization Using Multiple Subwoofers*, Journal of the Audio Engineering Society, [AES E-Library 13680](https://secure.aes.org/forum/pubs/journal/?elib=13680), 2006.
+- H. Enquist, [CamillaDSP](https://github.com/HEnquist/camilladsp): official convolution, mixer and runtime implementation documentation.
+
 ## Validation
 
 Run the matching writer with `-ValidateOnly -NoPause` before writing media. The repository also contains exhaustive isolated profile/Web tests and synthetic measurement-engine tests. Actual acoustic acceptance testing must be performed with UMIK-1 at 90° in the intended listening area and requires explicit permission before AudioDSP emits measurement sound.
