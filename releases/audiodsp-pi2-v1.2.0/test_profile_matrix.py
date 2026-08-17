@@ -660,7 +660,7 @@ def main() -> int:
             require(b"/measurement/rewind" not in measure_page, "step navigation unexpectedly discards data")
             require(b"current FIR" not in measure_page and b"data-profile=" not in measure_page, "measurement page contains another screen")
             settings_page, _ = get_bytes(base + "/settings")
-            for marker in (b"DSP Bypass", b"Front WAV", b"Rear WAV", b"chunksize", b"live_u7_status_poll", "전체 백업 · 안전 복원".encode("utf-8"), b"schema v1"):
+            for marker in (b"DSP Bypass", b"MIMO 2", b"Front WAV", b"Rear WAV", b"chunksize", b"live_u7_status_poll", "전체 백업 · 안전 복원".encode("utf-8"), b"schema v2"):
                 require(marker in settings_page, f"Settings-page marker missing: {marker!r}")
             require(b"measurement card-wide" not in settings_page and b"fir-response" not in settings_page, "settings page contains another screen")
             for page in (status_page, measure_page, settings_page):
@@ -687,7 +687,7 @@ def main() -> int:
                 backup_names = set(archive.namelist())
                 require({"manifest.json", "profile-settings.json", "correction-preferences.json", "profiles/Factory_Speaker_Front_LR.wav"}.issubset(backup_names), "full backup is missing required members")
                 backup_manifest = json.loads(archive.read("manifest.json"))
-                require(backup_manifest["format"] == "AudioDSP Backup" and backup_manifest["schema_version"] == 1, "backup schema mismatch")
+                require(backup_manifest["format"] == "AudioDSP Backup" and backup_manifest["schema_version"] == 2, "backup schema mismatch")
                 for name, item in backup_manifest["files"].items():
                     require(hashlib.sha256(archive.read(name)).hexdigest() == item["sha256"], f"backup hash mismatch: {name}")
             restore_settings_before = manager.load_settings()
@@ -753,7 +753,7 @@ def main() -> int:
             }
             (measurements / "current.json").write_text(json.dumps(browser_job), encoding="utf-8")
             result_page, _ = get_bytes(base + "/measure")
-            for marker in (b"Front WAV", b"Rear WAV", b"Front + Rear ZIP", b"measurement-result-graph", "A/B 청취 비교".encode("utf-8"), "자동 백업".encode("utf-8"), "덮어쓰기".encode("utf-8")):
+            for marker in (b"Front WAV", b"Rear WAV", "WAV + 보고서 ZIP".encode("utf-8"), b"measurement-result-graph", "A/B 청취 비교".encode("utf-8"), "자동 백업".encode("utf-8"), "덮어쓰기".encode("utf-8")):
                 require(marker in result_page, f"generated-result Web marker missing: {marker!r}")
             downloaded_front, download_headers = get_bytes(base + "/api/measurement/download/front")
             require(downloaded_front == browser_front.read_bytes(), "browser Front WAV download content mismatch")

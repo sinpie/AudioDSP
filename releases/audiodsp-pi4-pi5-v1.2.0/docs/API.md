@@ -6,7 +6,7 @@
 
 ### `GET /api/status`
 
-정규화된 settings, fallback을 반영한 resolved profile, 관리 FIR metadata, U7 selector, A/B preview 상태를 반환한다.
+정규화된 settings, fallback을 반영한 resolved profile, SISO/MIMO 관리 FIR metadata, 플랫폼 MIMO capability, U7 selector, A/B preview 상태를 반환한다.
 
 ### `GET /api/health`
 
@@ -75,13 +75,17 @@ Invoke-RestMethod -Uri 'http://audiodsp-pi2.local:8080/api/volume' -Method Put -
 | GET | `/api/measurement/download/front` | 생성 Front WAV |
 | GET | `/api/measurement/download/rear` | 생성 Rear WAV |
 | GET | `/api/measurement/download/all` | Front+Rear+manifest ZIP. 두 WAV가 있을 때만 |
+| GET | `/api/measurement/download/report-md` | 보정 가능/한계/미측정 분류가 포함된 영구 Markdown 보고서 |
+| GET | `/api/measurement/download/report-json` | 그래프·진단·검증을 포함한 전체 결과 JSON |
+
+MIMO 결과의 `/download/all`은 네 MIMO WAV, MIMO manifest, JSON/Markdown 보고서를 한 ZIP으로 반환한다.
 
 측정 실행은 현재 HTML form POST 경로를 사용한다: `/measurement/new`, `/configure`, `/level`, `/position`, `/restart-positions`, `/validation`, `/build`, `/preview`, `/restore`, `/apply`, `/cancel`, `/calibration`.
 
 `result`에는 `self_validation`(실제 FIR FFT/target-fit/전달 이득/impulse),
 `room_decay`(채널별 octave T20→RT60), `graphs.*.actual_correction_db`,
 `graphs.*.effective_target_db`, `graphs.*.decay_control_db`가 포함된다. 각 측정
-응답에는 `measurement_quality`와 `room_decay`가 저장된다.
+응답에는 `measurement_quality`, `room_decay`, `temporal`, `group_delay`가 저장된다. MIMO 결과는 `kind=mimo_2x4`, `mimo`, `mimo_files`, `room_tuning_audit`를 추가한다.
 
 ## 백업
 
@@ -98,6 +102,7 @@ JavaScript가 꺼져 있어도 다음 form POST가 동작한다.
 
 - `/volume`: `db=-60..0`
 - `/bypass`: `profile`, `enabled=on|off`
+- `/mimo-enabled`: `profile=speaker`, `enabled=on|off` (검증된 bank와 Pi4/5 필요)
 - `/rear-mode`: `profile`, `mode=copy_front|separate`
 - `/woofer-trim`: `profile`, `trim_db=-18..0`
 - `/chunksize`: `chunksize=512|1024|2048|4096`

@@ -85,6 +85,27 @@
 - Pi 2에서도 측정 녹음과 FFTW3f FIR 계산을 완료할 수 있고 진행률과 예상시간을 보여준다.
 - 설정을 바꾸지 않는 상태 조회는 불필요한 Python child process와 FFT를 반복하지 않는다.
 
+## 전체 룸 튜닝 진단과 결과 분류
+
+- 각 결과는 `Room_Tuning_Report.json`과 사람이 읽는 `Room_Tuning_Report.md`로 session에 영구 보관하고 Web에서 내려받을 수 있어야 한다.
+- 모든 항목을 `fir_correctable`, `mimo_correctable`, `limited_fir`, `limited_mimo`, `diagnostic_placement`, `physical_treatment`, `not_measured`, `not_certified`, `runtime_validation` 중 하나로 분류한다.
+- 측정 gate에는 calibration 방향, background/noise SNR, peak/clipping을 포함한다.
+- 보정 설계에는 target magnitude, 자연 저역 한계와 boost/headroom, 위치간 편차, L/R 일치, 도달시간·극성·저역 excess phase, crossover를 포함한다.
+- 시간영역 진단에는 EDT/T20뿐 아니라 C50, C80, D50, center time, direct-to-remainder, 초기 반사 창과 20~300 Hz group delay를 포함한다.
+- late reverberation, SBIR/초기반사, 비선형 왜곡·compression, directivity/off-axis, binaural/IACC, 절대 SPL·청력·층간 구조전달, clock/XRUN과 독립 post-verification을 누락하지 않는다.
+- FIR/MIMO가 직접 해결하지 못하는 항목은 성공으로 표시하지 않는다. 배치·흡음·베이스트랩·방진·출력 제한·추가 계측 같은 물리적 또는 운영상 대책을 별도로 제시한다.
+
+## MIMO 룸 보정
+
+- 실시간 MIMO는 Pi 4/5에서만 허용하고 Pi 2에서는 manager와 UI가 명시적으로 차단한다.
+- `MIMO Stereo`는 Front L/R 두 독립 actuator, `MIMO 2.1`은 Front L/R과 한 T5S, `MIMO 2.2`는 Front L/R과 독립 배치한 두 서브우퍼를 사용한다.
+- 세 청취 위치에서 각 actuator를 독립 sweep하고, 좌표 없는 세 측정점에 robust weighted complex pressure matching을 적용한다.
+- 주파수별 Tikhonov regularization, SISO prior, 자연 저역·support penalty, 공통 target phase, row-sum headroom projection과 인과 지연을 적용한다.
+- 출력 bank는 48 kHz stereo float32, 정확히 32768 taps인 WAV 네 개이며 CamillaDSP에서는 8 convolution path가 된다.
+- MIMO 범위는 기본 20~120 Hz이고 80/120/150 Hz 중 선택한다. 범위 위에서는 SISO로 부드럽게 복귀한다.
+- 결과에는 condition/coherence, target MAE, 위치간 편차, headroom, causality와 modeled modal tail을 표시한다. modal tail이 0.5 dB보다 악화되면 경고하며 잔향 개선으로 인증하지 않는다.
+- 현재 구현은 ART와 같은 다중 음원 제어 계열이지만 Dirac ART의 독점 구현과 동등하다고 주장하지 않는다. 지속 방사장 억제, 좌표 기반 wave-field control과 비선형 제어는 범위 밖이다.
+
 ## 네트워크와 이름
 
 - Pi 2는 Ethernet DHCP 전용이며 onboard Wi-Fi가 없음을 명시한다.

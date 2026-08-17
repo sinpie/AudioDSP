@@ -5,7 +5,7 @@
 Python:
 
 ```powershell
-py -3 -m py_compile .\payload\audiodsp-profile-manager.py .\payload\audiodsp-profile-web.py .\payload\audiodsp-measurement.py .\payload\audiodsp-profile-monitor.py .\test_profile_matrix.py .\test_measurement_engine.py
+py -3 -m py_compile .\payload\audiodsp-profile-manager.py .\payload\audiodsp-profile-web.py .\payload\audiodsp-measurement.py .\payload\audiodsp-mimo.py .\payload\audiodsp-profile-monitor.py .\test_profile_matrix.py .\test_measurement_engine.py .\test_mimo_runtime.py
 ```
 
 Shell:
@@ -86,7 +86,23 @@ sudo /usr/local/bin/audiodsp-measurement.py self-test-targets
 조합을 검증한다. Offline engine test는 합성 0.60초 감쇠의 Schroeder T20,
 우퍼 측정/reference -12 dB 비율, 개별 SNR, 잔향 cut-only 동작도 확인한다.
 
-## 4. 실제 Pi 무중단 배포 확인
+## 4. MIMO 무음 시험
+
+Pi4/5 배포 전 세 토폴로지의 수치 비퇴행을 확인한다. Pi2에서도 계산 fixture는 실행할 수 있지만 실시간 활성화는 별도로 차단된다.
+
+```bash
+AUDIODSP_PLATFORM_CLASS=test AUDIODSP_TARGET_DIR=/usr/local/share/audiodsp/targets \
+python3 /usr/local/bin/audiodsp-mimo.py --measurement-engine /usr/local/bin/audiodsp-measurement.py self-test
+python3 /tmp/test_mimo_runtime.py \
+  --manager /usr/local/bin/audiodsp-profile-manager.py \
+  --web /usr/local/bin/audiodsp-profile-web.py \
+  --measurement /usr/local/bin/audiodsp-measurement.py \
+  --camilladsp /usr/local/bin/camilladsp
+```
+
+첫 명령은 Stereo/2.1/2.2 각각 finite, 인과성, 최악 상관입력 row sum ≤1, 타깃 MAE·좌석편차 비퇴행, 네 WAV×32768탭을 검사한다. 두 번째는 격리된 임시 config에서 8 Conv와 2→8→4 mixer를 실제 CamillaDSP `--check`로 검사하고 Pi2 enable 거부를 확인한다. 둘 다 오디오 장치를 열거나 소리를 내지 않는다.
+
+## 5. 실제 Pi 무중단 배포 확인
 
 배포 전:
 
@@ -111,7 +127,7 @@ Invoke-RestMethod -Uri 'http://<PI-IP>:8080/api/volume' -Method Put -ContentType
 - API `actual_db=saved_db=-10`, raw117, channels8, uniform=true, hardware_applied=true
 - 음악 출력 유지
 
-## 5. 볼륨 경계 시험
+## 6. 볼륨 경계 시험
 
 자동 시험 외 수동 확인:
 
@@ -123,13 +139,13 @@ Invoke-RestMethod -Uri 'http://<PI-IP>:8080/api/volume' -Method Put -ContentType
 
 큰 음량으로 올리는 시험은 하지 않는다.
 
-## 6. 실제 측정 수락 시험
+## 7. 실제 측정 수락 시험
 
 실제 음향 시험은 사용자가 허용한 시간에만 한다.
 
 - 90° calibration serial/point 확인
 - -48 또는 -42 dBFS level check, clipping 없음, SNR OK
-- 세 위치 L/R 또는 L/R/Woofer 완료
+- 세 위치 L/R, L/R/Woofer 또는 Pi4/5의 독립 제어원 MIMO 완료
 - build progress/ETA와 Pi 응답성 유지
 - 결과 WAV 48k/float32/stereo/32768
 - maximum transfer ≤ 0 dB
@@ -138,8 +154,9 @@ Invoke-RestMethod -Uri 'http://<PI-IP>:8080/api/volume' -Method Put -ContentType
 - preview에서 기존/이번 전환, apply 전 profile hash 불변
 - apply 후 backup 생성 및 새 hash 반영
 - restore 기존 튜닝 정상
+- MIMO이면 네 WAV/manifest/report, 8 convolution, coherence/headroom, 별도 검증 위치를 추가 확인
 
-## 7. 장시간 성능
+## 8. 장시간 성능
 
 Pi 2는 10분 이상 다음을 기록한다.
 
@@ -148,3 +165,5 @@ pidstat -p "$(pgrep -x camilladsp)" 5 120
 ```
 
 XRUN, service restart, thermal throttling, 지속 90% 이상 CPU가 없어야 한다. chunksize 1024를 선택했다면 2048과 별도 비교한다. Pi 4/5도 같은 방식으로 측정하되 architecture 차이를 이유로 Pi 2 수치를 그대로 복사하지 않는다.
+
+MIMO 8-path는 Pi4/5에서 chunksize 1024 이상으로 최소 10분 측정한다. 합성 수치 PASS나 CamillaDSP parser PASS를 실제 CPU/XRUN 수락으로 대신하지 않는다.

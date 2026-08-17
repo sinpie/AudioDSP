@@ -1,6 +1,6 @@
 # 백업, 복원, 마이그레이션
 
-## Backup schema 1
+## Backup schema 2
 
 브라우저 전체 백업은 `AudioDSP_backup_YYYYMMDD-HHMMSS.zip`이다.
 
@@ -17,6 +17,11 @@
 - `profiles/Speaker_Rear_LR.wav`
 - `profiles/Headphone_Front_LR.wav`
 - `profiles/Headphone_Rear_LR.wav`
+- `profiles/mimo/MIMO_Front_Left_LR_32768.wav`
+- `profiles/mimo/MIMO_Front_Right_LR_32768.wav`
+- `profiles/mimo/MIMO_Rear_Left_LR_32768.wav`
+- `profiles/mimo/MIMO_Rear_Right_LR_32768.wav`
+- `profiles/mimo/Speaker_MIMO.json`
 - `calibration/7200660.txt`
 - `calibration/7200660_90deg.txt`
 - `README.txt`
@@ -26,7 +31,7 @@ Manifest 예:
 ```json
 {
   "format": "AudioDSP Backup",
-  "schema_version": 1,
+  "schema_version": 2,
   "app_version": "1.2.0",
   "created_unix": 0,
   "files": {
@@ -57,16 +62,17 @@ Manifest 예:
 
 ## Settings 호환
 
-Schema 1 `profile-settings.json`에는 다음 key가 정식이다.
+Schema 2 `profile-settings.json`에는 다음 key가 정식이다.
 
 - `requested_profile`
 - `chunksize`
 - `output_volume_db`
 - `bypass.speaker`, `bypass.headphone`
+- `mimo_enabled.speaker`, `mimo_enabled.headphone`
 - `rear_mode.speaker`, `rear_mode.headphone`
 - `woofer_trim_db.speaker`, `woofer_trim_db.headphone`
 
-이전 백업에 `output_volume_db`가 없으면 -10 dB default를 사용한다. Schema 1의 알 수 없는 top-level key는 보고 후 무시한다. 알려진 key의 타입/범위가 잘못되면 복원 전 검증에서 거부한다. 현재 지원 버전보다 큰 schema는 downgrade 추측 없이 거부한다.
+이전 schema 1 백업에 `output_volume_db` 또는 `mimo_enabled`가 없으면 각각 -10 dB와 false default를 사용한다. 알 수 없는 top-level key는 보고 후 무시한다. 알려진 key의 타입/범위가 잘못되면 복원 전 검증에서 거부한다. 현재 지원 버전보다 큰 schema는 downgrade 추측 없이 거부한다.
 
 볼륨은 settings에 포함되므로 복원 때 저장값도 바뀐다. 관리자 snapshot 복원은 CamillaDSP를 재시작하며 시작 래퍼가 복원된 볼륨을 적용한다.
 
@@ -92,4 +98,4 @@ Python의 `environment()`는 `AUDIODSP_<NAME>`을 먼저 보고 없으면 `GSONI
 
 ## 릴리스 간 복원
 
-Pi 2와 Pi 4/5는 앱 settings/FIR/calibration 형식이 같아 schema 1 백업을 서로 복원할 수 있다. 다만 backup의 chunksize도 그대로 복원되므로 Pi 2에 1024를 옮긴 경우 부하를 확인하고 2048로 되돌리는 것이 권장된다. OS 이미지, SSH key, network secret, systemd unit, CamillaDSP binary는 브라우저 backup에 포함되지 않는다.
+Pi 2와 Pi 4/5는 앱 settings/FIR/calibration 형식이 같아 schema 1/2 백업을 서로 복원할 수 있다. MIMO bank와 설정을 Pi2에 복원해도 실시간 활성화는 차단되며 SISO로 동작한다. backup의 chunksize도 그대로 복원되므로 Pi 2에 1024를 옮긴 경우 부하를 확인하고 2048로 되돌리는 것이 권장된다. OS 이미지, SSH key, network secret, systemd unit, CamillaDSP binary는 브라우저 backup에 포함되지 않는다.

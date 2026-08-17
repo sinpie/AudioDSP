@@ -33,12 +33,13 @@ Hash가 달라지면 writer의 expected hash를 단순히 새 값으로 바꾸�
 - `audiodsp-profile-manager.py`
 - `audiodsp-profile-web.py`
 - `audiodsp-measurement.py`
+- `audiodsp-mimo.py`
 - `audiodsp-profile-monitor.py`
 - `audiodsp-camilladsp-start`
 - `audiodsp-output-profile`
 - systemd service와 ALSA config
 - FIR, announcement, target, calibration asset
-- `test_profile_matrix.py`, `test_measurement_engine.py`
+- `test_profile_matrix.py`, `test_measurement_engine.py`, `test_mimo_runtime.py`
 
 플랫폼 차이는 `firstrun.sh`, writer, network helper/template, OS image, CamillaDSP binary다. 공통 파일을 동기화한 후 Pi 4/5의 초기 chunksize 1024 설정이 `firstrun.sh`와 base `camilladsp.yml`에 유지되는지 확인한다.
 
@@ -60,7 +61,9 @@ py -3 -m py_compile `
   "$pi2\payload\audiodsp-profile-manager.py" `
   "$pi2\payload\audiodsp-profile-web.py" `
   "$pi2\payload\audiodsp-measurement.py" `
-  "$pi2\test_profile_matrix.py"
+  "$pi2\payload\audiodsp-mimo.py" `
+  "$pi2\test_profile_matrix.py" `
+  "$pi2\test_mimo_runtime.py"
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$pi2\write_pi2_sd_as_admin.ps1" -ValidateOnly -NoPause
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$pi45\write_final_sd_as_admin.ps1" -ValidateOnly -NoPause
@@ -93,6 +96,8 @@ Pi 4/5 writer는 SSID/password를 묻고 secret을 출력하지 않는다. 두 w
 - `/api/status`와 `/api/volume` 응답
 - U7 실제 volume -10 dB/raw117 초기화
 - Speaker profile 적용, 다른 프로필 fallback 정상
+- Pi 4/5에서 MIMO bank manifest 검증, 8 Conv parser 검사, OFF 시 SISO 복귀
+- Pi 2에서 MIMO 활성화 요청이 상태 변경 없이 거부됨
 - `DSP ready` 안내
 - DHCP 주소 확인, 고정 주소 없음
 
@@ -109,6 +114,7 @@ Checksum 생성 후 임의 표본이 아니라 모든 줄을 다시 hash해 일�
 - `README.md`
 - `RELEASE_NOTES_<version>.md`
 - `FINAL_TEST_REPORT.md`
+- `MIMO_VALIDATION_REPORT.md`
 - `AUDIODSP_REQUIREMENTS_VERIFIED.md`
 - `AGENTS.md`
 - `docs/` 재현 문서 사본

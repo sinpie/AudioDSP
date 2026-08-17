@@ -37,20 +37,34 @@ UMIK 0°/90° calibration, level precheck, three-position room measurement,
 32768-tap regularized correction, target/preset selection, A/B review and safe
 permanent apply.
 
+This 64-bit bundle additionally supports Pi-4/Pi-5-only MIMO Stereo, 2.1 and
+2.2 measurement/correction. It creates a robust 2-input x 4-output bank as four
+stereo float32 WAVs (eight 32768-tap convolution paths), validates correlated-
+input headroom and a common causal delay, and uses chunksize 1024 or larger.
+One T5S with two RCA inputs remains one physical control source; dual-sub mode
+requires two independently placed and wired subs. Pi 2 explicitly rejects MIMO
+activation while retaining all SISO functions.
+
 Woofer measurement and combined-validation sweeps are attenuated by 12 dB with
 the same reference scaling. Every sweep has an SNR gate. Octave-band
 noise-compensated Schroeder EDT/T20 reports decay; reliable long-decay bass
 resonances can receive up to 3 dB additional cut, but late reverberation is
 never inverted. The result page verifies the actual truncated FIR FFT,
 normalized target-fit MAE/P90, maximum transfer and early impulse position.
+Every SISO or MIMO result also persists `Room_Tuning_Report.json` and
+`Room_Tuning_Report.md`. The UI and download distinguish filter-correctable,
+MIMO-limited, placement/acoustic-treatment, not-measured and not-certified
+items instead of presenting deep nulls, late reverberation, distortion or
+neighbor noise as solved.
 
 Completed measurement steps are navigation controls only. Data is kept until a
 changed setting is explicitly applied or a level test, position restart, or
 FIR rebuild is actually started. WAV uploads and full backups are staged and
 validated before applying.
 
-The versioned backup ZIP includes settings, correction preferences, Factory,
-Speaker and Headphones FIRs, and both UMIK calibration files. Restore verifies
+The versioned schema-v2 backup ZIP includes settings, correction preferences,
+Factory, Speaker and Headphones FIRs, optional managed MIMO banks, and both
+UMIK calibration files. Restore verifies
 schema, sizes, SHA-256, WAV and calibration data before review; it creates a
 downloadable server rollback ZIP before changing the device. A backup from an
 unsupported future schema is rejected without mutation.
@@ -71,3 +85,7 @@ FAT volume and final disk identity.
 
 See `AUDIODSP_REQUIREMENTS_VERIFIED.md` for the full verification record and
 `docs/README.md` for the complete reproduction and maintenance documentation.
+See `docs/MIMO_ROOM_TUNING.md` for research sources, topology rules, the exact
+optimization/safety pipeline, measurement instructions and explicit limits.
+`MIMO_VALIDATION_REPORT.md` records the silent numerical/runtime/backup tests
+and the remaining real-room and Pi4/Pi5 load acceptance work.

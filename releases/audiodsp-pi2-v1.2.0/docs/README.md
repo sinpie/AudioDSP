@@ -18,6 +18,7 @@
 - [API.md](API.md): HTTP API와 폼 경로
 - [UI_UX_SPEC.md](UI_UX_SPEC.md): PC·모바일 화면과 상호작용 규칙
 - [MEASUREMENT_AND_DSP.md](MEASUREMENT_AND_DSP.md): 측정, FIR 설계, 안전 제한
+- [MIMO_ROOM_TUNING.md](MIMO_ROOM_TUNING.md): 공통 MIMO 설계·최신 연구·전체 룸 요소; Pi2 실시간 적용은 차단
 - [BACKUP_AND_MIGRATION.md](BACKUP_AND_MIGRATION.md): 백업 스키마와 이름 변경 호환성
 - [HARDWARE_AND_AUDIO_PATH.md](HARDWARE_AND_AUDIO_PATH.md): 배선, 채널, 형식, U7 볼륨
 - [OPERATIONS_AND_TROUBLESHOOTING.md](OPERATIONS_AND_TROUBLESHOOTING.md): 운영과 장애 진단
@@ -37,6 +38,7 @@
 - Factory/Speaker FIR SHA-256: `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`
 - 출력 볼륨: U7 `PCM,0`, 웹/API 범위 -60~0 dB, 초기 저장값 -10 dB
 - Pi 2 초기 chunksize 2048; Pi 4/5 초기 chunksize 1024
+- Pi2는 MIMO 측정/적용 선택을 차단하고 SISO 2/4 convolution만 실행한다. 같은 SD/application 형식으로 Pi4/5 이전 시 MIMO bank를 복원할 수 있다.
 - 네트워크는 DHCP만 사용하며 고정·비상 주소를 만들지 않는다.
 
 ## 가장 빠른 재현 검사

@@ -22,6 +22,10 @@
 8. 고정/비상 IP를 만들지 않는다. DHCP 실패는 명확한 오류로 남긴다.
 9. 측정음은 사용자가 시작할 때만 재생한다. 야간 기본값은 -42 dBFS이며 레벨 검사를 선행한다.
 10. 단계 링크 이동, 그래프 보기, WAV/ZIP 다운로드만으로 저장 상태를 바꾸지 않는다.
+11. MIMO는 Pi4/5만 활성화한다. Pi2 UI/engine/manager 우회를 모두 차단하고 SISO fallback을 보존한다.
+12. 한 물리 우퍼의 stereo 입력을 두 독립 제어원으로 세지 않는다. MIMO 2.2는 서로 다른 위치·배선의 두 우퍼가 있어야 한다.
+13. MIMO bank는 4 stereo float32 WAV × 32768 taps, 2×4=8 convolution, manifest SHA/self-validation PASS, physical-output row sum ≤1을 유지한다.
+14. FIR/MIMO 가능, 부분 개선, 물리 처리, 미측정, 미인증을 결과 JSON/Markdown에 구분한다. 합성 예측을 실기 성공으로 기록하지 않는다.
 
 ## 변경 절차
 
@@ -51,6 +55,8 @@
 - 볼륨 GET/PUT/form, -60/0 경계, 형식·범위 오류, 물리 노브 divergence, 동시 쓰기 통과
 - Pi 2 실제 장치에서 서비스 active, U7 8채널 동일값, Camilla PID/FIR hash 불변
 - 두 writer의 `-ValidateOnly` 통과
+- MIMO 세 토폴로지 무음 self-test, 실제 CamillaDSP 8-path parser, schema-v2 bank backup staging, Pi2 활성 차단 통과
+- 실제 MIMO 수락은 Pi4/5 10분 CPU/XRUN과 별도 검증 위치 전/후 측정 없이는 완료로 표시하지 않음
 
 ## 문서 유지
 

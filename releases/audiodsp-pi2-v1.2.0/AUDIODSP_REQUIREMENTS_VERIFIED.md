@@ -48,6 +48,10 @@ Release: 1.2.0 · 2026-08-18
 - [x] Primus-like and Strong woofer-control modes.
 - [x] Spatial uncertainty band, before/after/target graph, diagnostics and manifest.
 - [x] Browser WAV/ZIP download, non-destructive A/B, rollback and final apply.
+- [x] Persistent JSON/Markdown room-tuning audit distinguishes FIR limits,
+  placement/treatment, not-measured and not-certified factors.
+- [x] MIMO bank/backup formats share the Pi4/5 code, while Pi2 UI, engine and
+  runtime reject MIMO measurement/activation and retain SISO processing.
 
 ## Automated and hardware verification
 
@@ -62,6 +66,7 @@ Release: 1.2.0 · 2026-08-18
 - [x] Operating Speaker FIR SHA-256 unchanged during Web deployment.
 - [x] Pi 2 bundle preflight validates image, binary, FIR, scripts and hashes.
 - [x] Pi 4/5 ARM64 release uses the same application with default chunksize 1024.
+- [x] Silent MIMO math/runtime fixtures pass, and Pi2 activation blocking is verified.
 - [x] Ethernet uses DHCP only; no collision-prone emergency static address.
 
 ## Algorithm references

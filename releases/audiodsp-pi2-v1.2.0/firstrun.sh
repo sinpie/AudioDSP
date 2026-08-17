@@ -26,6 +26,7 @@ test -f "$PAYLOAD_DIR/audiodsp-profile-manager.py"
 test -f "$PAYLOAD_DIR/audiodsp-profile-web.py"
 test -f "$PAYLOAD_DIR/audiodsp-web.service"
 test -f "$PAYLOAD_DIR/audiodsp-measurement.py"
+test -f "$PAYLOAD_DIR/audiodsp-mimo.py"
 test -f "$PAYLOAD_DIR/7200660.txt"
 test -f "$PAYLOAD_DIR/7200660_90deg.txt"
 test -f "$PAYLOAD_DIR/target_Harman_Kardon.txt"
@@ -116,6 +117,7 @@ install -m 0755 "$PAYLOAD_DIR/audiodsp-output-profile" /usr/local/bin/audiodsp-o
 install -m 0755 "$PAYLOAD_DIR/audiodsp-profile-manager.py" /usr/local/bin/audiodsp-profile-manager.py
 install -m 0755 "$PAYLOAD_DIR/audiodsp-profile-web.py" /usr/local/bin/audiodsp-profile-web.py
 install -m 0755 "$PAYLOAD_DIR/audiodsp-measurement.py" /usr/local/bin/audiodsp-measurement.py
+install -m 0755 "$PAYLOAD_DIR/audiodsp-mimo.py" /usr/local/bin/audiodsp-mimo.py
 install -m 0755 "$PAYLOAD_DIR/audiodsp-profile-monitor.py" /usr/local/bin/audiodsp-profile-monitor.py
 install -m 0755 "$PAYLOAD_DIR/audiodsp-dsp-ready" /usr/local/bin/audiodsp-dsp-ready
 install -m 0644 "$PAYLOAD_DIR/asound-audiodsp.conf" /etc/asound.conf

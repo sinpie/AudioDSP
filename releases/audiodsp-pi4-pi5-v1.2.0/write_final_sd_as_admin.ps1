@@ -147,6 +147,7 @@ function Assert-FinalBundle {
     $profileManager = Join-Path $payload 'audiodsp-profile-manager.py'
     $profileWeb = Join-Path $payload 'audiodsp-profile-web.py'
     $measurement = Join-Path $payload 'audiodsp-measurement.py'
+    $mimo = Join-Path $payload 'audiodsp-mimo.py'
     $cal0 = Join-Path $payload '7200660.txt'
     $cal90 = Join-Path $payload '7200660_90deg.txt'
     $targetHarman = Join-Path $payload 'target_Harman_Kardon.txt'
@@ -160,16 +161,17 @@ function Assert-FinalBundle {
     $headphoneWave = Join-Path $payload 'announce_headphone_48k_front_lr.wav'
     $matrixTest = Join-Path $script:StageRoot 'test_profile_matrix.py'
     $measurementTest = Join-Path $script:StageRoot 'test_measurement_engine.py'
+    $mimoTest = Join-Path $script:StageRoot 'test_mimo_runtime.py'
     $privateKey = Join-Path $script:StageRoot 'audiodsp_pi_ed25519'
     $publicKey = Join-Path $script:StageRoot 'audiodsp_pi_ed25519.pub'
     $imager = 'C:\Program Files\Raspberry Pi Ltd\Imager\rpi-imager.exe'
 
     foreach ($requiredFile in @(
         $image, $firstRun, $networkTemplate, $starter, $config, $camilla,
-        $fir, $service, $asound, $outputProfile, $profileManager, $profileWeb, $measurement,
+        $fir, $service, $asound, $outputProfile, $profileManager, $profileWeb, $measurement, $mimo,
         $cal0, $cal90, $targetHarman,
         $profileWebService, $u7Monitor, $u7Service, $dspReady, $dspReadyService,
-        $dspReadyWave, $speakerWave, $headphoneWave, $matrixTest, $measurementTest,
+        $dspReadyWave, $speakerWave, $headphoneWave, $matrixTest, $measurementTest, $mimoTest,
         $privateKey, $publicKey, $imager
     )) {
         if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
@@ -192,8 +194,8 @@ function Assert-FinalBundle {
     foreach ($linuxTextFile in @(
         $firstRun, $networkTemplate, $starter, $config, $service, $asound,
         $outputProfile, $profileManager, $profileWeb, $profileWebService,
-        $u7Monitor, $u7Service, $dspReady, $dspReadyService, $measurement,
-        $matrixTest, $measurementTest
+        $u7Monitor, $u7Service, $dspReady, $dspReadyService, $measurement, $mimo,
+        $matrixTest, $measurementTest, $mimoTest
     )) {
         Assert-LfNoBom -Path $linuxTextFile
     }
@@ -235,6 +237,7 @@ function Assert-FinalBundle {
         $managerText -notmatch 'set-output-volume' -or
         $managerText -notmatch 'output_volume_db' -or
         $managerText -notmatch 'restore-snapshot' -or
+        $managerText -notmatch 'install-mimo' -or
         $managerText -notmatch 'ALLOWED_CHUNKSIZES' -or
         $managerText -notmatch 'selector_status' -or
         $managerText -notmatch 'remain active for one second') {
@@ -247,6 +250,7 @@ function Assert-FinalBundle {
         $webText -notmatch '/chunksize' -or
         $webText -notmatch 'name="chunksize"' -or
         $webText -notmatch '/api/measurement/download/front' -or
+        $webText -notmatch 'mimo_one_sub' -or
         $webText -notmatch 'measurement-result-graph' -or
         $webText -notmatch 'def backup_archive' -or
         $webText -notmatch '/api/backup/download' -or
@@ -255,7 +259,7 @@ function Assert-FinalBundle {
         $webText -notmatch 'output_volume_control' -or
         $webText -notmatch 'output-volume-control' -or
         $webText -notmatch 'non_destructive_step_navigation' -or
-        $webText -notmatch 'T20→RT60' -or
+        $webText -notmatch 'room_tuning_audit' -or
         $webText -notmatch 'live_u7_status_poll' -or
         $webText -notmatch "fetch\('/api/status'" -or
         $webText -notmatch 'active-profile' -or
@@ -277,10 +281,18 @@ function Assert-FinalBundle {
         'finalize_graph_with_fir',
         'audiodsp_announce',
         'invalidate_from_step',
-        'install-pair'
+        'install-pair',
+        'MIMO_MODES'
     )) {
         if ($measurementText -notmatch [regex]::Escape($requiredText)) {
             throw "Measurement engine validation is missing: $requiredText"
+        }
+    }
+
+    $mimoText = Get-Content -LiteralPath $mimo -Raw
+    foreach ($requiredText in @('weighted pressure matching', 'MIMO_manifest.json', 'correlated_input_headroom', 'mimo_one_sub')) {
+        if ($mimoText -notmatch [regex]::Escape($requiredText)) {
+            throw "MIMO engine validation is missing: $requiredText"
         }
     }
 
@@ -301,6 +313,7 @@ function Assert-FinalBundle {
         'audiodsp-profile-manager.py set-chunksize 1024 --no-restart',
         'audiodsp-web.service',
         'audiodsp-measurement.py self-test',
+        'audiodsp-mimo.py',
         'audiodsp-ready.service',
         'test ! -e /etc/ssh/sshd_config.d/rename_user.conf'
     )) {

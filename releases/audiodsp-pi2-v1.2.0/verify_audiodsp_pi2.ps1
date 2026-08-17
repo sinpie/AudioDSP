@@ -22,6 +22,7 @@ for service in camilladsp.service audiodsp-web.service audiodsp-profile-monitor.
 done
 test -x /usr/local/bin/audiodsp-profile-manager.py
 test -x /usr/local/bin/audiodsp-measurement.py
+test -x /usr/local/bin/audiodsp-mimo.py
 test -r /etc/camilladsp/profiles/Factory_Speaker_Front_LR.wav
 sudo -n python3 /usr/local/bin/audiodsp-profile-manager.py status >/tmp/audiodsp-verify-status.json
 python3 - <<'PY'
@@ -30,6 +31,7 @@ p='/tmp/audiodsp-verify-status.json'
 s=json.load(open(p, encoding='utf-8'))
 assert s['settings']['chunksize'] in (512,1024,2048,4096)
 assert s['resolved']['convolution_channels'] in (0,2,4)
+assert s['capabilities']['mimo_supported'] is False
 f=s['files']['speaker']['front']
 assert f and f['sample_rate']==48000 and f['channels']==2 and f['frames']==32768
 print('profile='+s['resolved']['effective_profile'])

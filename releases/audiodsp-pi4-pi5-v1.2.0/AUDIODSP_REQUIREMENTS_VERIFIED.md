@@ -48,6 +48,16 @@ Release: 1.2.0 · 2026-08-18
 - [x] Primus-like and Strong woofer-control modes.
 - [x] Spatial uncertainty band, before/after/target graph, diagnostics and manifest.
 - [x] Browser WAV/ZIP download, non-destructive A/B, rollback and final apply.
+- [x] Pi4/5 MIMO Stereo, 2.1 and 2.2 independent-actuator measurement modes.
+- [x] Robust weighted pressure matching with spatial weights, Tikhonov/prior,
+  usable-band/support penalties and per-frequency physical-output headroom.
+- [x] Four stereo float32 WAVs encode all eight 2-input x 4-output FIR paths.
+- [x] Common causal delay, 20–80/120/150 Hz selection and SISO transition band.
+- [x] One stereo-fed T5S is one `sub_pair`; dual-sub requires two physical subs.
+- [x] Pi2 UI/engine/runtime MIMO rejection; Pi4/5 chunksize floor 1024.
+- [x] Persistent JSON/Markdown room-tuning audit separates FIR/MIMO improvement,
+  placement/treatment, not-measured and not-certified elements.
+- [x] MIMO Preview/Apply rollback and schema-v2 backup/restore of managed banks.
 
 ## Automated and hardware verification
 
@@ -62,6 +72,8 @@ Release: 1.2.0 · 2026-08-18
 - [x] Operating Speaker FIR SHA-256 unchanged during Web deployment.
 - [x] Pi 2 bundle preflight validates image, binary, FIR, scripts and hashes.
 - [x] Pi 4/5 ARM64 release uses the same application with default chunksize 1024.
+- [x] Silent synthetic MIMO tests pass all three topologies; real CamillaDSP parser
+  accepts the 2→8, eight-Conv, 8→4 pipeline; Pi2 activation block verified.
 - [x] Ethernet uses DHCP only; no collision-prone emergency static address.
 
 ## Algorithm references
@@ -71,6 +83,10 @@ Release: 1.2.0 · 2026-08-18
 - Kirkeby/Nelson regularized inverse-filter principles.
 - Frequency-dependent regularization and causality-aware room equalization.
 - Multi-position response aggregation with uncertainty-dependent correction.
+- Robust MIMO loudspeaker-room compensation (IEEE TASL, DOI 10.1109/TASL.2013.2245650).
+- Weighted pressure matching (arXiv:2210.14711, arXiv:2303.13027) and multi-sub
+  spatial-variance literature; see `docs/MIMO_ROOM_TUNING.md` for links/scope.
 
 AudioDSP deliberately uses conservative deterministic DSP inspired by these
-principles; it does not claim to implement an unrelated neural model verbatim.
+principles; its MIMO is an independent feed-forward FIR implementation and does
+not claim to be Dirac ART or to remove physical late reverberation/nonlinearity.

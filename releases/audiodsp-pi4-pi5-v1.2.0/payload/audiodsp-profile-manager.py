@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 from pathlib import Path
 import shutil
 import struct
@@ -29,6 +30,11 @@ U7_MIXER = environment("U7_MIXER", "hw:U7")
 CONFIG_DIR = Path(environment("CONFIG_DIR", "/etc/camilladsp"))
 CONFIG_PATH = CONFIG_DIR / "camilladsp.yml"
 PROFILE_DIR = CONFIG_DIR / "profiles"
+MIMO_DIR = PROFILE_DIR / "mimo"
+MIMO_MANIFESTS = {
+    "speaker": MIMO_DIR / "Speaker_MIMO.json",
+    "headphone": MIMO_DIR / "Headphone_MIMO.json",
+}
 FACTORY_FRONT = PROFILE_DIR / "Factory_Speaker_Front_LR.wav"
 STATE_DIR = Path(environment("STATE_DIR", "/var/lib/audiodsp"))
 SETTINGS_PATH = STATE_DIR / "profile-settings.json"
@@ -62,12 +68,27 @@ SNAPSHOT_FILES = {
     "Headphone_Front_LR.wav": PROFILE_FILES["headphone"]["front"],
     "Headphone_Rear_LR.wav": PROFILE_FILES["headphone"]["rear"],
 }
+MIMO_OUTPUT_NAMES = (
+    "MIMO_Front_Left_LR_32768.wav",
+    "MIMO_Front_Right_LR_32768.wav",
+    "MIMO_Rear_Left_LR_32768.wav",
+    "MIMO_Rear_Right_LR_32768.wav",
+)
+MIMO_SNAPSHOT_FILES = {
+    **{f"mimo/{name}": MIMO_DIR / name for name in MIMO_OUTPUT_NAMES},
+    "mimo/Speaker_MIMO.json": MIMO_MANIFESTS["speaker"],
+    "mimo/Headphone_MIMO.json": MIMO_MANIFESTS["headphone"],
+}
 
 DEFAULT_SETTINGS = {
     "requested_profile": "speaker",
     "chunksize": 2048,
     "output_volume_db": -10,
     "bypass": {
+        "speaker": False,
+        "headphone": False,
+    },
+    "mimo_enabled": {
         "speaker": False,
         "headphone": False,
     },
@@ -121,7 +142,7 @@ def normalize_settings(saved: dict[str, Any], strict: bool = False) -> dict[str,
         settings["output_volume_db"] = saved_volume
     elif strict and "output_volume_db" in saved:
         raise ProfileError("Invalid output_volume_db in backup; expected an integer from -60 to 0 dB.")
-    for key, allowed in (("rear_mode", ("copy_front", "separate")), ("bypass", (False, True)), ("woofer_trim_db", ALLOWED_WOOFER_TRIMS)):
+    for key, allowed in (("rear_mode", ("copy_front", "separate")), ("bypass", (False, True)), ("mimo_enabled", (False, True)), ("woofer_trim_db", ALLOWED_WOOFER_TRIMS)):
         values = saved.get(key, {})
         if strict and not isinstance(values, dict):
             raise ProfileError(f"Invalid {key} object in backup.")
@@ -129,7 +150,7 @@ def normalize_settings(saved: dict[str, Any], strict: bool = False) -> dict[str,
             continue
         for profile in PROFILE_FILES:
             value = values.get(profile)
-            if key == "bypass":
+            if key in ("bypass", "mimo_enabled"):
                 valid = isinstance(value, bool)
             elif key == "woofer_trim_db":
                 valid = isinstance(value, int) and not isinstance(value, bool) and value in allowed
@@ -258,6 +279,81 @@ def validate_wav(path: Path) -> dict[str, Any]:
     }
 
 
+def platform_capability() -> dict[str, Any]:
+    """MIMO needs eight 32768-tap convolution paths and is intentionally Pi 4/5 only."""
+    override = environment("PLATFORM_CLASS", "").strip().lower()
+    model = ""
+    try:
+        model = Path("/proc/device-tree/model").read_text(encoding="utf-8", errors="replace").rstrip("\x00\n")
+    except OSError:
+        model = platform.machine()
+    lowered = (override or model).lower()
+    supported = override in ("test", "pi4", "pi5") or "raspberry pi 4" in lowered or "raspberry pi 5" in lowered
+    pi2 = override == "pi2" or "raspberry pi 2" in lowered
+    reason = None
+    if not supported:
+        reason = "Pi 4/5 전용: 2입력×4출력의 32768탭 convolution 8개는 Pi 2 실시간 예산을 초과합니다."
+    return {
+        "platform": override or model,
+        "mimo_supported": supported,
+        "pi2": pi2,
+        "required_chunksize_min": 1024,
+        "convolution_paths": 8,
+        "reason": reason,
+    }
+
+
+def validate_mimo_bank(manifest_path: Path) -> dict[str, Any]:
+    try:
+        manifest_path = manifest_path.resolve(strict=True)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProfileError(f"MIMO manifest 오류: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("format") != "AudioDSP MIMO Bank" or manifest.get("schema_version") != 1:
+        raise ProfileError("지원하지 않는 MIMO manifest 형식입니다.")
+    expected = {"sample_rate": 48000, "taps": 32768, "inputs": 2, "outputs": 4}
+    for key, value in expected.items():
+        if manifest.get(key) != value:
+            raise ProfileError(f"MIMO manifest {key}는 {value}이어야 합니다.")
+    files = manifest.get("files")
+    if not isinstance(files, list) or len(files) != 4:
+        raise ProfileError("MIMO bank에는 정확히 네 출력 WAV가 필요합니다.")
+    root = manifest_path.parent
+    validated: list[dict[str, Any]] = []
+    seen_outputs: set[int] = set()
+    for item in files:
+        if not isinstance(item, dict) or item.get("output") not in range(4):
+            raise ProfileError("MIMO 출력 번호는 0..3이어야 합니다.")
+        output = int(item["output"])
+        if output in seen_outputs:
+            raise ProfileError("MIMO 출력 번호가 중복되었습니다.")
+        seen_outputs.add(output)
+        filename = item.get("file")
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise ProfileError("MIMO WAV는 manifest와 같은 디렉터리의 안전한 파일명이어야 합니다.")
+        path = (root / filename).resolve(strict=True)
+        if path.parent != root:
+            raise ProfileError("MIMO WAV 경로가 manifest 디렉터리를 벗어났습니다.")
+        metadata = validate_wav(path)
+        if metadata["frames"] != 32768 or metadata["sample_rate"] != 48000 or metadata["channels"] != 2 or metadata["format"] != "float" or metadata["bits"] != 32:
+            raise ProfileError(f"{filename}: stereo 48 kHz float32, 정확히 32768탭이어야 합니다.")
+        if item.get("sha256") != metadata["sha256"]:
+            raise ProfileError(f"{filename}: SHA-256가 manifest와 다릅니다.")
+        validated.append({"output": output, "label": item.get("label"), "file": filename, "path": path, "metadata": metadata})
+    validated.sort(key=lambda value: value["output"])
+    if seen_outputs != set(range(4)):
+        raise ProfileError("MIMO bank 출력 0..3이 모두 필요합니다.")
+    validation = manifest.get("self_validation", {})
+    if not isinstance(validation, dict) or not validation.get("overall_pass"):
+        raise ProfileError("MIMO 자체 검증을 통과하지 않은 bank는 적용할 수 없습니다.")
+    return {"manifest": manifest, "manifest_path": manifest_path, "files": validated}
+
+
+def managed_mimo(profile: str) -> dict[str, Any] | None:
+    path = MIMO_MANIFESTS[profile]
+    return validate_mimo_bank(path) if path.is_file() else None
+
+
 def resolve_profile(settings: dict[str, Any]) -> dict[str, Any]:
     requested = settings["requested_profile"]
     other = "headphone" if requested == "speaker" else "speaker"
@@ -285,7 +381,7 @@ def resolve_profile(settings: dict[str, Any]) -> dict[str, Any]:
         woofer_trim_db = settings["woofer_trim_db"][effective]
 
     mode = "bypass" if bypass else ("separate" if rear is not None else "copy_front")
-    return {
+    resolved = {
         "requested_profile": requested,
         "chunksize": settings["chunksize"],
         "effective_profile": effective,
@@ -296,7 +392,28 @@ def resolve_profile(settings: dict[str, Any]) -> dict[str, Any]:
         "bypass": bypass,
         "convolution_channels": 0 if bypass else (4 if mode == "separate" else 2),
         "woofer_trim_db": woofer_trim_db,
+        "mimo_paths": None,
+        "mimo_manifest_path": None,
+        "mimo_unavailable_reason": None,
     }
+    if effective in MIMO_MANIFESTS and not bypass and settings.get("mimo_enabled", {}).get(effective, False):
+        capability = platform_capability()
+        if capability["mimo_supported"]:
+            bank = managed_mimo(effective)
+            if bank is None:
+                raise ProfileError(f"{effective} MIMO가 켜졌지만 설치된 bank가 없습니다.")
+            resolved.update({
+                "chunksize": max(1024, resolved["chunksize"]),
+                "effective_rear_mode": "mimo_2x4",
+                "convolution_channels": 8,
+                "woofer_trim_db": 0,
+                "mimo_paths": [item["path"] for item in bank["files"]],
+                "mimo_manifest_path": bank["manifest_path"],
+                "mimo_topology": bank["manifest"].get("topology"),
+            })
+        else:
+            resolved["mimo_unavailable_reason"] = capability["reason"]
+    return resolved
 
 
 def mixer_yaml(woofer_trim_db: int) -> str:
@@ -338,6 +455,101 @@ def mixer_yaml(woofer_trim_db: int) -> str:
 def build_config(resolved: dict[str, Any]) -> bytes:
     chunksize = resolved["chunksize"]
     woofer_trim_db = resolved["woofer_trim_db"]
+    mimo_paths = resolved.get("mimo_paths")
+    if mimo_paths:
+        if len(mimo_paths) != 4:
+            raise ProfileError("MIMO config에는 네 출력 경로가 필요합니다.")
+        names = ("front_left", "front_right", "rear_left", "rear_right")
+        filter_lines = []
+        pipeline_lines = []
+        for output, (name, path) in enumerate(zip(names, mimo_paths)):
+            for source in range(2):
+                filter_name = f"mimo_{name}_from_{'left' if source == 0 else 'right'}"
+                filter_lines.extend([
+                    f"  {filter_name}:",
+                    "    type: Conv",
+                    "    parameters:",
+                    "      type: Wav",
+                    f"      filename: {json.dumps(str(path))}",
+                    f"      channel: {source}",
+                ])
+                pipeline_lines.extend([
+                    "  - type: Filter",
+                    f"    channels: [{output * 2 + source}]",
+                    f"    names: [{json.dumps(filter_name)}]",
+                ])
+        expand_mapping = []
+        for output in range(4):
+            for source in range(2):
+                expand_mapping.extend([
+                    f"      - dest: {output * 2 + source}",
+                    "        sources:",
+                    f"          - channel: {source}",
+                    "            gain: 0",
+                    "            inverted: false",
+                    "            mute: false",
+                ])
+        sum_mapping = []
+        for output in range(4):
+            sum_mapping.extend([
+                f"      - dest: {output}",
+                "        sources:",
+                f"          - channel: {output * 2}",
+                "            gain: 0",
+                "            inverted: false",
+                "            mute: false",
+                f"          - channel: {output * 2 + 1}",
+                "            gain: 0",
+                "            inverted: false",
+                "            mute: false",
+            ])
+        title = f"AudioDSP {resolved['effective_profile']} / MIMO 2x4 / Xonar U7"
+        config = f"""---
+title: {json.dumps(title)}
+description: "Robust 2-input x 4-output MIMO FIR bank; eight 32768-tap convolution paths"
+
+devices:
+  samplerate: 48000
+  chunksize: {chunksize}
+  queuelimit: 4
+  enable_rate_adjust: false
+  capture:
+    type: Alsa
+    channels: 2
+    device: "__CAPTURE_DEVICE__"
+    format: S32_LE
+    labels: ["Left", "Right"]
+  playback:
+    type: Alsa
+    channels: 4
+    device: "__PLAYBACK_DEVICE__"
+    format: S32_LE
+
+filters:
+{chr(10).join(filter_lines)}
+
+mixers:
+  mimo_expand_2_to_8:
+    channels:
+      in: 2
+      out: 8
+    mapping:
+{chr(10).join(expand_mapping)}
+  mimo_sum_8_to_4:
+    channels:
+      in: 8
+      out: 4
+    mapping:
+{chr(10).join(sum_mapping)}
+
+pipeline:
+  - type: Mixer
+    name: "mimo_expand_2_to_8"
+{chr(10).join(pipeline_lines)}
+  - type: Mixer
+    name: "mimo_sum_8_to_4"
+"""
+        return config.encode()
     if resolved["bypass"]:
         title = f"AudioDSP {resolved['effective_profile']} / bypass / Xonar U7"
         config = f"""---
@@ -509,6 +721,7 @@ def apply_settings(settings: dict[str, Any], restart: bool = True) -> dict[str, 
     resolved = resolve_profile(settings)
     front_meta = validate_wav(resolved["front_path"]) if resolved["front_path"] else None
     rear_meta = validate_wav(resolved["rear_path"]) if resolved["rear_path"] else None
+    mimo_meta = validate_mimo_bank(resolved["mimo_manifest_path"]) if resolved.get("mimo_manifest_path") else None
     config = build_config(resolved)
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -538,6 +751,7 @@ def apply_settings(settings: dict[str, Any], restart: bool = True) -> dict[str, 
 
     resolved["front"] = front_meta
     resolved["rear"] = rear_meta
+    resolved["mimo"] = mimo_meta
     resolved["config_changed"] = changed
     return serializable(resolved)
 
@@ -612,7 +826,22 @@ def status() -> dict[str, Any]:
                     files[profile][band] = {"path": str(path), "error": str(exc)}
             else:
                 files[profile][band] = None
-    return serializable({"settings": settings, "resolved": resolved, "files": files, "u7_selector": selector_status(), "preview": preview_status()})
+    mimo = {}
+    for profile, path in MIMO_MANIFESTS.items():
+        if path.is_file():
+            try:
+                bank = validate_mimo_bank(path)
+                mimo[profile] = {
+                    "manifest": str(path),
+                    "topology": bank["manifest"].get("topology"),
+                    "files": [item["metadata"] for item in bank["files"]],
+                    "valid": True,
+                }
+            except ProfileError as exc:
+                mimo[profile] = {"manifest": str(path), "valid": False, "error": str(exc)}
+        else:
+            mimo[profile] = None
+    return serializable({"settings": settings, "resolved": resolved, "files": files, "mimo": mimo, "capabilities": platform_capability(), "u7_selector": selector_status(), "preview": preview_status()})
 
 
 def activate(profile: str, restart: bool = True) -> dict[str, Any]:
@@ -636,6 +865,23 @@ def set_bypass(profile: str, enabled: bool, restart: bool = True) -> dict[str, A
         raise ProfileError("Invalid profile for bypass.")
     settings = load_settings()
     settings["bypass"][profile] = enabled
+    return apply_settings(settings, restart=restart)
+
+
+def set_mimo_enabled(profile: str, enabled: bool, restart: bool = True) -> dict[str, Any]:
+    if profile not in PROFILE_FILES:
+        raise ProfileError("Invalid profile for MIMO.")
+    if enabled:
+        capability = platform_capability()
+        if not capability["mimo_supported"]:
+            raise ProfileError(capability["reason"] or "MIMO is unavailable on this platform.")
+        if managed_mimo(profile) is None:
+            raise ProfileError(f"{profile}에 설치된 MIMO bank가 없습니다.")
+    settings = load_settings()
+    settings["mimo_enabled"][profile] = enabled
+    if enabled:
+        settings["bypass"][profile] = False
+        settings["chunksize"] = max(1024, settings["chunksize"])
     return apply_settings(settings, restart=restart)
 
 
@@ -708,7 +954,9 @@ def upload(profile: str, band: str, source: Path, original_name: str) -> dict[st
         shutil.copyfile(source, temporary)
         os.chmod(temporary, 0o644)
         os.replace(temporary, target)
-        applied = apply_settings(load_settings(), restart=True)
+        settings = load_settings()
+        settings["mimo_enabled"][profile] = False
+        applied = apply_settings(settings, restart=True)
     except Exception:
         temporary.unlink(missing_ok=True)
         if previous is None:
@@ -749,6 +997,8 @@ def preview_pair(profile: str, front_source: Path, rear_source: Path | None) -> 
         "convolution_channels": 4 if rear_source is not None else 2,
         # Generated Rear FIRs already contain the chosen trim.
         "woofer_trim_db": 0,
+        "mimo_paths": None,
+        "mimo_manifest_path": None,
     }
     config = build_config(resolved)
     check_config(config)
@@ -785,6 +1035,137 @@ def preview_pair(profile: str, front_source: Path, rear_source: Path | None) -> 
     result = serializable(resolved)
     result.update({"front": front_meta, "rear": rear_meta, "preview": preview_status()})
     return result
+
+
+def preview_mimo(profile: str, manifest_source: Path) -> dict[str, Any]:
+    """Audition a validated session MIMO bank without modifying managed files/settings."""
+    if profile != "speaker":
+        raise ProfileError("MIMO 2×4는 실제 4채널 speaker 출력에만 적용할 수 있습니다.")
+    capability = platform_capability()
+    if not capability["mimo_supported"]:
+        raise ProfileError(capability["reason"] or "MIMO is unavailable.")
+    bank = validate_mimo_bank(manifest_source)
+    settings = load_settings()
+    resolved = {
+        "requested_profile": settings["requested_profile"],
+        "chunksize": max(1024, settings["chunksize"]),
+        "effective_profile": profile,
+        "front_path": None,
+        "rear_path": None,
+        "configured_rear_mode": "mimo_2x4",
+        "effective_rear_mode": "mimo_2x4",
+        "bypass": False,
+        "convolution_channels": 8,
+        "woofer_trim_db": 0,
+        "mimo_paths": [item["path"] for item in bank["files"]],
+        "mimo_manifest_path": bank["manifest_path"],
+        "mimo_topology": bank["manifest"].get("topology"),
+    }
+    config = build_config(resolved)
+    check_config(config)
+    old_config = CONFIG_PATH.read_bytes() if CONFIG_PATH.is_file() else None
+    old_preview = PREVIEW_STATE_PATH.read_bytes() if PREVIEW_STATE_PATH.is_file() else None
+    preview = {
+        "active": True,
+        "profile": profile,
+        "mode": "mimo_2x4",
+        "topology": bank["manifest"].get("topology"),
+        "boot_id": current_boot_id(),
+        "started_unix": time.time(),
+        "manifest": str(bank["manifest_path"]),
+        "note": "temporary MIMO audition; managed bank and settings are unchanged",
+    }
+    try:
+        atomic_write(CONFIG_PATH, config)
+        atomic_write(PREVIEW_STATE_PATH, (json.dumps(preview, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
+        if old_config != config and not DISABLE_SERVICE_RESTART:
+            restart_camilladsp()
+    except Exception:
+        if old_config is None:
+            CONFIG_PATH.unlink(missing_ok=True)
+        else:
+            atomic_write(CONFIG_PATH, old_config)
+        if old_preview is None:
+            PREVIEW_STATE_PATH.unlink(missing_ok=True)
+        else:
+            atomic_write(PREVIEW_STATE_PATH, old_preview)
+        if old_config is not None and not DISABLE_SERVICE_RESTART:
+            subprocess.run(["systemctl", "restart", "camilladsp.service"], check=False)
+        raise
+    result = serializable(resolved)
+    result.update({"bank": serializable(bank), "preview": preview_status()})
+    return result
+
+
+def install_mimo(profile: str, manifest_source: Path) -> dict[str, Any]:
+    """Atomically install a self-validated 2×4 MIMO bank with rollback."""
+    if profile != "speaker":
+        raise ProfileError("MIMO 2×4는 실제 4채널 speaker 출력에만 적용할 수 있습니다.")
+    capability = platform_capability()
+    if not capability["mimo_supported"]:
+        raise ProfileError(capability["reason"] or "MIMO is unavailable.")
+    bank = validate_mimo_bank(manifest_source)
+    MIMO_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    targets = [MIMO_DIR / name for name in MIMO_OUTPUT_NAMES]
+    manifest_target = MIMO_MANIFESTS[profile]
+    prior = {path: path.read_bytes() if path.is_file() else None for path in [*targets, manifest_target]}
+    previous_settings = load_settings()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = BACKUP_DIR / f"{profile}-mimo-{stamp}-{os.getpid()}"
+    backup.mkdir(parents=True, exist_ok=False)
+    for path, data in prior.items():
+        if data is not None:
+            atomic_write(backup / path.name, data)
+    temporary: list[tuple[Path, Path]] = []
+    try:
+        managed_files = []
+        for item, target in zip(bank["files"], targets):
+            temp = target.with_name(f".{target.name}.mimo-{os.getpid()}")
+            shutil.copyfile(item["path"], temp)
+            os.chmod(temp, 0o644)
+            temporary.append((temp, target))
+            metadata = validate_wav(temp)
+            managed_files.append({
+                "output": item["output"], "label": item.get("label"), "file": target.name,
+                "sha256": metadata["sha256"], "channels": 2, "frames": 32768, "format": "float32",
+            })
+        for temp, target in temporary:
+            os.replace(temp, target)
+        managed_manifest = dict(bank["manifest"])
+        managed_manifest["files"] = managed_files
+        managed_manifest["installed_unix"] = time.time()
+        managed_manifest["source_manifest_sha256"] = hashlib.sha256(bank["manifest_path"].read_bytes()).hexdigest()
+        atomic_write(manifest_target, (json.dumps(managed_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
+        validate_mimo_bank(manifest_target)
+        settings = load_settings()
+        settings["requested_profile"] = profile
+        settings["bypass"][profile] = False
+        settings["mimo_enabled"][profile] = True
+        settings["chunksize"] = max(1024, settings["chunksize"])
+        applied = apply_settings(settings, restart=True)
+    except Exception:
+        for temp, _target in temporary:
+            temp.unlink(missing_ok=True)
+        for path, data in prior.items():
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write(path, data)
+        try:
+            apply_settings(previous_settings, restart=True)
+        except Exception:
+            pass
+        raise
+    applied["installed_mimo"] = {
+        "profile": profile,
+        "topology": bank["manifest"].get("topology"),
+        "manifest": str(manifest_target),
+        "rollback_backup": str(backup),
+        "paths": 8,
+        "taps": 32768,
+    }
+    return applied
 
 
 def restore_profile(restart: bool = True) -> dict[str, Any]:
@@ -837,6 +1218,7 @@ def install_pair(profile: str, front_source: Path, rear_source: Path | None, woo
             os.replace(temporary, PROFILE_FILES[profile][band])
         settings = load_settings()
         settings["bypass"][profile] = False
+        settings["mimo_enabled"][profile] = False
         settings["rear_mode"][profile] = "separate" if rear_source is not None else "copy_front"
         settings["woofer_trim_db"][profile] = woofer_trim_db
         applied = apply_settings(settings, restart=True)
@@ -883,11 +1265,16 @@ def restore_snapshot(source_dir: Path) -> dict[str, Any]:
         source = profiles_source / name
         if source.is_file():
             metadata[name] = validate_wav(source)
+    for profile, manifest in MIMO_MANIFESTS.items():
+        source = profiles_source / "mimo" / manifest.name
+        if source.is_file():
+            metadata[f"mimo/{manifest.name}"] = serializable(validate_mimo_bank(source))
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     backup_dir = BACKUP_DIR / f"full-restore-{timestamp}-{os.getpid()}"
     backup_dir.mkdir(parents=True, exist_ok=False)
-    previous_files = {name: target.read_bytes() if target.is_file() else None for name, target in SNAPSHOT_FILES.items()}
+    all_snapshot_files = {**SNAPSHOT_FILES, **MIMO_SNAPSHOT_FILES}
+    previous_files = {name: target.read_bytes() if target.is_file() else None for name, target in all_snapshot_files.items()}
     previous_settings = SETTINGS_PATH.read_bytes() if SETTINGS_PATH.is_file() else None
     previous_legacy = LEGACY_STATE_PATH.read_bytes() if LEGACY_STATE_PATH.is_file() else None
     previous_config = CONFIG_PATH.read_bytes() if CONFIG_PATH.is_file() else None
@@ -907,7 +1294,7 @@ def restore_snapshot(source_dir: Path) -> dict[str, Any]:
 
     try:
         PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        for name, target in SNAPSHOT_FILES.items():
+        for name, target in all_snapshot_files.items():
             source = profiles_source / name
             if source.is_file():
                 atomic_write(target, source.read_bytes())
@@ -915,7 +1302,7 @@ def restore_snapshot(source_dir: Path) -> dict[str, Any]:
                 target.unlink()
         applied = apply_settings(settings, restart=True)
     except Exception:
-        for name, target in SNAPSHOT_FILES.items():
+        for name, target in all_snapshot_files.items():
             previous = previous_files[name]
             if previous is None:
                 target.unlink(missing_ok=True)
@@ -959,6 +1346,10 @@ def main() -> int:
     bypass_parser.add_argument("profile", choices=PROFILE_FILES)
     bypass_parser.add_argument("enabled", choices=("on", "off"))
     bypass_parser.add_argument("--no-restart", action="store_true")
+    mimo_enabled_parser = subparsers.add_parser("set-mimo-enabled")
+    mimo_enabled_parser.add_argument("profile", choices=PROFILE_FILES)
+    mimo_enabled_parser.add_argument("enabled", choices=("on", "off"))
+    mimo_enabled_parser.add_argument("--no-restart", action="store_true")
     trim_parser = subparsers.add_parser("set-woofer-trim")
     trim_parser.add_argument("profile", choices=PROFILE_FILES)
     trim_parser.add_argument("trim_db", type=int, choices=ALLOWED_WOOFER_TRIMS)
@@ -975,6 +1366,8 @@ def main() -> int:
     upload_parser.add_argument("original_name")
     validate_parser = subparsers.add_parser("validate-wav")
     validate_parser.add_argument("source", type=Path)
+    validate_mimo_parser = subparsers.add_parser("validate-mimo")
+    validate_mimo_parser.add_argument("manifest", type=Path)
     validate_settings_parser = subparsers.add_parser("validate-settings")
     validate_settings_parser.add_argument("source", type=Path)
     pair_parser = subparsers.add_parser("install-pair")
@@ -986,6 +1379,12 @@ def main() -> int:
     preview_parser.add_argument("profile", choices=PROFILE_FILES)
     preview_parser.add_argument("front_source", type=Path)
     preview_parser.add_argument("rear_source", type=Path, nargs="?")
+    install_mimo_parser = subparsers.add_parser("install-mimo")
+    install_mimo_parser.add_argument("profile", choices=PROFILE_FILES)
+    install_mimo_parser.add_argument("manifest", type=Path)
+    preview_mimo_parser = subparsers.add_parser("preview-mimo")
+    preview_mimo_parser.add_argument("profile", choices=PROFILE_FILES)
+    preview_mimo_parser.add_argument("manifest", type=Path)
     restore_parser = subparsers.add_parser("restore-profile")
     restore_parser.add_argument("--no-restart", action="store_true")
     snapshot_parser = subparsers.add_parser("restore-snapshot")
@@ -1004,6 +1403,8 @@ def main() -> int:
             result = set_rear_mode(args.profile, args.mode, restart=not args.no_restart)
         elif args.command == "set-bypass":
             result = set_bypass(args.profile, args.enabled == "on", restart=not args.no_restart)
+        elif args.command == "set-mimo-enabled":
+            result = set_mimo_enabled(args.profile, args.enabled == "on", restart=not args.no_restart)
         elif args.command == "set-woofer-trim":
             result = set_woofer_trim(args.profile, args.trim_db, restart=not args.no_restart)
         elif args.command == "set-chunksize":
@@ -1012,12 +1413,18 @@ def main() -> int:
             result = set_output_volume(args.volume_db)
         elif args.command == "validate-wav":
             result = validate_wav(args.source)
+        elif args.command == "validate-mimo":
+            result = serializable(validate_mimo_bank(args.manifest))
         elif args.command == "validate-settings":
             result = validate_settings_file(args.source)
         elif args.command == "install-pair":
             result = install_pair(args.profile, args.front_source, args.rear_source, args.woofer_trim)
         elif args.command == "preview-pair":
             result = preview_pair(args.profile, args.front_source, args.rear_source)
+        elif args.command == "install-mimo":
+            result = install_mimo(args.profile, args.manifest)
+        elif args.command == "preview-mimo":
+            result = preview_mimo(args.profile, args.manifest)
         elif args.command == "restore-profile":
             result = restore_profile(restart=not args.no_restart)
         elif args.command == "restore-snapshot":

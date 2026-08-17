@@ -2,6 +2,14 @@
 
 ## 2026-08-18 · v1.2 유지보수 revision
 
+- 2026년까지의 MIMO/weighted pressure matching/excess-phase/공간 보간 연구 재검토와 채택·보류 근거 문서화
+- Pi4/5 MIMO Stereo/2.1/2.2, 2×4/8-path 32768탭 bank와 SISO 전이 구현
+- 주파수별 physical-output headroom 투영, 공통 인과 지연, 제어원 coherence·예측 비퇴행 검사 추가
+- Pi2 MIMO 측정/UI/runtime 차단, 한 stereo-fed T5S를 한 물리 제어원으로 강제
+- MIMO Preview/Apply/rollback, schema-v2 bank 백업/복원 staging 추가
+- 모든 결과에 보정 가능·제한·물리 처리·미측정·미인증 JSON/Markdown 보고서 추가
+- 세 토폴로지 합성, 실제 CamillaDSP 8-path parser, backup staging 무음 회귀시험 추가
+
 - 측정 재생을 검증된 `audiodsp_announce` 4채널 경로로 통일
 - Woofer 측정/reference를 함께 -12 dB 감쇄하고 sweep별 SNR gate 추가
 - octave noise-compensated Schroeder EDT/T20 및 저역 장시간 공진 cut-only 제어 추가

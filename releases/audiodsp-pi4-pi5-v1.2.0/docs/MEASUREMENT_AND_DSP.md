@@ -101,6 +101,8 @@ Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니�
 
 ## 연구 근거와 한계
 
+Pi4/5의 다중 제어원 MIMO, 2026년까지 검토한 연구, 알고리즘 수식, 세 토폴로지, 전체 룸 요소 분류와 의도적으로 보정하지 않는 항목은 [MIMO_ROOM_TUNING.md](MIMO_ROOM_TUNING.md)에 별도로 고정한다. 모든 새 결과는 `Room_Tuning_Report.json/.md`에도 같은 경계를 저장한다.
+
 구현은 다지점 응답 결합, smoothing, regularized inversion, boost 제한, 저역 위상 보정이라는 현대적 실내 보정 원칙을 반영한다. 참고 자료는 다음과 같다.
 
 - [Room EQ Wizard EQ 도움말](https://www.roomeqwizard.com/help/help_en-GB/html/eqwindow.html)

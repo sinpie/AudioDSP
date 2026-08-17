@@ -2,6 +2,12 @@
 
 ## 2026-08-18 maintenance revision
 
+- Added common MIMO bank/report/backup compatibility for migration to Pi4/5,
+  while explicitly blocking MIMO measurement and eight-path runtime on Pi2.
+- Added persistent SISO room-tuning JSON/Markdown reports that separate FIR
+  improvements from partial, physical-treatment, unmeasured and uncertified limits.
+- Added schema-v2 backup compatibility and silent MIMO math/runtime/Pi2-block tests.
+
 - Added real Xonar U7 PCM output-volume read/write in the Status Web UI.
 - Added `GET /api/volume` and strict `PUT /api/volume` for integer -60..0 dB.
 - Saved volume is restored after boot/USB reset; physical-knob changes are

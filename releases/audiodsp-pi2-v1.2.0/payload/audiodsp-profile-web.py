@@ -48,12 +48,13 @@ SYSTEM_BACKUP_DIR = STATE_DIR / "system-backups"
 CORRECTION_PREFERENCES_PATH = Path(environment("PREFERENCES_PATH", str(STATE_DIR / "correction-preferences.json")))
 AMIXER = environment("AMIXER", "/usr/bin/amixer")
 U7_MIXER = environment("U7_MIXER", "hw:U7")
-BACKUP_SCHEMA_VERSION = 1
+BACKUP_SCHEMA_VERSION = 2
 DEFAULT_CORRECTION_PREFERENCES = {
     "target": "harman", "preset": "strong", "woofer_trim_db": -9,
     "phase_mode": "bass", "phase_cutoff": 200, "spatial_mode": "equal",
     "bass_tilt_db": 0, "treble_tilt_db": 0, "correction_low_hz": 20,
     "correction_high_hz": 20_000, "max_boost_db": 6, "max_cut_db": 18,
+    "mimo_high_hz": 150, "mimo_strength": "balanced", "mimo_support_penalty_db": 6,
 }
 MAX_REQUEST = 33 * 1024 * 1024
 GRAPH_CACHE: dict[tuple[str, str, bool], str] = {}
@@ -78,6 +79,14 @@ BACKUP_PROFILE_NAMES = (
     "Headphone_Rear_LR.wav",
 )
 BACKUP_CALIBRATION_NAMES = ("7200660.txt", "7200660_90deg.txt")
+BACKUP_MIMO_NAMES = (
+    "MIMO_Front_Left_LR_32768.wav",
+    "MIMO_Front_Right_LR_32768.wav",
+    "MIMO_Rear_Left_LR_32768.wav",
+    "MIMO_Rear_Right_LR_32768.wav",
+    "Speaker_MIMO.json",
+    "Headphone_MIMO.json",
+)
 
 
 def manager(*arguments: str) -> dict:
@@ -106,6 +115,7 @@ def status_signature() -> tuple[tuple[str, int, int], ...]:
         PREVIEW_STATE_PATH,
         *(WEB_PROFILE_DIR / basename for bands in PROFILE_BASENAMES.values() for basename in bands.values()),
         WEB_PROFILE_DIR / FACTORY_BASENAME,
+        *(WEB_PROFILE_DIR / "mimo" / name for name in BACKUP_MIMO_NAMES),
     ]
     signature = []
     for path in paths:
@@ -360,6 +370,10 @@ def backup_archive(status: dict) -> tuple[bytes, str, dict]:
         path = WEB_PROFILE_DIR / name
         if path.is_file():
             entries[f"profiles/{name}"] = path.read_bytes()
+    for name in BACKUP_MIMO_NAMES:
+        path = WEB_PROFILE_DIR / "mimo" / name
+        if path.is_file():
+            entries[f"profiles/mimo/{name}"] = path.read_bytes()
     for name in BACKUP_CALIBRATION_NAMES:
         path = CAL_DIR / name
         if path.is_file():
@@ -417,6 +431,7 @@ def stage_restore_archive(payload: bytes, original_name: str) -> dict:
         raise RuntimeError("AudioDSP 백업 ZIP이 아닙니다.") from exc
     allowed = {"manifest.json", "profile-settings.json", "correction-preferences.json", "README.txt"}
     allowed.update(f"profiles/{name}" for name in BACKUP_PROFILE_NAMES)
+    allowed.update(f"profiles/mimo/{name}" for name in BACKUP_MIMO_NAMES)
     allowed.update(f"calibration/{name}" for name in BACKUP_CALIBRATION_NAMES)
     infos = [info for info in archive.infolist() if not info.is_dir()]
     names = [info.filename for info in infos]
@@ -465,6 +480,11 @@ def stage_restore_archive(payload: bytes, original_name: str) -> dict:
         path = directory / "profiles" / name
         if path.is_file():
             fir_report[name] = manager("validate-wav", str(path))
+    mimo_report = {}
+    for name in ("Speaker_MIMO.json", "Headphone_MIMO.json"):
+        path = directory / "profiles" / "mimo" / name
+        if path.is_file():
+            mimo_report[name] = manager("validate-mimo", str(path))
     calibration_report = {}
     for name, orientation in (("7200660.txt", "0"), ("7200660_90deg.txt", "90")):
         path = directory / "calibration" / name
@@ -480,6 +500,7 @@ def stage_restore_archive(payload: bytes, original_name: str) -> dict:
         "correction_preferences": preference_report,
         "unknown_settings": settings_report.get("ignored_unknown_keys", []),
         "firs": fir_report,
+        "mimo": mimo_report,
         "calibrations": calibration_report,
         "staged_unix": time.time(),
     }
@@ -864,6 +885,8 @@ def measurement_panel(job: dict, preview: dict) -> str:
     level = job.get("level_check") or {}
     preferences = job.get("correction_preferences") or {}
     installed = job.get("installed_calibrations") or {}
+    capabilities = job.get("capabilities") or {}
+    mimo_supported = bool(capabilities.get("mimo_supported"))
     cal90 = installed.get("90") or {}
     cal0 = installed.get("0") or {}
     if job.get("applied_profile"):
@@ -897,9 +920,18 @@ def measurement_panel(job: dict, preview: dict) -> str:
     )
     controls = ""
     if state == "idle":
-        controls = """
+        mode_options = ''.join(
+            f'<option value="{value}" {"disabled" if value.startswith("mimo_") and not mimo_supported else ""}>{label}</option>'
+            for value, label in (
+                ("lrw", "L / R / Woofer · SISO · 3위치"), ("lr", "L / R · SISO · 3위치"),
+                ("mimo_stereo", "MIMO Stereo · L/R 2제어원 · Pi4/5"),
+                ("mimo_one_sub", "MIMO 2.1 · L/R+T5S 3제어원 · Pi4/5"),
+                ("mimo_dual_sub", "MIMO 2.2 · L/R+독립 우퍼2대 · Pi4/5"),
+            )
+        )
+        controls = f"""
         <form method="post" action="/measurement/new" class="measure-form">
-          <label>측정 구성<select name="mode"><option value="lrw">L / R / Woofer · 3위치</option><option value="lr">L / R · 3위치</option></select></label>
+          <label>측정 구성<select name="mode">{mode_options}</select></label>
           <label>UMIK 방향<select name="orientation"><option value="90" selected>90° · 천장 방향 · 권장</option></select></label>
           <label>측정 출력<select name="level_dbfs"><option value="-48">-48 dBFS · 야간 매우 작게</option><option value="-42" selected>-42 dBFS · 야간 기본</option><option value="-36">-36 dBFS · 작게</option><option value="-30">-30 dBFS · 일반</option><option value="-24">-24 dBFS · 크게</option></select></label>
           <label>Sweep 길이<select name="sweep_seconds"><option value="4">4초 · 시험</option><option value="8" selected>8초 · 권장</option><option value="12">12초 · 정밀</option><option value="14">14초 · 저레벨 정밀</option></select></label>
@@ -910,11 +942,20 @@ def measurement_panel(job: dict, preview: dict) -> str:
         level_ok = bool(level.get("ok"))
         position_disabled = " disabled" if busy or not level_ok else ""
         mode = str(job.get("mode", "lrw"))
+        mode_options = ''.join(
+            f'<option value="{value}" {"selected" if mode == value else ""} {"disabled" if value.startswith("mimo_") and not mimo_supported else ""}>{label}</option>'
+            for value, label in (
+                ("lrw", "L / R / Woofer · SISO · 3위치"), ("lr", "L / R · SISO · 3위치"),
+                ("mimo_stereo", "MIMO Stereo · L/R 2제어원 · Pi4/5"),
+                ("mimo_one_sub", "MIMO 2.1 · L/R+T5S 3제어원 · Pi4/5"),
+                ("mimo_dual_sub", "MIMO 2.2 · L/R+독립 우퍼2대 · Pi4/5"),
+            )
+        )
         level_dbfs = int(job.get("level_dbfs", -42))
         sweep_seconds = int(job.get("sweep_seconds", 8))
         session_settings = f"""
         <form method="post" action="/measurement/configure" class="measure-form session-settings" onsubmit="return confirm('변경 적용 시 영향을 받는 단계만 초기화합니다. 단순 단계 이동은 측정값을 지우지 않습니다. 적용할까요?')">
-          <label>측정 구성<select name="mode"><option value="lrw" {'selected' if mode == 'lrw' else ''}>L / R / Woofer · 3위치</option><option value="lr" {'selected' if mode == 'lr' else ''}>L / R · 3위치</option></select></label>
+          <label>측정 구성<select name="mode">{mode_options}</select></label>
           <label>UMIK 방향<select name="orientation"><option value="90" selected>90° · 천장 방향 · 권장</option></select></label>
           <label>측정 출력<select name="level_dbfs">{''.join(f'<option value="{value}" {"selected" if value == level_dbfs else ""}>{value} dBFS</option>' for value in (-48, -42, -36, -30, -24))}</select></label>
           <label>Sweep 길이<select name="sweep_seconds">{''.join(f'<option value="{value}" {"selected" if value == sweep_seconds else ""}>{value}초</option>' for value in (4, 8, 12, 14))}</select></label>
@@ -957,7 +998,10 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 <label>최대 room boost<select name="max_boost_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("max_boost_db", 6) else ""}>+{value} dB</option>' for value in (0, 3, 6, 9)) + """</select></label>
                 <label>최대 room cut<select name="max_cut_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("max_cut_db", 18) else ""}>−{value} dB</option>' for value in (6, 9, 12, 18, 24)) + """</select></label>
                 <label>저역 phase 상한<select name="phase_cutoff">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("phase_cutoff", 200) else ""}>{value} Hz</option>' for value in (80, 120, 160, 200, 250)) + """</select></label>
-              </div><p class="muted">자연 roll-off 밖과 위치별 편차가 큰 null은 이 최대 boost보다 우선하여 자동 보호됩니다.</p></details>
+                <label>MIMO 공동제어 상한<select name="mimo_high_hz">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_high_hz", 150) else ""}>{value} Hz</option>' for value in (80, 120, 150)) + """</select></label>
+                <label>MIMO 강도<select name="mimo_strength">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_strength", "balanced") else ""}>{label}</option>' for value, label in (("safe", "Safe · 높은 안정성"), ("balanced", "Balanced · 권장"), ("maximum", "Maximum · 측정영역 우선"))) + """</select></label>
+                <label>지원 제어원 제한<select name="mimo_support_penalty_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_support_penalty_db", 6) else ""}>{value} dB</option>' for value in (3, 6, 9, 12)) + """</select></label>
+              </div><p class="muted">자연 roll-off 밖과 위치별 편차가 큰 null은 최대 boost보다 우선하여 보호됩니다. MIMO 항목은 MIMO 측정 구성에만 쓰이며 Pi4/5에서 chunksize 1024 이상으로 동작합니다.</p></details>
             </form>
             <div class="target-preview"><b>선택 Target 곡선 · 1kHz 기준</b><svg id="target-graph" viewBox="0 0 760 230" role="img" aria-label="Target frequency response"></svg></div>"""
     result_html = ""
@@ -989,6 +1033,11 @@ def measurement_panel(job: dict, preview: dict) -> str:
         decay_html = "".join(decay_cards)
         warnings = diagnostics.get("warnings") or []
         warning_html = "".join(f'<li>{html.escape(str(item))}</li>' for item in warnings) or "<li>자동 진단에서 큰 위험 신호가 발견되지 않았습니다.</li>"
+        audit_rows = "".join(
+            f'<tr><td><b>{html.escape(str(item.get("label", item.get("id", ""))))}</b></td><td><code>{html.escape(str(item.get("classification", "")))}</code></td><td>{html.escape(str(item.get("status", "")))}</td><td>{html.escape(str(item.get("action", "")))}</td></tr>'
+            for item in result.get("room_tuning_audit", [])
+        )
+        audit_html = f'<details class="audit-report" open><summary>보정 가능 / 한계 / 미측정 전체 분류</summary><div class="table-scroll"><table><thead><tr><th>요소</th><th>분류</th><th>상태</th><th>해석·조치</th></tr></thead><tbody>{audit_rows}</tbody></table></div></details>' if audit_rows else ""
         limits = result.get("correction_limits", {})
         preference = result.get("preference", {})
         result_html = f"""
@@ -999,10 +1048,13 @@ def measurement_panel(job: dict, preview: dict) -> str:
           <div class="measure-actions target-fit">{fit_html}</div>
           {f'<details class="decay-report"><summary>잔향/공진 T20→RT60 보기</summary><div class="decay-grid">{decay_html}</div><p class="muted">late reverb는 불안정한 역보정을 하지 않습니다. 신뢰 가능한 300 Hz 이하 장시간 공진만 최대 3 dB 추가 감쇄합니다.</p></details>' if decay_html else ''}
           <div class="diagnostic-note"><b>자동 진단</b><ul>{warning_html}</ul></div>
+          {audit_html}
           <p class="muted">WAV 다운로드와 그래프 확인은 현재 재생 설정을 바꾸지 않습니다. 점선은 튜닝 전 측정, 실선은 32768탭 FIR 적용 후 예상 응답입니다.</p>
           <div class="measure-actions"><a class="button" download href="/api/measurement/download/front">Front WAV 받기</a>
           {('<a class="button" download href="/api/measurement/download/rear">Rear WAV 받기</a>' if result.get('rear') else '')}
-          {('<a class="button" download href="/api/measurement/download/all">Front + Rear ZIP 받기</a>' if result.get('rear') else '')}</div>
+          {('<a class="button" download href="/api/measurement/download/all">WAV + 보고서 ZIP 받기</a>' if result.get('rear') else '')}
+          {('<a class="button secondary" download href="/api/measurement/download/report-md">한계 포함 보고서 MD</a>' if result.get('report_md') else '')}
+          {('<a class="button secondary" download href="/api/measurement/download/report-json">전체 결과 JSON</a>' if result.get('report_json') else '')}</div>
           <div class="result-box"><b>A/B 청취 비교</b><p class="muted">현재 상태: <span class="pill">{preview_label}</span> · 테스트 적용은 프로필 WAV와 설정을 덮어쓰지 않습니다.</p><div class="measure-actions">
           <form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="speaker"><button>이번 튜닝 · Speaker 테스트</button></form>
           <form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="headphone"><button>이번 튜닝 · Headphones 테스트</button></form>
@@ -1011,6 +1063,27 @@ def measurement_panel(job: dict, preview: dict) -> str:
           <form method="post" action="/measurement/apply" onsubmit="return confirm('Headphones의 기존 FIR WAV를 새 결과로 덮어씁니다. 기존 파일은 자동 백업됩니다. 정식 적용할까요?')"><input type="hidden" name="profile" value="headphone"><button>Headphones 정식 적용 · 덮어쓰기</button></form></div>
           <svg id="measurement-result-graph" data-result-target="{html.escape(str(result.get('target', 'harman')))}" viewBox="0 0 760 250" role="img" aria-label="Tuning before and predicted after frequency response"></svg>
         </div>"""
+        if result.get("kind") == "mimo_2x4":
+            mimo = result.get("mimo", {})
+            prediction = mimo.get("prediction", {})
+            metric_cards = "".join(
+                f'<div><small>{channel.title()} target MAE</small><b>{values.get("before_target_mae_db", "?")} → {values.get("after_target_mae_db", "?")} dB</b><small>좌석 편차 {values.get("before_spatial_std_db", "?")} → {values.get("after_spatial_std_db", "?")} dB</small></div>'
+                for channel, values in prediction.items()
+            )
+            topology = html.escape(str(mimo.get("topology", "mimo")))
+            headroom = mimo.get("headroom", {})
+            diversity = mimo.get("actuator_diversity", {})
+            result_html = f"""
+            <div class="result-box" id="measurement-step-5"><h3>MIMO 2×4 적용 전 검토</h3>
+              <p><b>{topology}</b> · {result.get('taps')} taps × 8 convolution paths · 공동 제어 {mimo.get('frequency_range_hz', ['?', '?'])[0]}–{mimo.get('frequency_range_hz', ['?', '?'])[1]} Hz</p>
+              <div class="diagnostic-grid">{metric_cards}<div><small>최악 상관입력 row sum</small><b>{headroom.get('maximum_correlated_input_row_sum', '?')}</b><small>global {headroom.get('global_scale_db', '?')} dB</small></div><div><small>제어원 최대 coherence</small><b>{diversity.get('maximum_coherence', '?')}</b><small>1에 가까우면 독립성 부족</small></div><div><small>Self validation</small><b>{'PASS' if self_validation.get('overall_pass') else 'FAIL · 적용 차단'}</b></div></div>
+              <div class="diagnostic-note"><b>자동 진단</b><ul>{warning_html}</ul></div>{audit_html}
+              <p class="muted">예측은 측정한 세 위치의 선형 모델에만 유효합니다. 실제 적용 전 Preview, 이후 별도 위치 재측정과 XRUN/CPU 확인이 필요합니다.</p>
+              <div class="measure-actions"><a class="button" download href="/api/measurement/download/all">MIMO WAV 4개 + 보고서 ZIP</a><a class="button secondary" download href="/api/measurement/download/report-md">한계 포함 보고서 MD</a><a class="button secondary" download href="/api/measurement/download/report-json">전체 결과 JSON</a></div>
+              <div class="result-box"><b>A/B 청취 비교</b><p class="muted">현재 상태: <span class="pill">{preview_label}</span> · MIMO는 실제 4채널 Speaker 출력 전용입니다.</p><div class="measure-actions"><form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="speaker"><button>이번 MIMO · Speaker 테스트</button></form><form method="post" action="/measurement/restore"><button>기존 튜닝 듣기</button></form></div></div>
+              <div class="measure-actions" id="measurement-step-6"><form method="post" action="/measurement/apply" onsubmit="return confirm('검증된 MIMO bank를 Speaker에 설치합니다. 기존 bank와 설정은 자동 백업됩니다. 정식 적용할까요?')"><input type="hidden" name="profile" value="speaker"><button{' disabled' if not self_validation.get('overall_pass') else ''}>Speaker MIMO 정식 적용</button></form></div>
+              <svg id="measurement-result-graph" data-result-target="{html.escape(str(result.get('target', 'harman')))}" viewBox="0 0 760 250" role="img" aria-label="MIMO predicted response"></svg>
+            </div>"""
     error = f'<div class="failure">{html.escape(str(job.get("error")))}</div>' if job.get("error") else ""
     level_html = ""
     if level:
@@ -1021,6 +1094,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
       <div class="workflow" aria-label="Calibration workflow">{workflow}</div>
       {error}<div class="job-status"><div><b id="job-stage">{html.escape(str(job.get('stage', '대기')))}</b><span id="job-eta">{eta_text}</span></div><progress id="job-progress" max="100" value="{progress:.2f}"></progress><small id="job-percent">{progress:.0f}%</small></div>
       <p class="muted">Session: {html.escape(str(job.get('session_id', '없음')))} · 위치 {positions}/{total} · Calibration {html.escape(str(calibration.get('orientation', '90')))}° / {html.escape(str(calibration.get('serial', '7200660')))}</p>
+      {'' if mimo_supported else '<p class="diagnostic-note"><b>MIMO 비활성</b> · Pi 2는 측정/UI 코드를 공유하지만 실시간 8경로 적용을 차단합니다. SISO L/R/W 보정은 그대로 사용할 수 있습니다.</p>'}
       <details class="cal-card" id="measurement-step-1" {'open' if current_step == 1 else ''}><summary class="cal-head"><span class="state-icon">μ</span><div><b>1 · UMIK calibration</b><p class="muted">0°/90° 파일 상태 · 클릭해서 펼치기 · 단계 이동만으로는 값이 지워지지 않습니다.</p></div></summary><div class="cal-slots">
         <form method="post" action="/measurement/calibration" enctype="multipart/form-data" class="cal-slot" onsubmit="return confirm('90° calibration 교체를 적용하면 이 파일로 측정한 레벨·3위치 응답·생성 FIR 결과가 초기화됩니다. 계속할까요?')"><input type="hidden" name="orientation" value="90"><div><b>90° · 천장 방향</b><span class="pill">룸 측정용</span></div><p>{cal90_summary}</p><label>miniDSP 90° TXT<input required type="file" name="file" accept="text/plain,.txt"></label><button>90° 파일 교체 적용</button></form>
         <form method="post" action="/measurement/calibration" enctype="multipart/form-data" class="cal-slot"><input type="hidden" name="orientation" value="0"><div><b>0° · 마이크 정면</b><span class="pill neutral">근접 진단용</span></div><p>{cal0_summary}</p><label>miniDSP 0° TXT<input required type="file" name="file" accept="text/plain,.txt"></label><button>0° 파일 교체 적용</button></form>
@@ -1046,6 +1120,9 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
         files = status["files"][profile]
         mode = settings["rear_mode"][profile]
         bypass = settings["bypass"][profile]
+        mimo_enabled = bool(settings.get("mimo_enabled", {}).get(profile, False))
+        mimo_info = status.get("mimo", {}).get(profile)
+        capability = status.get("capabilities", {})
         woofer_trim = settings.get("woofer_trim_db", {}).get(profile, 0)
         is_active = physical == profile
         staged = staging_status(profile)
@@ -1055,6 +1132,18 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
         candidate_rear = candidate_rear_path is not None
         staged_front_name = html.escape(str(staged_front.get("original_name", "")))
         staged_rear_name = html.escape(str(staged_rear.get("original_name", "")))
+        mimo_control = ""
+        if profile == "speaker":
+            if mimo_enabled:
+                mimo_status_text = "켜짐 · 8 convolution paths"
+            elif mimo_info and mimo_info.get("valid"):
+                mimo_status_text = "설치됨 · 현재 SISO"
+            elif capability.get("mimo_supported"):
+                mimo_status_text = "Pi4/5 사용 가능 · bank 없음"
+            else:
+                mimo_status_text = html.escape(str(capability.get("reason", "Pi4/5 전용")))
+            mimo_disabled = " disabled" if not mimo_enabled and not (mimo_info and mimo_info.get("valid") and capability.get("mimo_supported")) else ""
+            mimo_control = f'''<form method="post" action="/mimo-enabled" class="bypass {'enabled' if mimo_enabled else ''}"><input type="hidden" name="profile" value="speaker"><input type="hidden" name="enabled" value="{'off' if mimo_enabled else 'on'}"><div><b>MIMO 2×4 bank</b><small>{mimo_status_text}</small></div><button{mimo_disabled}>{'MIMO 끄기' if mimo_enabled else 'MIMO 켜기'}</button></form>'''
         stage_html = ""
         if staged["active"]:
             preview_active = bool(status.get("preview", {}).get("active")) and not bool(status.get("preview", {}).get("stale"))
@@ -1085,6 +1174,7 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
             <div><b>DSP Bypass</b><small>{'켜짐 · FIR 0채널, 원본 L/R 복사' if bypass else '꺼짐 · FIR 프로필 사용'}</small></div>
             <button>{'Bypass 끄기' if bypass else 'Bypass 켜기'}</button>
           </form>
+          {mimo_control}
           <div class="file"><b>Front L/R FIR</b><p>{file_summary(files['front'])}</p>
             <form method="post" action="/upload-stage" enctype="multipart/form-data">
               <input type="hidden" name="profile" value="{profile}"><input type="hidden" name="band" value="front">
@@ -1138,6 +1228,11 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
             next_label, next_href, next_note = "결과 검토·A/B로 이동", "/measure#measurement-step-5", "다운로드와 A/B 테스트 후에만 정식 적용합니다."
         else:
             next_label, next_href, next_note = "적용 결과 확인", "/measure#measurement-step-6", f"{job.get('applied_profile')} 프로필에 정식 적용된 상태입니다."
+        graph_note = (
+            "MIMO 활성 상태입니다. 아래 곡선은 전이대역 위에서 사용하는 base SISO FIR만 보여줍니다. 저역의 실제 합산 예상은 측정·보정 결과 그래프와 MIMO 보고서에서 확인하세요."
+            if resolved.get("mimo_paths") else
+            "Front L/R은 개별 곡선입니다. Woofer는 Rear L/R 크기의 에너지 평균이며, Front 복사 모드에서는 점선입니다."
+        )
         status_html = f"""
         <section class="next-action"><div><small>지금 할 일</small><h2>{html.escape(next_label)}</h2><p>{html.escape(next_note)}</p></div><div class="measure-actions"><a class="button" href="{next_href}">{html.escape(next_label)}</a><a class="button secondary" href="/settings">프로필 · 백업 설정</a></div></section>
         <section class="card-wide output-volume" id="output-volume-control" data-saved-volume="{saved_volume_db}">
@@ -1164,13 +1259,14 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
           <tr><td>A/B 청취 상태</td><td>{('이번 튜닝 테스트 중 · ' + html.escape(str(status.get('preview', {}).get('profile')))) if status.get('preview', {}).get('active') and not status.get('preview', {}).get('stale') else '기존 정식 튜닝'}</td></tr>
           <tr><td>Rear 처리</td><td>{html.escape(resolved['effective_rear_mode'])}</td></tr>
           <tr><td>컨볼루션</td><td>{resolved['convolution_channels']}채널</td></tr>
+          <tr><td>MIMO bank</td><td>{'활성 · ' + html.escape(str(resolved.get('mimo_topology'))) if resolved.get('mimo_paths') else ('설정됨, 현재 플랫폼에서 비활성: ' + html.escape(str(resolved.get('mimo_unavailable_reason'))) if resolved.get('mimo_unavailable_reason') else '비활성')}</td></tr>
           <tr><td>CamillaDSP / HID 감시</td><td>{camilla} / {monitor}</td></tr>
           <tr><td>시스템 상태</td><td id="system-health">확인 중…</td></tr>
           <tr><td>오디오</td><td>48 kHz · 입력 2ch · 출력 4ch · chunksize {chunksize}</td></tr>
         </table></section>
         <section class="graphbox"><h2>현재 FIR 주파수 응답</h2>
           <a class="button" href="/?woofer={woofer_query}">{'Woofer 숨기기' if show_woofer else 'Woofer 표시'}</a>
-          <p class="muted">Front L/R은 개별 곡선입니다. Woofer는 Rear L/R 크기의 에너지 평균이며, Front 복사 모드에서는 점선입니다.</p>{graph}</section>"""
+          <p class="muted">{graph_note}</p>{graph}</section>"""
     settings_html = ""
     if view == "settings":
         chunk_options = ''.join(f'<option value="{size}" {"selected" if chunksize == size else ""}>{size} · {label}</option>' for size, label in ((512, '최저 지연 / 고부하'), (1024, 'Pi4/Pi5 권장'), (2048, 'Pi2 권장'), (4096, '최대 여유')))
@@ -1193,7 +1289,7 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
         else:
             restore_detail = '<p class="muted">복원 ZIP을 선택하면 먼저 임시 검토만 합니다. 검증 완료 후 별도 확정 버튼을 눌러야 실제 설정이 바뀝니다.</p>'
         settings_html = f"""
-        <section class="card-wide backup-panel"><div class="section-head"><div><h2>전체 백업 · 안전 복원</h2><p class="muted">프로필 설정, Speaker/Headphones/Factory FIR, 0°/90° UMIK calibration을 버전형 ZIP 하나로 관리합니다.</p></div><span class="pill neutral">schema v{BACKUP_SCHEMA_VERSION}</span></div>
+        <section class="card-wide backup-panel"><div class="section-head"><div><h2>전체 백업 · 안전 복원</h2><p class="muted">프로필 설정, Speaker/Headphones/Factory FIR, 선택적 MIMO bank, 0°/90° UMIK calibration을 버전형 ZIP 하나로 관리합니다.</p></div><span class="pill neutral">schema v{BACKUP_SCHEMA_VERSION}</span></div>
           <div class="backup-actions"><div><b>현재 상태 보관</b><p>다운로드는 오디오를 바꾸지 않습니다.</p><a class="button" download href="/api/backup/download">전체 백업 ZIP 받기</a>{automatic_backup_html}</div><form method="post" action="/backup/stage" enctype="multipart/form-data"><b>백업에서 복원</b><p>업로드 → 검사 → 확인 → 복원</p><input required type="file" name="backup" accept="application/zip,.zip"><button>ZIP 검토하기</button></form></div>
           {restore_detail}
         </section>
@@ -1360,13 +1456,21 @@ class Handler(BaseHTTPRequestHandler):
     def send_measurement_zip(self) -> None:
         job = measurement_status()
         result = job.get("result") or {}
-        if not result.get("front") or not result.get("rear"):
-            self.send_error(HTTPStatus.NOT_FOUND, "A ZIP is available only when both Front and Rear WAVs exist")
-            return
         directory = Path(job["session_dir"]).resolve(strict=True)
         files: list[Path] = []
-        for kind in ("front", "rear"):
-            path = (directory / Path(result[kind]).name).resolve(strict=True)
+        names = []
+        if result.get("kind") == "mimo_2x4":
+            names.extend(item.get("file") for item in result.get("mimo_files", []) if isinstance(item, dict))
+            names.extend(result.get(key) for key in ("mimo_manifest", "report_json", "report_md"))
+        else:
+            names.extend(result.get(kind) for kind in ("front", "rear"))
+            names.extend(result.get(key) for key in ("report_json", "report_md"))
+        names = [name for name in names if isinstance(name, str) and name]
+        if len(names) < 2:
+            self.send_error(HTTPStatus.NOT_FOUND, "ZIP requires at least two generated artifacts")
+            return
+        for name in dict.fromkeys(names):
+            path = (directory / Path(name).name).resolve(strict=True)
             if os.path.commonpath((str(directory), str(path))) != str(directory):
                 raise RuntimeError("Measurement result path escaped its session")
             files.append(path)
@@ -1383,6 +1487,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_measurement_report(self, kind: str) -> None:
+        job = measurement_status()
+        result = job.get("result") or {}
+        key = "report_md" if kind == "report-md" else "report_json"
+        name = result.get(key)
+        if not isinstance(name, str) or not name:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        directory = Path(job["session_dir"]).resolve(strict=True)
+        path = (directory / Path(name).name).resolve(strict=True)
+        if path.parent != directory:
+            raise RuntimeError("Measurement report path escaped its session")
+        content_type = "text/markdown; charset=utf-8" if kind == "report-md" else "application/json; charset=utf-8"
+        body = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -1463,6 +1589,12 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path in ("/api/measurement/download/front", "/api/measurement/download/rear"):
             try:
                 self.send_measurement_result(parsed.path.rsplit("/", 1)[-1])
+            except Exception as exc:
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            return
+        if parsed.path in ("/api/measurement/download/report-md", "/api/measurement/download/report-json"):
+            try:
+                self.send_measurement_report(parsed.path.rsplit("/", 1)[-1])
             except Exception as exc:
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
             return
@@ -1553,6 +1685,12 @@ class Handler(BaseHTTPRequestHandler):
                 state = "ON" if fields["enabled"] == "on" else "OFF"
                 self.redirect(f"{fields['profile']} DSP Bypass {state}; 실제 적용={result['effective_profile']}", "/settings")
                 return
+            if parsed.path == "/mimo-enabled":
+                fields = self.read_urlencoded()
+                result = manager("set-mimo-enabled", fields["profile"], fields["enabled"])
+                state = "ON" if fields["enabled"] == "on" else "OFF"
+                self.redirect(f"{fields['profile']} MIMO {state}; 처리 경로={result['convolution_channels']}", "/settings")
+                return
             if parsed.path == "/chunksize":
                 fields = self.read_urlencoded()
                 result = manager("set-chunksize", fields["chunksize"])
@@ -1606,7 +1744,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/measurement/build":
                 fields = self.read_urlencoded()
-                measurement("start-build", fields["target"], fields["preset"], fields["woofer_trim_db"], fields["phase_mode"], fields["phase_cutoff"], fields["spatial_mode"], fields["bass_tilt_db"], fields["treble_tilt_db"], fields["correction_low_hz"], fields["correction_high_hz"], fields["max_boost_db"], fields["max_cut_db"])
+                measurement("start-build", fields["target"], fields["preset"], fields["woofer_trim_db"], fields["phase_mode"], fields["phase_cutoff"], fields["spatial_mode"], fields["bass_tilt_db"], fields["treble_tilt_db"], fields["correction_low_hz"], fields["correction_high_hz"], fields["max_boost_db"], fields["max_cut_db"], fields["mimo_high_hz"], fields["mimo_strength"], fields["mimo_support_penalty_db"])
                 self.redirect("32768탭 FIR 계산을 시작했습니다.", "/measure")
                 return
             if parsed.path == "/measurement/apply":
@@ -1694,7 +1832,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             try:
                 status = manager("status")
-                error_view = "measure" if parsed.path.startswith("/measurement/") else ("settings" if parsed.path in ("/rear-mode", "/bypass", "/chunksize", "/woofer-trim", "/upload", "/upload-stage") or parsed.path.startswith(("/staging/", "/backup/")) else "status")
+                error_view = "measure" if parsed.path.startswith("/measurement/") else ("settings" if parsed.path in ("/rear-mode", "/bypass", "/mimo-enabled", "/chunksize", "/woofer-trim", "/upload", "/upload-stage") or parsed.path.startswith(("/staging/", "/backup/")) else "status")
                 self.send_bytes(render_page(status, error=str(exc), view=error_view), status=400)
             except Exception:
                 self.send_bytes(f"AudioDSP UI error: {html.escape(str(exc))}".encode(), status=500)

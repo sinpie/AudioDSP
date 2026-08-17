@@ -2,6 +2,15 @@
 
 ## 2026-08-18 maintenance revision
 
+- Added Pi4/Pi5 MIMO Stereo/2.1/2.2 measurement and robust 2×4 weighted
+  pressure-matching FIR banks: four stereo WAVs, eight 32768-tap paths.
+- Added per-frequency physical-output headroom, common causal delay, SISO
+  transition, MIMO preview/apply/rollback and schema-v2 bank backup.
+- Added persistent room-tuning JSON/Markdown reports that separate FIR/MIMO
+  improvements from placement/treatment, unmeasured and uncertified limits.
+- Added silent three-topology numerical tests, real CamillaDSP parser test and
+  explicit remaining real-room/Pi4/Pi5 load acceptance list.
+
 - Added real Xonar U7 PCM output-volume read/write in the Status Web UI.
 - Added `GET /api/volume` and strict `PUT /api/volume` for integer -60..0 dB.
 - Saved volume is restored after boot/USB reset; physical-knob changes are

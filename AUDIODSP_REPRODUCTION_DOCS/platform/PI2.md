@@ -46,6 +46,14 @@ Pi 2는 onboard Wi-Fi가 없으므로 USB Wi-Fi는 별도 driver/NetworkManager 
 
 수치는 현재 FIR/topology에서의 관측값이며 릴리스 보증 상한은 아니다.
 
+## MIMO 지원 경계
+
+- Pi 2에서는 실시간 MIMO를 활성화할 수 없다. 8 convolution과 2→8→4 matrix를 안정적으로 운용할 CPU 여유가 검증되지 않았기 때문이다.
+- MIMO 측정·설계·manifest 코드는 백업 호환성과 Pi 4/5 이전을 위해 설치되지만 Web과 manager가 실행을 명시적으로 거부한다.
+- Pi 2의 정식 운용 경로는 Front/Rear를 공유하는 2 convolution 또는 독립 Front/Rear의 4 convolution SISO다.
+- Pi 4/5에서 만든 MIMO bank를 포함한 schema 2 백업은 보관할 수 있지만, Pi 2에서 복원된 MIMO 설정은 `configured but inactive`로 표시된다.
+- 룸 측정과 일반 32768-tap SISO 설계는 가능하다. 합성 시험에서 약 49~56초가 걸렸으므로 작업 중 음악 재생과 Web 부하를 최소화하고, 결과 적용 전 반드시 별도 검증 위치를 재측정한다.
+
 ## 기존 운용 장치
 
 기존 장치는 무중단 이전 때문에 hostname `gsonic-pi2`, user `gsonic`을 유지할 수 있다. 서비스와 앱 파일은 `audiodsp-*`, 상태는 `/var/lib/audiodsp`다. 새 SD는 반드시 위의 새 이름을 사용한다.

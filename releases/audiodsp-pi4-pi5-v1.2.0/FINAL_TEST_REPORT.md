@@ -50,3 +50,31 @@ its PID remained 28488 and the active Speaker FIR remained SHA-256
   Factory FIR, LF/no-BOM Linux files and Bash syntax: PASS.
 - Pi 4/5: arm64 image, uncompressed image hash, ELF AArch64 machine 183
   CamillaDSP, Factory FIR, LF/no-BOM Linux files and Bash syntax: PASS.
+
+## MIMO candidate and full room audit
+
+- Three synthetic topologies passed: stereo 2-actuator, one-sub 3-actuator and
+  dual-sub 4-actuator. Every bank contained four stereo float32 WAV files with
+  exactly 32768 taps and eight finite convolution paths.
+- Robust complex solver, per-output correlated-input headroom projection,
+  causality, manifest SHA-256 and actual CamillaDSP `--check`: PASS.
+- Isolated manager test installed/enabled/disabled MIMO, returned to SISO and
+  rejected MIMO on Pi 2 without touching production state.
+- Backup schema 2 MIMO inventory and restore staging validation: PASS. The live
+  production Pi 2 remained on its already-installed schema 1 code during this
+  candidate-only test.
+- SISO and MIMO builds now persist JSON and Markdown room-tuning audits that
+  separate FIR/MIMO-correctable findings from placement/treatment limits,
+  unmeasured items and required runtime/post-measurement validation.
+- See `MIMO_VALIDATION_REPORT.md` for metrics and the remaining sound-producing
+  Pi 4/5 acceptance tests. No actual sweep or live deployment was performed.
+
+## Final read-only live check
+
+At closeout on 2026-08-18, the connected production Pi 2 reported CamillaDSP
+PID 2036; `camilladsp`, `audiodsp-web` and `audiodsp-profile-monitor` were all
+active, the last 30 minutes contained zero XRUN/underrun/overrun matches, and
+the active Speaker FIR SHA-256 was still
+`8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`.
+This was a read-only check; no audio was generated and no service, profile or
+configuration was changed.

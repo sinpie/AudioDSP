@@ -12,6 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import shutil
 import statistics
 import struct
@@ -39,6 +40,7 @@ TARGET_DIR = Path(environment("TARGET_DIR", "/usr/local/share/audiodsp/targets")
 LOCK = Path(environment("MEASUREMENT_LOCK", "/run/audiodsp-measurement.lock"))
 AUDIO_LOCK = Path(environment("AUDIO_LOCK", "/run/audiodsp-audio-exclusive.lock"))
 MANAGER = environment("PROFILE_MANAGER", "/usr/local/bin/audiodsp-profile-manager.py")
+MIMO_ENGINE = environment("MIMO_ENGINE", "/usr/local/bin/audiodsp-mimo.py")
 PREFERENCES = Path(environment("PREFERENCES_PATH", str(BASE.parent / "correction-preferences.json")))
 PYTHON = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
 APLAY = environment("APLAY", "/usr/bin/aplay")
@@ -53,7 +55,14 @@ if not -24.0 <= WOOFER_MEASUREMENT_ATTENUATION_DB <= 0.0:
 WOOFER_MEASUREMENT_SCALE = 10.0 ** (WOOFER_MEASUREMENT_ATTENUATION_DB / 20.0)
 ALLOWED_LEVELS = tuple(range(-60, -11))
 ALLOWED_DURATIONS = (2, 4, 6, 8, 10, 12, 14)
-SOURCES = {"lr": ("left", "right"), "lrw": ("left", "right", "woofer")}
+SOURCES = {
+    "lr": ("left", "right"),
+    "lrw": ("left", "right", "woofer"),
+    "mimo_stereo": ("front_left", "front_right"),
+    "mimo_one_sub": ("front_left", "front_right", "sub_pair"),
+    "mimo_dual_sub": ("front_left", "front_right", "sub_left", "sub_right"),
+}
+MIMO_MODES = tuple(mode for mode in SOURCES if mode.startswith("mimo_"))
 TARGET_FILES = {
     "flat": None,
     "harman": "target_Harman_Kardon.txt",
@@ -77,6 +86,9 @@ DEFAULT_CORRECTION_PREFERENCES = {
     "correction_high_hz": 20_000,
     "max_boost_db": 6,
     "max_cut_db": 18,
+    "mimo_high_hz": 150,
+    "mimo_strength": "balanced",
+    "mimo_support_penalty_db": 6,
 }
 
 
@@ -110,6 +122,7 @@ def load_current() -> dict[str, Any]:
             "umik_connected": umik_connected(),
             "installed_calibrations": calibration_inventory(),
             "correction_preferences": load_correction_preferences(),
+            "capabilities": platform_capabilities(),
         }
     try:
         value = json.loads(CURRENT.read_text(encoding="utf-8"))
@@ -118,6 +131,7 @@ def load_current() -> dict[str, Any]:
     value["umik_connected"] = umik_connected()
     value["installed_calibrations"] = calibration_inventory()
     value["correction_preferences"] = load_correction_preferences()
+    value["capabilities"] = platform_capabilities()
     return value
 
 
@@ -133,6 +147,9 @@ def normalize_correction_preferences(value: dict[str, Any]) -> dict[str, Any]:
         "correction_low_hz": (20, 30, 40, 60, 80),
         "correction_high_hz": (300, 500, 1000, 5000, 20_000),
         "max_boost_db": (0, 3, 6, 9), "max_cut_db": (6, 9, 12, 18, 24),
+        "mimo_high_hz": (80, 120, 150),
+        "mimo_strength": ("safe", "balanced", "maximum"),
+        "mimo_support_penalty_db": (3, 6, 9, 12),
     }
     for key, allowed in checks.items():
         if key in value:
@@ -183,6 +200,28 @@ def umik_connected() -> bool:
 def u7_connected() -> bool:
     cards = Path("/proc/asound/cards")
     return cards.is_file() and "Xonar U7" in cards.read_text(errors="ignore")
+
+
+def platform_capabilities() -> dict[str, Any]:
+    override = environment("PLATFORM_CLASS", "").strip().lower()
+    if override:
+        kind = override
+    else:
+        machine = platform.machine().lower()
+        model_path = Path("/proc/device-tree/model")
+        model = model_path.read_text(errors="ignore").strip("\x00") if model_path.is_file() else ""
+        if "raspberry pi 2" in model or machine in ("armv6l", "armv7l"):
+            kind = "pi2"
+        elif "raspberry pi" in model or machine in ("aarch64", "arm64"):
+            kind = "pi4plus"
+        else:
+            kind = "development"
+    return {
+        "platform_class": kind,
+        "mimo_supported": kind in ("pi4plus", "development", "test"),
+        "mimo_runtime_paths": 8,
+        "mimo_minimum": "Raspberry Pi 4 / 64-bit AudioDSP",
+    }
 
 
 def parse_calibration(path: Path) -> dict[str, Any]:
@@ -441,17 +480,21 @@ def write_sweep(path: Path, source: str, level_dbfs: int, seconds: int, *, level
         zero = b"\x00\x00\x00"
         buffer = bytearray()
         for value in mono:
-            if source == "left":
+            if source in ("left", "front_left"):
                 frame = pack_pcm24(value) + zero + zero + zero
-            elif source == "right":
+            elif source in ("right", "front_right"):
                 frame = zero + pack_pcm24(value) + zero + zero
-            elif source == "woofer":
+            elif source in ("woofer", "sub_pair"):
                 # The T5S receives both Rear channels through a stereo cable. Each
                 # side carries half the mono sweep, and the pair is attenuated for
                 # night-safe measurement. The returned reference is scaled by the
                 # same amount so deconvolution remains level-correct.
                 rear = pack_pcm24(value * 0.5 * WOOFER_MEASUREMENT_SCALE)
                 frame = zero + zero + rear + rear
+            elif source == "sub_left":
+                frame = zero + zero + pack_pcm24(value * WOOFER_MEASUREMENT_SCALE) + zero
+            elif source == "sub_right":
+                frame = zero + zero + zero + pack_pcm24(value * WOOFER_MEASUREMENT_SCALE)
             elif source == "front_both":
                 front = pack_pcm24(value * 0.5)
                 frame = front + front + zero + zero
@@ -467,7 +510,7 @@ def write_sweep(path: Path, source: str, level_dbfs: int, seconds: int, *, level
                 buffer.clear()
         if buffer:
             handle.write(buffer)
-    if source == "woofer":
+    if source in ("woofer", "sub_pair", "sub_left", "sub_right"):
         return [value * WOOFER_MEASUREMENT_SCALE for value in mono]
     return mono
 
@@ -773,6 +816,71 @@ def room_decay_metrics(impulse: list[float], peak_index: int, fft: FFTBackend) -
     }
 
 
+def temporal_room_metrics(impulse: list[float], peak_index: int) -> dict[str, Any]:
+    """ISO-3382-inspired energy ratios plus reflection diagnostics.
+
+    These are engineering diagnostics from one loudspeaker/receiver transfer
+    path, not a certified diffuse-field room-acoustics measurement.
+    """
+    length = min(len(impulse), round(1.2 * RATE))
+    aligned = [impulse[(peak_index + index) % len(impulse)] for index in range(length)]
+    energy = [value * value for value in aligned]
+    total = max(sum(energy), 1.0e-30)
+
+    def energy_until(milliseconds: float) -> float:
+        return sum(energy[:min(length, round(milliseconds * RATE / 1000.0))])
+
+    early_50 = energy_until(50.0)
+    early_80 = energy_until(80.0)
+    late_50 = max(total - early_50, 1.0e-30)
+    late_80 = max(total - early_80, 1.0e-30)
+    direct = energy_until(5.0)
+    after_direct = max(total - direct, 1.0e-30)
+    center_seconds = sum((index / RATE) * value for index, value in enumerate(energy)) / total
+    peak = max(abs(aligned[0]), 1.0e-15)
+
+    reflection_windows = []
+    for start_ms, end_ms in ((1, 5), (5, 20), (20, 80)):
+        start = min(length, round(start_ms * RATE / 1000.0))
+        end = min(length, round(end_ms * RATE / 1000.0))
+        relative = max((abs(value) for value in aligned[start:end]), default=0.0) / peak
+        reflection_windows.append({
+            "window_ms": [start_ms, end_ms],
+            "strongest_relative_db": round(20.0 * math.log10(max(relative, 1.0e-15)), 2),
+        })
+    return {
+        "method": "single-path energy ratios aligned to the direct impulse peak",
+        "c50_db": round(10.0 * math.log10(max(early_50, 1.0e-30) / late_50), 3),
+        "c80_db": round(10.0 * math.log10(max(early_80, 1.0e-30) / late_80), 3),
+        "d50_percent": round(100.0 * early_50 / total, 3),
+        "center_time_ms": round(center_seconds * 1000.0, 3),
+        "direct_to_remainder_db": round(10.0 * math.log10(max(direct, 1.0e-30) / after_direct), 3),
+        "reflection_windows": reflection_windows,
+        "classification": "diagnostic_only_above_bass",
+    }
+
+
+def group_delay_metrics(frequencies: list[float], phases: list[float]) -> dict[str, Any]:
+    values = []
+    for index in range(1, len(frequencies) - 1):
+        frequency = frequencies[index]
+        if not 20.0 <= frequency <= 300.0:
+            continue
+        delta_frequency = frequencies[index + 1] - frequencies[index - 1]
+        if delta_frequency <= 0.0:
+            continue
+        seconds = -(phases[index + 1] - phases[index - 1]) / (2.0 * math.pi * delta_frequency)
+        if math.isfinite(seconds):
+            values.append(abs(seconds) * 1000.0)
+    return {
+        "method": "absolute residual group delay after bulk-delay removal",
+        "frequency_range_hz": [20, 300],
+        "bass_median_ms": round(statistics.median(values), 3) if values else None,
+        "bass_p90_ms": round(percentile(values, 0.90), 3) if values else None,
+        "classification": "limited_low_frequency_correction",
+    }
+
+
 def response_from_recording(recorded: Path, reference: list[float], cal: dict[str, Any]) -> dict[str, Any]:
     _, bits, samples = read_pcm_wav(recorded)
     if len(samples) < RATE:
@@ -801,6 +909,7 @@ def response_from_recording(recorded: Path, reference: list[float], cal: dict[st
     impulse = fft.irfft(h, length)
     raw_peak_index = max(range(length), key=lambda index: abs(impulse[index]))
     decay = room_decay_metrics(impulse, raw_peak_index, fft)
+    temporal = temporal_room_metrics(impulse, raw_peak_index)
     peak_index = raw_peak_index
     if peak_index > length // 2:
         peak_index -= length
@@ -826,6 +935,7 @@ def response_from_recording(recorded: Path, reference: list[float], cal: dict[st
         while phases[index] - phases[index - 1] < -math.pi:
             phases[index] += 2.0 * math.pi
     smoothed = variable_smooth(frequencies, levels)
+    group_delay = group_delay_metrics(frequencies, phases)
     return {
         "frequencies": [round(value, 3) for value in frequencies],
         "db": [round(value, 4) for value in smoothed],
@@ -840,12 +950,17 @@ def response_from_recording(recorded: Path, reference: list[float], cal: dict[st
         "smoothing": "variable 1/12 octave <200 Hz; 1/6 octave 200-2000 Hz; 1/3 octave >2 kHz",
         "measurement_quality": quality,
         "room_decay": decay,
+        "temporal": temporal,
+        "group_delay": group_delay,
     }
 
 
 def new_session(mode: str, orientation: str, level_dbfs: int, sweep_seconds: int) -> dict[str, Any]:
     if mode not in SOURCES:
-        raise MeasurementError("측정 모드는 lr 또는 lrw여야 합니다.")
+        raise MeasurementError("측정 모드가 잘못되었습니다.")
+    capability = platform_capabilities()
+    if mode in MIMO_MODES and not capability["mimo_supported"]:
+        raise MeasurementError("MIMO 측정/보정은 Raspberry Pi 4/5 전용입니다.")
     if orientation != "90":
         raise MeasurementError("최종 FIR 측정은 UMIK 90° 방향만 허용됩니다.")
     if level_dbfs not in ALLOWED_LEVELS or sweep_seconds not in ALLOWED_DURATIONS:
@@ -885,6 +1000,7 @@ def new_session(mode: str, orientation: str, level_dbfs: int, sweep_seconds: int
         "dsp_mode": "normal",
         "active_pids": [],
         "created_unix": time.time(),
+        "capabilities": capability,
     }
     save_current(state)
     atomic_json(directory / "session.json", state)
@@ -942,6 +1058,8 @@ def invalidate_from_step(state: dict[str, Any], step: int, reason: str) -> dict[
 def reconfigure_session(mode: str, orientation: str, level_dbfs: int, sweep_seconds: int) -> dict[str, Any]:
     if mode not in SOURCES or orientation != "90":
         raise MeasurementError("측정 모드 또는 UMIK 방향이 잘못되었습니다.")
+    if mode in MIMO_MODES and not platform_capabilities()["mimo_supported"]:
+        raise MeasurementError("MIMO 측정/보정은 Raspberry Pi 4/5 전용입니다.")
     if level_dbfs not in ALLOWED_LEVELS or sweep_seconds not in ALLOWED_DURATIONS:
         raise MeasurementError("측정 레벨 또는 sweep 시간이 허용 범위를 벗어났습니다.")
     state = load_current()
@@ -1183,6 +1301,61 @@ def integration_summary(directory: Path, validation: dict[str, str] | None) -> d
             "woofer_measurement_attenuation_db": WOOFER_MEASUREMENT_ATTENUATION_DB,
         }
     return result
+
+
+def build_room_tuning_audit(directory: Path, state: dict[str, Any], *, mimo: bool = False) -> list[dict[str, Any]]:
+    """Persist an explicit corrected/limited/not-measured inventory; never imply FIR can fix everything."""
+    responses = []
+    for position in range(1, POSITIONS + 1):
+        for source in state.get("sources", []):
+            path = directory / f"p{position}_{source}_response.json"
+            if path.is_file():
+                responses.append(json.loads(path.read_text(encoding="utf-8")))
+    snr = [float(item.get("measurement_quality", {}).get("snr_db")) for item in responses if isinstance(item.get("measurement_quality", {}).get("snr_db"), (int, float))]
+    clipping = [bool(item.get("measurement_quality", {}).get("clipped")) for item in responses]
+    c50 = [float(item.get("temporal", {}).get("c50_db")) for item in responses if isinstance(item.get("temporal", {}).get("c50_db"), (int, float))]
+    c80 = [float(item.get("temporal", {}).get("c80_db")) for item in responses if isinstance(item.get("temporal", {}).get("c80_db"), (int, float))]
+    group_delay = [float(item.get("group_delay", {}).get("bass_p90_ms")) for item in responses if isinstance(item.get("group_delay", {}).get("bass_p90_ms"), (int, float))]
+    decay = [
+        float(band["t20_rt60_s"]) for item in responses
+        for band in item.get("room_decay", {}).get("bands", [])
+        if band.get("reliable") and isinstance(band.get("t20_rt60_s"), (int, float))
+    ]
+    capability = platform_capabilities()
+    noise_status = "pass" if snr and min(snr) >= 15.0 and not any(clipping) else ("usable_with_warning" if snr and min(snr) >= 6.0 and not any(clipping) else "fail")
+    spatial_class = "mimo_correctable" if mimo else "limited_fir"
+    spatial_action = "복소 전달행렬을 공동 최적화해 측정한 세 위치의 저역 편차를 줄임" if mimo else "공간 평균 FIR은 공통 peak를 줄이지만 좌석마다 다른 null은 해결하지 못함; Pi4/5 MIMO 또는 배치 변경 검토"
+    return [
+        {"id": "noise_headroom", "label": "배경소음·SNR·클리핑", "classification": "measurement_gate", "status": noise_status, "evidence": {"minimum_snr_db": round(min(snr), 2) if snr else None, "recommended_snr_db": 15.0, "clipped_sweeps": sum(clipping)}, "action": "SNR 15 dB 이상 권장; clipping 또는 6 dB 미만이면 결과 적용 차단"},
+        {"id": "magnitude_target", "label": "주파수 응답·선호 타깃", "classification": "fir_correctable", "status": "evaluated", "action": "신뢰도·공간편차 가중, 자연 roll-off 보호, boost/cut 제한으로 보정"},
+        {"id": "bass_extension_headroom", "label": "저역 확장·출력 headroom", "classification": "limited_fir", "status": "evaluated", "action": "자연 저역 한계 아래 boost 금지; 드라이버 변위·앰프 여유·왜곡은 FIR이 늘릴 수 없음"},
+        {"id": "spatial_variance", "label": "좌석 간 저역 편차", "classification": spatial_class, "status": "evaluated", "evidence": {"mimo_platform_supported": capability["mimo_supported"]}, "action": spatial_action},
+        {"id": "arrival_polarity_phase", "label": "도착시간·극성·저역 위상", "classification": "limited_mimo" if mimo else "limited_fir", "status": "evaluated", "evidence": {"bass_group_delay_p90_ms_median": round(statistics.median(group_delay), 2) if group_delay else None}, "action": "공통 인과 지연과 저역 excess phase만 제한적으로 보정; 위치별 고역 phase 역보정 금지"},
+        {"id": "modal_decay", "label": "룸 모드·저역 감쇠시간", "classification": "limited_mimo" if mimo else "limited_fir", "status": "evaluated" if decay else "insufficient_data", "evidence": {"reliable_t20_rt60_s_median": round(statistics.median(decay), 3) if decay else None}, "action": "공진 peak cut 및 MIMO 능동 제어로 초기 꼬리 감소 가능; 방의 물리 RT60 전체 제거 불가"},
+        {"id": "sbir_early_reflections", "label": "SBIR·초기반사·명료도", "classification": "diagnostic_placement", "status": "evaluated" if c50 or c80 else "insufficient_data", "evidence": {"median_c50_db": round(statistics.median(c50), 2) if c50 else None, "median_c80_db": round(statistics.median(c80), 2) if c80 else None}, "action": "깊은 null은 boost하지 않고 스피커/청취 위치·벽 거리·1차 반사 흡음 조정"},
+        {"id": "late_reverberation", "label": "중·고역 늦은 잔향·확산", "classification": "physical_treatment", "status": "diagnostic_only", "action": "late field의 시간역 보정은 공간적으로 불안정; 흡음·확산·가구·배치로 개선"},
+        {"id": "speaker_matching", "label": "L/R 감도·음색 매칭", "classification": "fir_correctable", "status": "evaluated", "action": "독립 L/R magnitude를 맞추되 청취영역 공통 성분과 지향성 차이를 혼동하지 않음"},
+        {"id": "crossover_integration", "label": "메인–우퍼 크로스오버 합산", "classification": "limited_mimo" if mimo else "limited_fir", "status": "evaluated" if state.get("mode") in ("lrw", "mimo_one_sub", "mimo_dual_sub") else "not_applicable", "action": "레벨·지연·극성·저역 phase를 공동 조정; 아날로그 crossover 자체와 비선형은 변경 불가"},
+        {"id": "nonlinear_distortion", "label": "고조파 왜곡·압축·기계 잡음", "classification": "not_measured", "status": "not_available", "action": "향후 다중 레벨 Farina harmonic 분리 측정 필요; 선형 convolution으로 보정 불가"},
+        {"id": "directivity", "label": "지향성·파워 응답·오프축", "classification": "not_measured", "status": "not_available", "action": "회전/근접 다각도 측정이 필요; 단일 청취영역 UMIK 측정으로 분리 불가"},
+        {"id": "binaural_spatial", "label": "IACC·양이간 공간감·이미징", "classification": "not_measured", "status": "not_available", "action": "단일 omnidirectional UMIK-1로 직접 측정 불가; 더미헤드/2마이크와 별도 지표 필요"},
+        {"id": "absolute_spl_neighbor", "label": "절대 SPL·청력·층간소음", "classification": "not_certified", "status": "not_available", "action": "UMIK sensitivity/전체 체인 검교정과 수음세대 측정 없이는 보장 불가; 야간 저역 shelf·volume cap은 위험 저감일 뿐"},
+        {"id": "latency_clock", "label": "실시간 latency·clock drift·XRUN", "classification": "runtime_validation", "status": "requires_runtime_test", "action": "적용 후 CamillaDSP load, ALSA XRUN, rate drift, end-to-end latency를 무음 상태에서 모니터링"},
+        {"id": "post_verification", "label": "적용 후 독립 재측정", "classification": "measurement_gate", "status": "required", "action": "동일 위치 재사용만으로 과적합을 판단하지 말고 별도 검증 위치에서 전/후 측정"},
+    ]
+
+
+def write_room_tuning_report(path: Path, state: dict[str, Any], result: dict[str, Any]) -> None:
+    lines = [
+        "# AudioDSP 룸 튜닝 보고서", "",
+        f"- 모드: `{state.get('mode')}`", f"- 타깃: `{result.get('target')}`", f"- FIR: {result.get('sample_rate')} Hz / {result.get('taps')} taps",
+        f"- 자체 검증: {'PASS' if result.get('self_validation', {}).get('overall_pass') else 'FAIL'}", "",
+        "## 보정 가능성 분류", "",
+    ]
+    for item in result.get("room_tuning_audit", []):
+        lines.append(f"- **{item['label']}** — `{item['classification']}` / `{item['status']}`: {item['action']}")
+    lines += ["", "## 해석 원칙", "", "`fir_correctable`도 측정한 위치와 선형·시간불변 범위에서만 유효하다. `limited_*`는 부분 개선이며, `physical_treatment`, `not_measured`, `not_certified`는 FIR 성공으로 표시하지 않는다.", ""]
+    path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
 
 
 def target_curve(name: str) -> tuple[list[float], list[float]]:
@@ -1743,7 +1916,39 @@ def delay_fir(values: list[float], samples: int) -> list[float]:
     return [0.0] * samples + values[:TAPS - samples]
 
 
-def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode: str, phase_cutoff: int, spatial_mode: str = "equal", bass_tilt_db: int = 0, treble_tilt_db: int = 0, correction_low_hz: int = 20, correction_high_hz: int = 20_000, max_boost_db: int = 6, max_cut_db: int = 18) -> None:
+def build_mimo_worker(state: dict[str, Any], options: dict[str, Any]) -> None:
+    if not platform_capabilities()["mimo_supported"]:
+        raise MeasurementError("MIMO 계산과 활성화는 Raspberry Pi 4/5 전용입니다.")
+    directory = Path(state["session_dir"])
+    session_path = directory / "session.json"
+    options_path = directory / "mimo-build-options.json"
+    atomic_json(session_path, state)
+    atomic_json(options_path, options)
+    update_current(state="processing", stage="2×4 MIMO 전달행렬 정규화", progress=8.0, eta_seconds=180)
+    process = subprocess.run(
+        [PYTHON, MIMO_ENGINE, "--measurement-engine", str(Path(__file__).resolve()), "build", str(session_path), str(directory), str(options_path)],
+        check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    try:
+        result = json.loads(process.stdout)
+    except json.JSONDecodeError as exc:
+        raise MeasurementError(process.stdout.strip() or "MIMO 계산 결과를 읽을 수 없습니다.") from exc
+    if process.returncode or result.get("error"):
+        raise MeasurementError(result.get("error", "MIMO 계산 실패"))
+    result["correction_limits"] = {
+        "low_hz": options["correction_low_hz"],
+        "high_hz": options["correction_high_hz"],
+        "max_room_boost_db": options["max_boost_db"],
+        "max_room_cut_db": options["max_cut_db"],
+    }
+    updated = update_current(
+        state="built", stage="2×4 MIMO 32768탭 bank 생성 완료 · 보고서와 예측을 확인하세요.",
+        progress=100.0, eta_seconds=None, worker_pid=None, result=result,
+    )
+    atomic_json(session_path, updated)
+
+
+def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode: str, phase_cutoff: int, spatial_mode: str = "equal", bass_tilt_db: int = 0, treble_tilt_db: int = 0, correction_low_hz: int = 20, correction_high_hz: int = 20_000, max_boost_db: int = 6, max_cut_db: int = 18, mimo_high_hz: int = 150, mimo_strength: str = "balanced", mimo_support_penalty_db: int = 6) -> None:
     state = load_current()
     if int(state.get("positions_completed", 0)) != POSITIONS:
         raise MeasurementError("세 위치 측정을 먼저 완료하세요.")
@@ -1753,6 +1958,19 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         raise MeasurementError("보정 주파수 범위가 잘못되었습니다.")
     if max_boost_db not in (0, 3, 6, 9) or max_cut_db not in (6, 9, 12, 18, 24):
         raise MeasurementError("최대 boost/cut 값이 잘못되었습니다.")
+    if mimo_high_hz not in (80, 120, 150) or mimo_strength not in ("safe", "balanced", "maximum") or mimo_support_penalty_db not in (3, 6, 9, 12):
+        raise MeasurementError("MIMO 보정 범위·강도·지원 제어원 제한값이 잘못되었습니다.")
+    if state.get("mode") in MIMO_MODES:
+        build_mimo_worker(state, {
+            "target": target_name, "preset": preset, "woofer_trim_db": woofer_trim_db,
+            "phase_mode": phase_mode, "phase_cutoff": phase_cutoff, "spatial_mode": spatial_mode,
+            "bass_tilt_db": bass_tilt_db, "treble_tilt_db": treble_tilt_db,
+            "correction_low_hz": correction_low_hz, "correction_high_hz": correction_high_hz,
+            "max_boost_db": max_boost_db, "max_cut_db": max_cut_db,
+            "mimo_high_hz": mimo_high_hz, "mimo_strength": mimo_strength,
+            "mimo_support_penalty_db": mimo_support_penalty_db,
+        })
+        return
     directory = Path(state["session_dir"])
     update_current(state="processing", stage="공간 평균 응답 계산", progress=5.0, eta_seconds=45)
     fft = FFTBackend()
@@ -1920,6 +2138,11 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             "reverberation": "octave-band noise-compensated Schroeder EDT/T20; reliable low-frequency decay controls cut-only damping",
         },
     }
+    result["room_tuning_audit"] = build_room_tuning_audit(directory, state, mimo=False)
+    result["report_json"] = "Room_Tuning_Report.json"
+    result["report_md"] = "Room_Tuning_Report.md"
+    atomic_json(directory / result["report_json"], result)
+    write_room_tuning_report(directory / result["report_md"], state, result)
     state = update_current(state="built", stage="32768탭 FIR 생성 완료 · 그래프 확인 후 프로필에 적용하세요.", progress=100.0, eta_seconds=None, worker_pid=None, result=result)
     atomic_json(directory / "session.json", state)
 
@@ -1931,6 +2154,21 @@ def apply_result(profile: str) -> dict[str, Any]:
     if profile not in ("speaker", "headphone"):
         raise MeasurementError("프로필이 잘못되었습니다.")
     directory = Path(state["session_dir"])
+    if state["result"].get("kind") == "mimo_2x4":
+        if profile != "speaker":
+            raise MeasurementError("MIMO 2×4 결과는 Speaker 출력에만 적용할 수 있습니다.")
+        if not state["result"].get("self_validation", {}).get("overall_pass"):
+            raise MeasurementError("MIMO 자체 검증을 통과하지 않아 적용을 차단했습니다.")
+        arguments = [PYTHON, MANAGER, "install-mimo", profile, str(directory / state["result"]["mimo_manifest"])]
+        process = subprocess.run(arguments, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        try:
+            payload = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise MeasurementError(process.stdout.strip() or "MIMO 적용 실패") from exc
+        if process.returncode:
+            raise MeasurementError(payload.get("error", "MIMO 적용 실패"))
+        update_current(stage="speaker 프로필에 MIMO bank 정식 적용 완료", applied_profile=profile, preview_active=False)
+        return payload
     front = directory / state["result"]["front"]
     rear_name = state["result"].get("rear")
     arguments = [PYTHON, MANAGER, "install-pair", profile, str(front)]
@@ -1956,6 +2194,19 @@ def preview_result(profile: str) -> dict[str, Any]:
     if profile not in ("speaker", "headphone"):
         raise MeasurementError("프로필이 잘못되었습니다.")
     directory = Path(state["session_dir"])
+    if state["result"].get("kind") == "mimo_2x4":
+        if profile != "speaker":
+            raise MeasurementError("MIMO 2×4 테스트는 Speaker 출력에서만 가능합니다.")
+        arguments = [PYTHON, MANAGER, "preview-mimo", profile, str(directory / state["result"]["mimo_manifest"])]
+        process = subprocess.run(arguments, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        try:
+            payload = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise MeasurementError(process.stdout.strip() or "MIMO 테스트 적용 실패") from exc
+        if process.returncode:
+            raise MeasurementError(payload.get("error", "MIMO 테스트 적용 실패"))
+        update_current(stage="speaker · 이번 MIMO 튜닝 테스트 중", preview_active=True, preview_profile=profile)
+        return payload
     front = directory / state["result"]["front"]
     arguments = [PYTHON, MANAGER, "preview-pair", profile, str(front)]
     rear_name = state["result"].get("rear")
@@ -2137,6 +2388,9 @@ def main() -> int:
     build.add_argument("correction_high_hz", type=int, choices=(300, 500, 1000, 5000, 20_000), nargs="?", default=20_000)
     build.add_argument("max_boost_db", type=int, choices=(0, 3, 6, 9), nargs="?", default=6)
     build.add_argument("max_cut_db", type=int, choices=(6, 9, 12, 18, 24), nargs="?", default=18)
+    build.add_argument("mimo_high_hz", type=int, choices=(80, 120, 150), nargs="?", default=150)
+    build.add_argument("mimo_strength", choices=("safe", "balanced", "maximum"), nargs="?", default="balanced")
+    build.add_argument("mimo_support_penalty_db", type=int, choices=(3, 6, 9, 12), nargs="?", default=6)
     apply_parser = sub.add_parser("apply")
     apply_parser.add_argument("profile", choices=("speaker", "headphone"))
     preview_parser = sub.add_parser("preview")
@@ -2159,6 +2413,9 @@ def main() -> int:
     worker_build.add_argument("correction_high_hz", type=int, nargs="?", default=20_000)
     worker_build.add_argument("max_boost_db", type=int, nargs="?", default=6)
     worker_build.add_argument("max_cut_db", type=int, nargs="?", default=18)
+    worker_build.add_argument("mimo_high_hz", type=int, nargs="?", default=150)
+    worker_build.add_argument("mimo_strength", nargs="?", default="balanced")
+    worker_build.add_argument("mimo_support_penalty_db", type=int, nargs="?", default=6)
     sub.add_parser("self-test")
     sub.add_parser("self-test-targets")
     args = parser.parse_args()
@@ -2220,8 +2477,11 @@ def main() -> int:
                 "correction_high_hz": args.correction_high_hz,
                 "max_boost_db": args.max_boost_db,
                 "max_cut_db": args.max_cut_db,
+                "mimo_high_hz": args.mimo_high_hz,
+                "mimo_strength": args.mimo_strength,
+                "mimo_support_penalty_db": args.mimo_support_penalty_db,
             })
-            result = spawn_worker("_worker-build", args.target, args.preset, str(args.woofer_trim_db), args.phase_mode, str(args.phase_cutoff), args.spatial_mode, str(args.bass_tilt_db), str(args.treble_tilt_db), str(args.correction_low_hz), str(args.correction_high_hz), str(args.max_boost_db), str(args.max_cut_db))
+            result = spawn_worker("_worker-build", args.target, args.preset, str(args.woofer_trim_db), args.phase_mode, str(args.phase_cutoff), args.spatial_mode, str(args.bass_tilt_db), str(args.treble_tilt_db), str(args.correction_low_hz), str(args.correction_high_hz), str(args.max_boost_db), str(args.max_cut_db), str(args.mimo_high_hz), args.mimo_strength, str(args.mimo_support_penalty_db))
         elif args.command == "apply":
             result = apply_result(args.profile)
         elif args.command == "preview":
@@ -2237,7 +2497,7 @@ def main() -> int:
         elif args.command == "_worker-validation":
             return worker_guard(validation_worker)
         elif args.command == "_worker-build":
-            return worker_guard(lambda: build_worker(args.target, args.preset, args.woofer_trim_db, args.phase_mode, args.phase_cutoff, args.spatial_mode, args.bass_tilt_db, args.treble_tilt_db, args.correction_low_hz, args.correction_high_hz, args.max_boost_db, args.max_cut_db))
+            return worker_guard(lambda: build_worker(args.target, args.preset, args.woofer_trim_db, args.phase_mode, args.phase_cutoff, args.spatial_mode, args.bass_tilt_db, args.treble_tilt_db, args.correction_low_hz, args.correction_high_hz, args.max_boost_db, args.max_cut_db, args.mimo_high_hz, args.mimo_strength, args.mimo_support_penalty_db))
         elif args.command == "self-test":
             result = self_test()
         else:

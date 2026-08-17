@@ -32,6 +32,7 @@ flowchart LR
 | 출력 전환 helper | `/usr/local/bin/audiodsp-output-profile` | manager 호출과 Front L/R 안내음 믹스 |
 | 웹 | `/usr/local/bin/audiodsp-profile-web.py` | 세 화면, HTTP API, staged upload/backup, client SVG, 실제 볼륨 polling |
 | 측정 엔진 | `/usr/local/bin/audiodsp-measurement.py` | 독점 측정, sweep 분석, 공간 결합, FIR 계산, 진행 상태 |
+| MIMO 엔진 | `/usr/local/bin/audiodsp-mimo.py` | Pi4/5 전용 2×4 robust pressure matching, 8-path FIR bank와 영구 한계 보고서 생성 |
 | 준비 안내 | `/usr/local/bin/audiodsp-dsp-ready` | CamillaDSP 준비 확인 후 `DSP ready` 재생 |
 
 모든 서비스는 root로 동작한다. 이는 ALSA/HID, `/etc/camilladsp`, systemd 제어에 필요한 현재 설계 선택이며, 웹이 인증 없는 LAN 서비스라는 점과 함께 보안 경계를 결정한다.
@@ -43,6 +44,7 @@ flowchart LR
 - `copy_front`: L/R을 각각 한 번 convolution한 뒤 Front와 Rear로 복사한다. convolution 2개다.
 - `separate`: 입력을 Front/Rear로 복제한 뒤 각 L/R에 Front와 Rear FIR을 별도로 적용한다. convolution 4개다.
 - `bypass`: convolution 없이 입력 L/R을 Front/Rear에 복사한다.
+- `mimo_2x4`: 입력을 8개 경로로 펼쳐 각 물리 출력마다 L/R 전달 FIR을 적용하고 네 출력으로 합산한다. Pi4/5 전용이며 chunksize는 최소 1024다.
 - Rear FIR이 없으면 설정이 `separate`여도 유효 모드는 `copy_front`다.
 
 안내 WAV는 4채널 공유 dmix에 재생되지만 음성 샘플은 Front L/R에만 있고 Rear L/R은 무음이다.
@@ -57,10 +59,15 @@ flowchart LR
   "chunksize": 2048,
   "output_volume_db": -10,
   "bypass": {"speaker": false, "headphone": false},
+  "mimo_enabled": {"speaker": false, "headphone": false},
   "rear_mode": {"speaker": "copy_front", "headphone": "copy_front"},
   "woofer_trim_db": {"speaker": 0, "headphone": 0}
 }
 ```
+
+MIMO bank는 `/etc/camilladsp/profiles/mimo`의 manifest와 네 stereo float32 WAV로 관리한다. manifest의 네 WAV는 각기 입력 L/R→물리 출력 한 개의 두 경로이며 총 convolution은 8개다. T5S 한 대의 stereo 입력은 `sub_pair` 하나의 물리 제어원으로 측정하고 Rear L/R에 0.5씩 복제한다.
+
+전체 수식, 연구 근거, 측정 절차와 필터/물리 한계 분류는 `docs/MIMO_ROOM_TUNING.md`를 기준으로 한다.
 
 선택 프로필에 Front FIR이 있거나 bypass가 켜져 있으면 그대로 사용한다. 아니면 다른 프로필을 변경 없이 사용하고, 그것도 없으면 Factory Front를 사용한다. fallback은 파일을 복사하거나 선택값을 고쳐 쓰지 않고 runtime 해석 결과에만 나타난다.
 

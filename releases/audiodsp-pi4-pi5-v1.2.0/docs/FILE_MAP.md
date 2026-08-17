@@ -13,6 +13,7 @@
 | `audiodsp_pi_ed25519(.pub)` | 새 설치 SSH key pair; private 취급 |
 | `test_profile_matrix.py` | exhaustive isolated profile/Web/HID/volume 시험 |
 | `test_measurement_engine.py` | 합성 measurement/DSP 시험 |
+| `test_mimo_runtime.py` | 무음 2×4 bank 형식, 실제 CamillaDSP parser, Pi2 차단 시험 |
 | `SHA256SUMS.txt` | 릴리스 파일 inventory |
 
 ## Payload → 설치 위치
@@ -24,6 +25,7 @@
 | `audiodsp-profile-manager.py` | `/usr/local/bin/audiodsp-profile-manager.py` |
 | `audiodsp-profile-web.py` | `/usr/local/bin/audiodsp-profile-web.py` |
 | `audiodsp-measurement.py` | `/usr/local/bin/audiodsp-measurement.py` |
+| `audiodsp-mimo.py` | `/usr/local/bin/audiodsp-mimo.py` |
 | `audiodsp-profile-monitor.py` | `/usr/local/bin/audiodsp-profile-monitor.py` |
 | `audiodsp-output-profile` | `/usr/local/bin/audiodsp-output-profile` |
 | `audiodsp-dsp-ready` | `/usr/local/bin/audiodsp-dsp-ready` |
@@ -42,7 +44,8 @@
 | `/etc/camilladsp/camilladsp.yml` | 관리자 생성 config template |
 | `/run/camilladsp-active.yml` | 시작 래퍼가 U7 card ID를 치환한 실행 config |
 | `/etc/camilladsp/profiles/` | Factory/Speaker/Headphones Front/Rear 정식 FIR |
-| `/var/lib/audiodsp/profile-settings.json` | profile/chunksize/volume/bypass/rear/trim |
+| `/etc/camilladsp/profiles/mimo/` | 선택적 MIMO manifest와 네 2-input stereo FIR WAV |
+| `/var/lib/audiodsp/profile-settings.json` | profile/chunksize/volume/bypass/MIMO/rear/trim |
 | `/var/lib/audiodsp/output-profile` | legacy selection 호환 |
 | `/var/lib/audiodsp/u7-selector-state.json` | 실제 HID selector state |
 | `/var/lib/audiodsp/fir-preview.json` | 같은 boot에만 유효한 A/B preview |

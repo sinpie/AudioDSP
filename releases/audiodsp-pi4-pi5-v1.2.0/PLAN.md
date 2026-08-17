@@ -18,6 +18,10 @@
 - 측정 중 DSP direct bypass와 U7 입력 mute, 완료/오류 시 원상 복구
 - 버전형 전체 백업 ZIP, staging 검증, 적용 직전 자동 rollback ZIP
 - 4,096개 상태 진리표와 모든 설정 전이·웹·동시 쓰기 회귀 시험
+- Pi4/5 전용 MIMO Stereo/2.1/2.2 측정, robust 2×4 weighted pressure matching, 8-path 32768탭 bank
+- 주파수별 물리 출력 headroom 투영, 공통 인과 지연, 자연 roll-off/지원 제어원 regularization, SISO 전이대역
+- 결과마다 FIR/MIMO 가능·부분 가능·물리 처리·미측정·미인증을 구분한 영구 JSON/Markdown 보고서와 브라우저 다운로드
+- MIMO bank Preview/Apply/rollback, schema v2 전체 백업, Pi2 하드 차단과 Pi4/5 chunksize 1024 하한
 
 ## 변하지 않아야 하는 핵심 조건
 
@@ -32,7 +36,7 @@
 9. DHCP 실패용 임의 고정 주소를 만들지 않는다.
 10. Pi 2의 CPU·메모리 한계를 이유로 그래프 FFT를 서버에서 반복 계산하지 않는다.
 
-## 다음 릴리스 후보
+## 남은 실기 검증과 다음 릴리스 후보
 
 - HTTP 인증 또는 reverse proxy 옵션. 현재 UI는 신뢰된 LAN 전용이다.
 - WebSocket/SSE를 이용한 상태 push. 현재 1초 상태, 3초 볼륨 polling은 Pi 2에서 충분히 가볍다.
@@ -40,5 +44,7 @@
 - 측정 세션 목록·이름 지정·내보내기 UI.
 - Pi 5 실기 장시간 부하와 USB 복구 시험. 현재 Pi 5는 arm64 호환 설계와 번들 검증까지만 완료됐다.
 - 연구 알고리즘 변경 전 고정 측정 fixture와 수치 회귀 허용오차 정의.
+- 현재 방에서 사용자 승인 후 MIMO 2.1 실제 세 위치 측정, 독립 검증 위치 전/후 측정, 10분 이상 CPU/XRUN 모니터링.
+- 다중 레벨 Farina harmonic 분리, 측정점 3개 초과의 공간 가중, 별도 검증점 UI. 이들은 현재 보고서에서 `not_measured` 또는 `required`로 숨김 없이 표시한다.
 
 후보 기능은 현재 동작을 깨지 않는 별도 버전에서 진행한다. 특히 인증 추가나 볼륨 저장 정책 변경은 API 호환성과 부팅 동작을 바꾸므로 백업 스키마 및 문서 버전을 함께 올린다.

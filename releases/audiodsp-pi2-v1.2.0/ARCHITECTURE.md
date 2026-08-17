@@ -32,6 +32,7 @@ flowchart LR
 | 출력 전환 helper | `/usr/local/bin/audiodsp-output-profile` | manager 호출과 Front L/R 안내음 믹스 |
 | 웹 | `/usr/local/bin/audiodsp-profile-web.py` | 세 화면, HTTP API, staged upload/backup, client SVG, 실제 볼륨 polling |
 | 측정 엔진 | `/usr/local/bin/audiodsp-measurement.py` | 독점 측정, sweep 분석, 공간 결합, FIR 계산, 진행 상태 |
+| MIMO 엔진 | `/usr/local/bin/audiodsp-mimo.py` | 공통 코드와 bank 검증 제공; Pi2에서는 측정 선택과 8-path runtime 활성화를 명시적으로 거부 |
 | 준비 안내 | `/usr/local/bin/audiodsp-dsp-ready` | CamillaDSP 준비 확인 후 `DSP ready` 재생 |
 
 모든 서비스는 root로 동작한다. 이는 ALSA/HID, `/etc/camilladsp`, systemd 제어에 필요한 현재 설계 선택이며, 웹이 인증 없는 LAN 서비스라는 점과 함께 보안 경계를 결정한다.
@@ -43,6 +44,7 @@ flowchart LR
 - `copy_front`: L/R을 각각 한 번 convolution한 뒤 Front와 Rear로 복사한다. convolution 2개다.
 - `separate`: 입력을 Front/Rear로 복제한 뒤 각 L/R에 Front와 Rear FIR을 별도로 적용한다. convolution 4개다.
 - `bypass`: convolution 없이 입력 L/R을 Front/Rear에 복사한다.
+- `mimo_2x4`: 파일/설정 형식은 공통이나 Pi2 실시간 CPU·메모리 예산 때문에 생성·활성화하지 않는다. Pi4/5 전용이다.
 - Rear FIR이 없으면 설정이 `separate`여도 유효 모드는 `copy_front`다.
 
 안내 WAV는 4채널 공유 dmix에 재생되지만 음성 샘플은 Front L/R에만 있고 Rear L/R은 무음이다.
@@ -57,10 +59,13 @@ flowchart LR
   "chunksize": 2048,
   "output_volume_db": -10,
   "bypass": {"speaker": false, "headphone": false},
+  "mimo_enabled": {"speaker": false, "headphone": false},
   "rear_mode": {"speaker": "copy_front", "headphone": "copy_front"},
   "woofer_trim_db": {"speaker": 0, "headphone": 0}
 }
 ```
+
+전체 MIMO 토폴로지, 연구 근거와 룸 보정 한계는 `docs/MIMO_ROOM_TUNING.md`에 기록한다. Pi2 UI는 해당 옵션을 비활성으로 보여주며 API/CLI 우회도 거부한다.
 
 선택 프로필에 Front FIR이 있거나 bypass가 켜져 있으면 그대로 사용한다. 아니면 다른 프로필을 변경 없이 사용하고, 그것도 없으면 Factory Front를 사용한다. fallback은 파일을 복사하거나 선택값을 고쳐 쓰지 않고 runtime 해석 결과에만 나타난다.
 

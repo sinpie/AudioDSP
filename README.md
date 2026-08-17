@@ -1,6 +1,6 @@
 # AudioDSP
 
-AudioDSP is a Raspberry Pi audio processor for Xonar U7, CamillaDSP and UMIK-1. It provides 48 kHz convolution, independent Speaker/Headphone profiles, optional Front/Woofer routing, hardware-volume API control, a responsive Web UI, and a guided three-position room-correction workflow that produces 32768-tap stereo FIR WAV files.
+AudioDSP is a Raspberry Pi audio processor for Xonar U7, CamillaDSP and UMIK-1. It provides 48 kHz convolution, independent Speaker/Headphone profiles, optional Front/Woofer routing, hardware-volume API control, a responsive Web UI, and a guided three-position room-correction workflow that produces 32768-tap stereo FIR WAV files. Pi 4/5 additionally support an experimental robust 2-input×4-output MIMO FIR bank; Pi 2 deliberately remains SISO-only.
 
 ## Release bundles
 
@@ -19,13 +19,13 @@ Downloaded Raspberry Pi OS images, CamillaDSP binaries, private SSH keys, device
 - Missing Speaker/Headphone FIR falls back to the other profile and then the immutable Factory FIR
 - Uploads and generated tuning can be previewed, compared, discarded and backed up before Apply
 
-Room correction combines three nearby measurements, guarded/regularized cut-biased magnitude correction, optional low-frequency excess-phase correction, bass-mode control and octave-band decay diagnostics. Late reverberation is not aggressively inverted; only reliable long-decay low-frequency bands can receive an additional cut.
+Room correction combines three nearby measurements, guarded/regularized cut-biased magnitude correction, optional low-frequency excess-phase correction, bass-mode control and octave-band decay diagnostics. The optional MIMO path jointly optimizes independently measured speakers/subwoofers at the three positions, with frequency-dependent regularization, natural-rolloff penalties, correlated-input headroom limits and causal-delay checks. Late reverberation, nonlinear distortion and structural noise are diagnosed or marked unmeasured—not claimed as fixed by FIR.
 
 ## Documentation
 
 Start with [the reproduction documentation](AUDIODSP_REPRODUCTION_DOCS/README.md), then read the platform release README. Architecture, API, UI/UX, backup compatibility, testing, safety and algorithm details are maintained in both release bundles.
 
-The latest silent regression record is [SILENT_CALIBRATION_SELF_VALIDATION_20260818.md](AUDIODSP_REPRODUCTION_DOCS/SILENT_CALIBRATION_SELF_VALIDATION_20260818.md).
+The latest silent regression records are [SILENT_CALIBRATION_SELF_VALIDATION_20260818.md](AUDIODSP_REPRODUCTION_DOCS/SILENT_CALIBRATION_SELF_VALIDATION_20260818.md) and [MIMO_VALIDATION_REPORT_20260818.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_VALIDATION_REPORT_20260818.md). The algorithm, topology and correction limits are documented in [MIMO_ROOM_TUNING.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md).
 
 ## Validation
 

@@ -32,6 +32,8 @@
 - Level 결과는 OK/NOT OK, background, white-noise RMS, 추정 signal, SNR, peak를 카드로 보여준다.
 - Target을 바꾸면 1 kHz 기준 곡선과 bass/treble preference를 즉시 SVG에 반영한다.
 - 결과 그래프는 각 채널의 측정 전 ±공간 편차, 적용 후 예상, target을 구분한다.
+- Pi4/5는 SISO와 MIMO Stereo/2.1/2.2를 구분한다. Pi2는 MIMO 항목과 차단 이유를 보이되 선택할 수 없다.
+- MIMO 결과는 타깃 MAE, 좌석 편차, modal-tail 모델값, 제어원 coherence, headroom과 전체 보정 가능성 분류표를 보인다.
 - 다운로드와 A/B는 비파괴라고 명시하고, 정식 적용 버튼만 덮어쓰기 경고를 낸다.
 
 ## 설정 화면
@@ -40,6 +42,7 @@
 - Engine 표에서 chunksize를 바꾸면 오디오가 잠시 재시작된다고 표시한다.
 - Speaker/Headphones는 동일 구조의 카드다. U7 실제 선택 카드만 `active-profile` 외곽선과 badge를 가진다.
 - 카드에는 bypass, Front/Rear 파일 metadata, staged upload workflow, 기존/새 response graph, A/B, 정식 apply, Rear mode, woofer trim이 있다.
+- Speaker 카드에는 검증된 MIMO bank 설치/활성 상태와 8-path 여부를 표시한다. Headphones에는 4채널 MIMO 적용 버튼을 만들지 않는다.
 - 웹은 프로필 설정을 바꿀 수 있지만 U7 물리 LED/출력 selector를 바꾸는 버튼은 제공하지 않는다.
 
 ## 오류 방지
