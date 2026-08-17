@@ -1,0 +1,77 @@
+---
+title: "AudioDSP speaker / copy_front / Xonar U7"
+description: "Selectable Front/Rear FIR profile with Xonar U7 HID switching"
+
+devices:
+  samplerate: 48000
+  chunksize: 1024
+  queuelimit: 4
+  enable_rate_adjust: false
+  capture:
+    type: Alsa
+    channels: 2
+    device: "__CAPTURE_DEVICE__"
+    format: S32_LE
+    labels: ["Left", "Right"]
+  playback:
+    type: Alsa
+    channels: 4
+    device: "__PLAYBACK_DEVICE__"
+    format: S32_LE
+
+filters:
+  front_left:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "/etc/camilladsp/profiles/Speaker_Front_LR.wav"
+      channel: 0
+  front_right:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "/etc/camilladsp/profiles/Speaker_Front_LR.wav"
+      channel: 1
+
+mixers:
+  stereo_to_front_and_rear:
+    description: "Duplicate stereo to U7 Front L/R and Rear L/R"
+    labels: ["Front Left", "Front Right", "Rear Left", "Rear Right"]
+    channels:
+      in: 2
+      out: 4
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+            mute: false
+      - dest: 1
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+            mute: false
+      - dest: 2
+        sources:
+          - channel: 0
+            gain: 0
+            inverted: false
+            mute: false
+      - dest: 3
+        sources:
+          - channel: 1
+            gain: 0
+            inverted: false
+            mute: false
+
+pipeline:
+  - type: Filter
+    channels: [0]
+    names: ["front_left"]
+  - type: Filter
+    channels: [1]
+    names: ["front_right"]
+  - type: Mixer
+    name: "stereo_to_front_and_rear"

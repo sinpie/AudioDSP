@@ -1,0 +1,7 @@
+# Raspberry Pi scripts and checksum manifests must retain LF on Windows clones.
+* text=auto eol=lf
+
+*.wav binary
+*.img binary
+*.xz binary
+*.gz binary

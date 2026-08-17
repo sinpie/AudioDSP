@@ -1,0 +1,20 @@
+[Unit]
+Description=AudioDSP CamillaDSP Xonar U7 4-Channel Processor
+After=local-fs.target sound.target
+Wants=sound.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/audiodsp-camilladsp-start
+Restart=always
+RestartSec=3
+User=root
+Group=root
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=10
+
+[Install]
+WantedBy=multi-user.target

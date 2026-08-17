@@ -1,0 +1,38 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+    echo "Usage: audiodsp-output-profile speaker|headphone [--announce]" >&2
+    exit 2
+}
+
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
+profile="$1"
+announce=false
+manager="${AUDIODSP_PROFILE_MANAGER:-${GSONIC_PROFILE_MANAGER:-/usr/local/bin/audiodsp-profile-manager.py}}"
+aplay_bin="${AUDIODSP_APLAY:-${GSONIC_APLAY:-aplay}}"
+share_dir="${AUDIODSP_SHARE_DIR:-${GSONIC_SHARE_DIR:-/usr/local/share/audiodsp}}"
+if [ "$#" -eq 2 ]; then
+    [ "$2" = --announce ] || usage
+    announce=true
+fi
+
+case "$profile" in
+    speaker)
+        prompt="$share_dir/announce_speaker_48k_front_lr.wav"
+        ;;
+    headphone)
+        prompt="$share_dir/announce_headphone_48k_front_lr.wav"
+        ;;
+    *) usage ;;
+esac
+
+test -f "$prompt"
+/usr/bin/python3 "$manager" activate "$profile" >/dev/null
+sleep 0.15
+
+if $announce; then
+    "$aplay_bin" -q -D audiodsp_announce "$prompt"
+fi
+
+echo "AudioDSP output profile: $profile"

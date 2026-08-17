@@ -1,0 +1,71 @@
+#!/bin/bash
+set -euo pipefail
+
+BOOT_ROOT=/boot/firmware
+if [ ! -d "$BOOT_ROOT" ]; then
+    BOOT_ROOT=/boot
+fi
+exec > >(tee -a /var/log/audiodsp-pi2-ethernet-apply.log "$BOOT_ROOT/audiodsp-pi2-ethernet-apply.log") 2>&1
+
+systemctl enable NetworkManager.service 2>/dev/null || true
+systemctl start NetworkManager.service
+for attempt in $(seq 1 30); do
+    if nmcli general status >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+nmcli general status >/dev/null
+
+ethernet_if="$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2 == "ethernet" && $1 != "" { print $1; exit }')"
+if [ -z "$ethernet_if" ]; then
+    for candidate in /sys/class/net/eth* /sys/class/net/end* /sys/class/net/enx*; do
+        if [ -e "$candidate" ]; then
+            ethernet_if="$(basename "$candidate")"
+            break
+        fi
+    done
+fi
+if [ -z "$ethernet_if" ]; then
+    echo 'No Ethernet interface was found.' >&2
+    exit 1
+fi
+
+nmcli device set "$ethernet_if" managed yes
+nmcli connection delete audiodsp-ethernet >/dev/null 2>&1 || true
+nmcli connection add \
+    type ethernet \
+    ifname "$ethernet_if" \
+    con-name audiodsp-ethernet \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 100 \
+    ipv4.method auto \
+    ipv4.may-fail no \
+    ipv4.route-metric 100 \
+    ipv6.method auto
+
+nmcli --wait 45 connection up audiodsp-ethernet ifname "$ethernet_if"
+ipv4="$(ip -4 -o addr show dev "$ethernet_if" scope global 2>/dev/null | awk '{print $4}' | paste -sd, - || true)"
+
+if [ -z "$ipv4" ]; then
+    echo "Ethernet interface $ethernet_if did not receive a DHCP IPv4 address." >&2
+    exit 1
+fi
+
+systemctl enable ssh.service 2>/dev/null || true
+systemctl start ssh.service
+
+{
+    echo 'status=success'
+    echo "completed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "interface=$ethernet_if"
+    echo 'address_mode=dhcp'
+    echo "ipv4=$ipv4"
+} > "$BOOT_ROOT/audiodsp-pi2-network-success.txt"
+
+systemctl disable audiodsp-pi2-ethernet-apply.service || true
+rm -f /etc/systemd/system/audiodsp-pi2-ethernet-apply.service
+rm -f /usr/local/sbin/audiodsp-pi2-ethernet-apply
+systemctl daemon-reload
+sync
+exit 0

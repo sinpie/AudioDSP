@@ -1,0 +1,15 @@
+[Unit]
+Description=AudioDSP FIR Profile Web UI
+After=network.target camilladsp.service
+Wants=camilladsp.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/audiodsp-profile-web.py
+Restart=always
+RestartSec=2
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

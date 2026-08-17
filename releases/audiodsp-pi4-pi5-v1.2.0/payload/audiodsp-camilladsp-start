@@ -1,0 +1,81 @@
+#!/bin/bash
+set -euo pipefail
+
+TEMPLATE=/etc/camilladsp/camilladsp.yml
+ACTIVE=/run/camilladsp-active.yml
+
+# A/B preview is intentionally temporary. A same-boot service restart keeps it,
+# while the first CamillaDSP start after a reboot restores the saved profile.
+preview_state=/var/lib/audiodsp/fir-preview.json
+manager=/usr/local/bin/audiodsp-profile-manager.py
+if [ -x "$manager" ] && [ -r "$preview_state" ]; then
+    preview_boot="$(sed -n 's/.*"boot_id": "\([^"]*\)".*/\1/p' "$preview_state" | head -n 1)"
+    current_boot="$(tr -d '\r\n' < /proc/sys/kernel/random/boot_id)"
+    if [ -z "$preview_boot" ] || [ "$preview_boot" != "$current_boot" ]; then
+        "$manager" clear-stale-preview >/dev/null
+    fi
+fi
+
+# Prefer the exact USB ID of the original ASUS Xonar U7. Fall back to its
+# ALSA description so the setup also tolerates minor firmware-ID changes.
+card_index=""
+for usbid_file in /proc/asound/card*/usbid; do
+    [ -f "$usbid_file" ] || continue
+    if grep -Eqi '^1043:857c$' "$usbid_file"; then
+        card_index="${usbid_file#/proc/asound/card}"
+        card_index="${card_index%/usbid}"
+        break
+    fi
+done
+
+if [ -z "$card_index" ] && [ -r /proc/asound/cards ]; then
+    card_index="$(awk 'BEGIN { IGNORECASE=1 } /Xonar U7/ { gsub(/[^0-9]/, "", $1); print $1; exit }' /proc/asound/cards)"
+fi
+
+if [ -z "$card_index" ] || [ ! -r "/proc/asound/card${card_index}/id" ]; then
+    echo "Xonar U7 not found; retrying through systemd." >&2
+    exit 1
+fi
+
+card_id="$(tr -cd 'A-Za-z0-9_' < "/proc/asound/card${card_index}/id")"
+if [ -z "$card_id" ]; then
+    echo "Xonar U7 ALSA card ID is empty." >&2
+    exit 1
+fi
+
+capture_device="plughw:CARD=${card_id},DEV=0"
+playback_device="audiodsp_dsp"
+
+# The physical jack is shared by microphone and line input. Force the
+# line-level stereo source without changing the user's capture gain.
+if command -v amixer >/dev/null 2>&1; then
+    amixer -D "hw:${card_id}" set 'Mic' nocap >/dev/null 2>&1 || true
+    amixer -D "hw:${card_id}" set 'Line' cap >/dev/null 2>&1 || true
+    amixer -D "hw:${card_id}" set 'PCM Capture Source',0 'Line' >/dev/null 2>&1 || true
+    # Restore the saved global output level after every USB/power reset. The
+    # Xonar U7 exposes -127..0 dB as raw 0..127; AudioDSP intentionally limits
+    # its UI/API to the safer -60..0 dB interval.
+    output_volume_raw="$(python3 - <<'PY'
+import json
+from pathlib import Path
+
+volume_db = -10
+try:
+    saved = json.loads(Path("/var/lib/audiodsp/profile-settings.json").read_text(encoding="utf-8"))
+    candidate = saved.get("output_volume_db", volume_db)
+    if isinstance(candidate, int) and not isinstance(candidate, bool) and -60 <= candidate <= 0:
+        volume_db = candidate
+except (OSError, ValueError, TypeError):
+    pass
+print(127 + volume_db)
+PY
+)"
+    amixer -D "hw:${card_id}" set 'PCM',0 "$output_volume_raw" >/dev/null 2>&1 || true
+fi
+
+sed \
+    -e "s|__CAPTURE_DEVICE__|${capture_device}|g" \
+    -e "s|__PLAYBACK_DEVICE__|${playback_device}|g" \
+    "$TEMPLATE" > "$ACTIVE"
+
+exec /usr/local/bin/camilladsp "$ACTIVE"

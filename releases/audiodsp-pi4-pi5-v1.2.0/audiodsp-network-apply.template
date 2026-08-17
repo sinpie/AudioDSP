@@ -1,0 +1,87 @@
+#!/bin/bash
+set -euo pipefail
+
+BOOT_ROOT=/boot/firmware
+if [ ! -d "$BOOT_ROOT" ]; then
+    BOOT_ROOT=/boot
+fi
+exec > >(tee -a /var/log/audiodsp-network-apply.log "$BOOT_ROOT/audiodsp-network-apply.log") 2>&1
+
+ssid="$(printf '%s' '__SSID_B64__' | base64 --decode)"
+psk="$(printf '%s' '__PSK_B64__' | base64 --decode)"
+
+systemctl start NetworkManager.service
+for attempt in $(seq 1 30); do
+    if nmcli general status >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+nmcli general status >/dev/null
+
+if command -v raspi-config >/dev/null 2>&1; then
+    raspi-config nonint do_wifi_country KR || true
+fi
+if command -v iw >/dev/null 2>&1; then
+    iw reg set KR || true
+fi
+
+nmcli radio wifi on
+nmcli device set eth0 managed yes || true
+nmcli device set wlan0 managed yes || true
+
+nmcli connection delete audiodsp-ethernet >/dev/null 2>&1 || true
+nmcli connection add \
+    type ethernet \
+    ifname eth0 \
+    con-name audiodsp-ethernet \
+    ipv4.method auto \
+    ipv4.route-metric 100 \
+    ipv6.method auto \
+    connection.autoconnect yes
+# Let NetworkManager obtain Ethernet DHCP in parallel. A router that does not
+# answer DHCP must not delay Wi-Fi provisioning.
+
+nmcli connection delete audiodsp-wifi >/dev/null 2>&1 || true
+wifi_ok=0
+for attempt in $(seq 1 6); do
+    nmcli device wifi rescan ifname wlan0 ssid "$ssid" >/dev/null 2>&1 || true
+    if nmcli --wait 30 device wifi connect "$ssid" password "$psk" ifname wlan0 name audiodsp-wifi; then
+        wifi_ok=1
+        break
+    fi
+    sleep 5
+done
+if [ "$wifi_ok" -ne 1 ]; then
+    echo 'Wi-Fi activation failed; systemd will retry this service.' >&2
+    exit 1
+fi
+
+nmcli connection modify audiodsp-wifi \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 100 \
+    ipv4.method auto \
+    ipv4.route-metric 600 \
+    ipv6.method auto
+
+ethernet_ipv4="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | paste -sd, - || true)"
+wifi_ipv4="$(ip -4 -o addr show dev wlan0 2>/dev/null | awk '{print $4}' | paste -sd, - || true)"
+if [ -z "$ethernet_ipv4" ] && [ -z "$wifi_ipv4" ]; then
+    echo 'Neither Ethernet nor Wi-Fi received an IPv4 address.' >&2
+    exit 1
+fi
+
+unset psk
+{
+    echo 'status=success'
+    echo "completed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "ethernet_ipv4=$ethernet_ipv4"
+    echo "wifi_ipv4=$wifi_ipv4"
+} > "$BOOT_ROOT/audiodsp-network-success.txt"
+
+systemctl disable audiodsp-network-apply.service || true
+rm -f /etc/systemd/system/audiodsp-network-apply.service
+rm -f /usr/local/sbin/audiodsp-network-apply
+systemctl daemon-reload
+sync
+exit 0
