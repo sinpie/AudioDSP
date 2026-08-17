@@ -16,29 +16,29 @@ AudioDSP의 MIMO는 Dirac ART의 복제품이 아니다. 공개 연구의 robust
 
 ## 연구 근거와 채택 범위
 
-- Dirac의 공개 ART 설명은 여러 스피커를 공동 제어하는 MIMO, 최소 두 스피커, 주로 20–150 Hz의 능동 저역 제어를 설명한다. Stereo L/R도 서로 지원할 수 있어 sub가 필수는 아니지만, 실용적인 지원 스피커는 충분한 저역 재생 능력이 필요하다. 3개 이상의 유효 측정 위치를 요구하고 제어원·측정점이 늘면 공간 제어가 개선될 수 있다고 설명한다.  
+- Dirac의 공개 ART 설명은 여러 스피커를 공동 제어하는 MIMO, 최소 두 스피커, 주로 20–150 Hz의 능동 저역 제어를 설명한다. Stereo L/R도 서로 지원할 수 있어 sub가 필수는 아니지만, 실용적인 지원 스피커는 충분한 저역 재생 능력이 필요하다. 3개 이상의 유효 측정 위치를 요구하고 제어원·측정점이 늘면 공간 제어가 개선될 수 있다고 설명한다.
   - <https://www.dirac.com/resources/art-technology>
   - <https://helpdesk.dirac.com/en/dirac-art/Dirac-Live-Processor-ART-Stereo>
   - <https://helpdesk.dirac.com/en/dirac-art/Setup-Guide-c3cb>
   - <https://www.dirac.com/wp-content/uploads/2025/05/ART_Use-case-definition-and-setup-guidelines.pdf>
-- 공개 MIMO loudspeaker-room 보정 연구는 모든 스피커·위치의 전달함수를 공동 최적화하고 regularization, pre-ringing/robustness 제약으로 재생 오차와 공간 편차를 줄이는 틀을 제시한다. AudioDSP는 이 계열의 제약 최적화를 사용한다.  
+- 공개 MIMO loudspeaker-room 보정 연구는 모든 스피커·위치의 전달함수를 공동 최적화하고 regularization, pre-ringing/robustness 제약으로 재생 오차와 공간 편차를 줄이는 틀을 제시한다. AudioDSP는 이 계열의 제약 최적화를 사용한다.
   - DOI 10.1109/TASL.2013.2245650, *Compensation of Loudspeaker–Room Responses in a Robust MIMO Control Framework*
-- 최근 weighted pressure matching 연구는 공간 가중과 주파수별 안정화가 다중점 sound-field control의 강건성에 중요함을 다룬다.  
+- 최근 weighted pressure matching 연구는 공간 가중과 주파수별 안정화가 다중점 sound-field control의 강건성에 중요함을 다룬다.
   - <https://arxiv.org/abs/2210.14711>
   - <https://arxiv.org/abs/2303.13027>
-- 2025년 orthogonal loudspeaker matching 연구는 다중 스피커의 상호 독립성을 이용한 공간 제어 방향을 검토한다.  
+- 2025년 orthogonal loudspeaker matching 연구는 다중 스피커의 상호 독립성을 이용한 공간 제어 방향을 검토한다.
   - <https://www.sciencedirect.com/science/article/pii/S0003682X24006583>
-- 2026년 weighted acoustic model matching은 sparse transfer-function 측정에 kernel interpolation을 더해 연속 영역 목표를 구성한다. 현재 AudioDSP에는 측정 좌표·방 기하와 충분한 센서 수가 없으므로 가짜 보간점을 만들지 않고 보류했다.  
+- 2026년 weighted acoustic model matching은 sparse transfer-function 측정에 kernel interpolation을 더해 연속 영역 목표를 구성한다. 현재 AudioDSP에는 측정 좌표·방 기하와 충분한 센서 수가 없으므로 가짜 보간점을 만들지 않고 보류했다.
   - DOI 10.1016/j.jsv.2025.119489: <https://www.sciencedirect.com/science/article/pii/S0022460X25005620>
-- 2023년 UMIF-LCMV 연구도 제한된 실제 센서와 plane-wave interpolation으로 제어 영역을 넓힌다. 세 점 UMIK 절차에 그대로 적용하면 가정이 충족되지 않으므로 향후 측정점·좌표 기능과 함께 검토한다.  
+- 2023년 UMIF-LCMV 연구도 제한된 실제 센서와 plane-wave interpolation으로 제어 영역을 넓힌다. 세 점 UMIK 절차에 그대로 적용하면 가정이 충족되지 않으므로 향후 측정점·좌표 기능과 함께 검토한다.
   - DOI 10.1121/10.0017721: <https://pubmed.ncbi.nlm.nih.gov/37092918/>
-- 2026년 common excess-phase zero 식별 연구는 다중 위치 mixed-phase 보정에서 ringing 정량화의 중요성을 보여준다. 현재 구현은 더 보수적으로 저역만, 기존 도착 phase 유지, 공통 지연과 pre-energy 검사를 사용한다. sub-band zero 식별은 아직 구현하지 않았으며 보고서에 phase 보정을 `limited_*`로 표시한다.  
+- 2026년 common excess-phase zero 식별 연구는 다중 위치 mixed-phase 보정에서 ringing 정량화의 중요성을 보여준다. 현재 구현은 더 보수적으로 저역만, 기존 도착 phase 유지, 공통 지연과 pre-energy 검사를 사용한다. sub-band zero 식별은 아직 구현하지 않았으며 보고서에 phase 보정을 `limited_*`로 표시한다.
   - DOI 10.1016/j.apacoust.2025.111153: <https://www.sciencedirect.com/science/article/abs/pii/S0003682X25006255>
-- 2026년 cue-constrained Tikhonov은 두 청취자의 binaural cue를 목적함수로 분리한다. 단일 omni UMIK-1에는 귀별 전달함수가 없어 적용 조건이 없으므로, IACC/양이간 항목을 `not_measured`로 유지한다.  
+- 2026년 cue-constrained Tikhonov은 두 청취자의 binaural cue를 목적함수로 분리한다. 단일 omni UMIK-1에는 귀별 전달함수가 없어 적용 조건이 없으므로, IACC/양이간 항목을 `not_measured`로 유지한다.
   - <https://link.springer.com/article/10.1186/s13636-026-00461-6>
-- 다중 sub 배치는 좌석 간 저주파 편차를 줄여 후단 EQ가 효과적으로 동작하게 할 수 있다.  
+- 다중 sub 배치는 좌석 간 저주파 편차를 줄여 후단 EQ가 효과적으로 동작하게 할 수 있다.
   - Welti & Devantier, AES Journal: <https://secure.aes.org/forum/pubs/journal/?elib=13680>
-- CamillaDSP는 mixer로 중간 채널 수를 늘리고 임의의 FIR pipeline을 구성할 수 있다. AudioDSP는 2→8 확장, 8 convolution, 8→4 합산을 사용한다.  
+- CamillaDSP는 mixer로 중간 채널 수를 늘리고 임의의 FIR pipeline을 구성할 수 있다. AudioDSP는 2→8 확장, 8 convolution, 8→4 합산을 사용한다.
   - <https://github.com/HEnquist/camilladsp>
 
 연구·상용 제품의 아이디어를 참고하되 비공개 구현이나 특허 청구항을 복제하지 않는다. “ART-like”는 여러 출력의 측정 응답을 공동 최적화한다는 기능 범주를 뜻하며, ART와 동일 성능 또는 인증을 뜻하지 않는다.
