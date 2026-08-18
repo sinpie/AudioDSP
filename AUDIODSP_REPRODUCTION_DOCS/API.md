@@ -91,9 +91,9 @@ MIMO 결과의 `/download/all`은 네 MIMO WAV, MIMO manifest, JSON/Markdown 보
 
 고정 경로가 바뀌면 측정/검증/Preview는 HTTP 400으로 실패한다. 생성 결과의 profile과 다른 `/measurement/preview` 또는 `/measurement/apply` 요청도 HTTP 400이며 WAV/settings는 변경되지 않는다.
 
-측정 실행은 현재 HTML form POST 경로를 사용한다: `/measurement/new`, `/configure`, `/session-note`, `/load-session`, `/level`, `/position`, `/restart-positions`, `/validation`, `/build`, `/preview`, `/restore`, `/apply`, `/cancel`, `/calibration`. Session은 자동 저장되며 `/session-note`는 진행 상태를 건드리지 않고 최대 500자 주석만 저장한다. `/load-session`은 저장 artifact 무결성을 확인하고 완료된 1–6 checkpoint를 복원한다.
+측정 실행은 현재 HTML form POST 경로를 사용한다: `/measurement/new`, `/configure`, `/configure-level`, `/session-note`, `/load-session`, `/delete-session`, `/level`, `/position`, `/restart-positions`, `/validation`, `/post-validation`, `/reset-post-validation`, `/build`, `/preview`, `/restore`, `/apply`, `/cancel`, `/calibration`. Session은 자동 저장되며 `/session-note`는 진행 상태를 건드리지 않고 최대 500자 주석만 저장한다. `/load-session`은 저장 artifact 무결성을 확인하고 완료된 1–6 checkpoint를 복원한다. `/delete-session`은 정확한 ID와 내부 symbolic link 부재를 확인한 뒤 그 session의 측정 원본/생성물만 삭제하며 정식 프로필 FIR은 건드리지 않는다. 현재 session을 삭제하면 Preview를 먼저 복구하고 idle 상태로 돌아간다.
 
-내부 measurement CLI에는 `list-sessions`, `set-session-note <text>`, `load-session <id>`가 있다. Web의 1단계 session 목록은 `list-sessions`의 ID, 완료 위치, 결과 유무와 인접 주석을 사용한다.
+내부 measurement CLI에는 `list-sessions`, `set-session-note <text>`, `load-session <id>`, `delete-session <id>`가 있다. Web의 1단계 session 목록은 `list-sessions`의 ID, 완료 위치, 결과 유무와 인접 주석을 사용한다.
 
 `result`에는 `self_validation`(실제 FIR FFT/target-fit/전달 이득/impulse),
 `room_decay`(채널별 octave T20→RT60), `graphs.*.actual_correction_db`,
@@ -113,6 +113,8 @@ MIMO 결과는 `kind=mimo_2x4`, `mimo`, `mimo_files`, `room_tuning_audit`를 추
 - `crossover_frequency_hz=60|70|80|90|100|120`: 기본 `100`
 
 SISO 결과의 `result.crossover`는 `embedded_in_fir`, `frequency_hz`, `additional_runtime_filters=0`, `additional_block_latency_samples=0`, `coherent_upper_guard_pass`, `complex_sum_target_pass`, `phase_alignment_reliable`, `status`를 제공한다. MIMO 결과는 같은 top-level 필드와 `mimo.crossover`를 제공하고, 실제 Woofer trim transfer 한계는 `mimo.headroom.physical_output_limits`에서 확인한다. 합산 L/R 모드는 독립 branch가 없으므로 crossover `on` 요청을 HTTP 400으로 거부한다.
+
+측정 구성 값은 `lr`, `lrw_sum`, `lrw`, `mimo_stereo`, `mimo_one_sub`, `mimo_dual_sub`다. 새 session UI 기본은 `lrw_sum`이다. `lrw_sum`은 위치마다 L/R/W/L+W/R+W를 측정하지만 L/R/W만 설계에 사용하고 합산 두 응답은 `premeasured_sum_validation`과 `self_validation.premeasured_sum_model`에만 들어간다. 합산 closure와 최종 예측이 통과하면 `crossover_sum.status=pass_premeasured_model`이다. 더 빠른 `lrw`도 같은 capture/playback clock의 절대 impulse reference를 보존한 L/R/W 복소응답으로 최종 합산을 판정해 `pass_independent_complex_model`이 된다. 두 구성 모두 FIR 생성 뒤 필수 sweep을 요구하지 않는다. `/measurement/post-validation`은 이전 session의 진행값을 복구하거나 별도 acoustic audit를 수행할 때만 쓰는 선택 API다.
 
 ## 백업
 

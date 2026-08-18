@@ -1,5 +1,30 @@
 # 변경 이력
 
+## 2026-08-19 · 구조·보정·Pi 5 2 GB 검증
+
+- 공통 runtime/assets/tests를 `source/common` 한 사본으로 통합하고 Pi2/3/4/5 overlay manifest와 deterministic `build/<platform>` materializer를 추가; release의 중복 payload/docs/tests/legacy tree 제거
+- 두 SD writer가 기록 직전 canonical source를 조립하고 전체 byte 일치, image/Camilla/FIR hash와 정책 marker를 검증하도록 변경
+- 제품·서비스·환경변수 식별자를 AudioDSP/audiodsp로 통일하고 이전 environment fallback을 제거
+- 기본 보정 기준을 target + 저역 억제 `none` + Woofer trim `0 dB`로 고정; Strong/Primus/음수 trim을 기준 튜닝 이후 의도적 추가 감쇄로 분리
+- magnitude/phase/crossover 각 단계의 채널별 peak 정규화가 Front/Woofer 상대레벨과 LR4 합산을 바꾸던 문제를 제거하고 전체 FIR bank에 공통 normalization 한 번만 적용
+- 측정 출력 dBFS와 임시 Woofer 감쇄가 전달함수 크기를 바꾸지 않는 scale-relative regularized deconvolution 회귀 추가
+- 권장 정밀 측정 `L/R/W/L+W/R+W`를 추가해 FIR 계산 전에 절대 복소합 closure를 검증하고, L+W/R+W를 보정·평균·독립 normalize하지 않도록 고정; 통과 시 사후 sweep 제거
+- 표준 L/R/W와 MIMO도 동일 capture/playback clock의 절대 복소 전달함수 PASS를 적용 게이트로 사용해 FIR 생성 뒤 필수 재측정을 제거하고, 적용 후 acoustic sweep은 선택 audit로 분리
+- 실제 FIR 사후 L+Woofer/R+Woofer 합산, Fast 1위치 N/A semantics, Standard 3위치 안정성, 18 target/preset 조합과 94개 SISO UI 옵션 시나리오를 실제 32768탭 무음 합성 fixture로 검증
+- phase 신뢰 시 crossover guard를 이론적 `|Front|+|Woofer|` 상한이 아니라 세 위치 실제 복소합 최대값으로 변경하고, 저역 극성 ±/상대 지연 robust 탐색 추가; phase 불신뢰 때만 보수적 상한 fallback
+- MIMO가 미정규화 SISO 중간값과 headroom 제한 후 bank를 비교해 false FAIL을 만들던 오류를 수정; deployable SISO bank 공통 정규화, 한 reference-band target-shape 평가, 실제 global 감쇄 분리 보고 추가
+- Flat/추가 억제 없음/trim 0 dB 기준에서 MIMO Stereo/2.1/2.2 모델 PASS, MIMO UI 19개 bank 구조 PASS와 비기준 5개 modal-tail 안전 차단 검증
+- 자동 진단 FAIL/PENDING/N/A 안내를 실제 1–5단계, select, 실행 버튼명으로 통일하고 MIMO core별 조치 추가
+- active session 삭제·idle 복귀·정식 FIR 불변·중복 삭제 거부를 Web matrix에 추가
+- Web이 알고리즘 revision을 따로 하드코딩해 새 결과를 stale로 오판하던 오류를 제거하고 measurement engine을 단일 revision 원본으로 사용
+- 4096 profile 상태, 3136 ordered setting pairs, 28 Camilla config, 33 concurrent writes와 전체 UI/API/backup/preview 경로 재검증
+- Pi 5 2 GB 계획 검증 추가: 현재 8경로 runtime/생성 46/309 MiB, 5.1+dual-sub 완전 dense 42경로 135/530 MiB, 64-bit 실제 배열 allocation peak 138.64 MiB
+- MIMO 생성기가 path spectrum을 causalization 전에 해제하고 bank scaling을 in-place로 수행해 향후 5.1 생성 피크를 제한
+- Woofer 독립 LPF branch를 full-range target과 비교하던 MAE/P90 false FAIL을 제거하고, 실제 Front+Woofer 합산 target 오차와 crossover 중앙 오차를 별도 진단으로 표시
+- MAE/P90의 의미, 높음/낮음 방향, 실제 메뉴 `4 · FIR 계산`의 수정 control과 `3 · 위치 측정` 재측정 대상을 FAIL 카드에 직접 안내
+- 390×844/1440×1200 실제 Chrome CDP 회귀를 추가해 1–6 탭, disclosure, 자동 새로고침 없음, 가로 overflow 없음과 앱/단계 탭의 구별을 검증
+- production Pi 2를 `audiodsp-pi2`/`audiodsp`/`audiodsp-ethernet`으로 단계 이전하고 새 SSH·sudo 확인 뒤 이전 식별자를 활성 경로에서 제거; CamillaDSP PID/FIR/볼륨 보존
+
 ## 2026-08-18 · v1.2 유지보수 revision
 
 - 활성 session 요약/주석을 1–6 탭 위로 이동하고 자동 저장된 session 목록, 주석과 함께 불러오기, 완료 checkpoint 전체 복원, 누락 artifact 차단을 추가
@@ -71,4 +96,4 @@
 
 ## 이전 기준
 
-`legacy-v1-reference`와 `pi2-strong-bass-4ch-v1.1.0`에 GSonic 이름의 개발·장애 대응 이력이 보존되어 있다. 이 항목들은 새 릴리스 입력이 아니다.
+이전 개발·장애 대응 자료는 Git 이력에 보존한다. 현재 source/release tree에는 이전 제품 식별자를 남기지 않으며, 이력 파일을 새 릴리스 입력으로 사용하지 않는다.

@@ -1,0 +1,11 @@
+{
+  "id": "pi3",
+  "inherits": "pi2",
+  "family": "armv7",
+  "models": ["Raspberry Pi 3 Model B", "Raspberry Pi 3 Model B+"],
+  "memory_min_mb": 768,
+  "mimo_supported": false,
+  "default_chunksize": 2048,
+  "release": "releases/audiodsp-pi2-v1.2.0",
+  "notes": "Uses the Pi 2 ARMv7 low-memory bundle unchanged; chunksize can be lowered in the Web UI after load testing."
+}

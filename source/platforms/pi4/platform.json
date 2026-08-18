@@ -1,0 +1,10 @@
+{
+  "id": "pi4",
+  "family": "arm64",
+  "models": ["Raspberry Pi 4 Model B"],
+  "memory_min_mb": 1024,
+  "mimo_supported": true,
+  "default_chunksize": 1024,
+  "release": "releases/audiodsp-pi4-pi5-v1.2.0",
+  "notes": "Primary ARM64 release source."
+}

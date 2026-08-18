@@ -91,7 +91,7 @@ Release: 1.2.0 · 2026-08-18
 - Multi-position response aggregation with uncertainty-dependent correction.
 - Robust MIMO loudspeaker-room compensation (IEEE TASL, DOI 10.1109/TASL.2013.2245650).
 - Weighted pressure matching (arXiv:2210.14711, arXiv:2303.13027) and multi-sub
-  spatial-variance literature; see `docs/MIMO_ROOM_TUNING.md` for links/scope.
+  spatial-variance literature; see `../../AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md` for links/scope.
 
 AudioDSP deliberately uses conservative deterministic DSP inspired by these
 principles; its MIMO is an independent feed-forward FIR implementation and does

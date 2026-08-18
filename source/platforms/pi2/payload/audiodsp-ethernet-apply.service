@@ -1,0 +1,15 @@
+[Unit]
+Description=AudioDSP Pi 2 one-time Ethernet provisioning
+After=NetworkManager.service
+Wants=NetworkManager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/audiodsp-ethernet-apply
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

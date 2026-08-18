@@ -14,7 +14,7 @@ Pi 2 using the shared SISO code: exactly one L+Woofer, one R+Woofer and one
 Woofer-only generation sweep; all 67 option variants and 134 FIR WAVs; 136/136
 usable acoustic validation captures; two successful low-SNR retries; and
 generated-FIR preview/apply/restore.  See
-`docs/FULL_OPTION_E2E_REPORT_20260818.md`.  Pi 5 2 GB is sufficient for the
+`../../AUDIODSP_REPRODUCTION_DOCS/FULL_OPTION_E2E_REPORT_20260818.md`.  Pi 5 2 GB is sufficient for the
 AudioDSP-only MIMO target; 4 GB is not required.
 
 ## Profile and Web matrix
@@ -108,7 +108,7 @@ AudioDSP-only MIMO target; 4 GB is not required.
 - SISO and MIMO builds now persist JSON and Markdown room-tuning audits that
   separate FIR/MIMO-correctable findings from placement/treatment limits,
   unmeasured items and required runtime/post-measurement validation.
-- See `MIMO_VALIDATION_REPORT.md` for metrics and the remaining sound-producing
+- See `../../AUDIODSP_REPRODUCTION_DOCS/MIMO_VALIDATION_REPORT_20260818.md` for metrics and the remaining sound-producing
   Pi 4/5 MIMO acceptance tests. The acoustic sweep above validates SISO only.
 
 ## Final read-only live check
@@ -173,3 +173,10 @@ change the profile, FIR, volume or persistent audio configuration. Pre-deploymen
 - Common request handling absorbs normal BrokenPipe/ConnectionReset client
   disconnects at the connection boundary so polling-browser navigation does not
   produce misleading Web error tracebacks.
+
+## 2026-08-19 final common-source validation
+
+- The shared SISO source passed Flat/none/0 dB baseline, 18 target/preset and 94 UI-option 32768-tap scenarios. Precision L/R/W/L+W/R+W validates crossover closure before build; target-fit diagnostics use the full audible sum rather than a standalone LPF branch.
+- MIMO Stereo/2.1/2.2 baseline models passed. The 19-option matrix intentionally rejected five unsafe modal-tail variants instead of weakening the safety gate.
+- Pi 5 2 GB planning passed for the current 2×4 bank and a dense 5.1+dual-sub 6×7/42-path worst case: 135 MiB runtime plan, 530 MiB generation plan and 138.64 MiB measured 64-bit array allocation peak. CPU/XRUN remains a required Pi 5 hardware acceptance test.
+- Pi 2/3/4/5 deterministic materialization, both release writer validation paths, exact Chrome CDP PC/mobile UI regression, Python compile and shell syntax checks passed. This does not claim a Pi 4/5 acoustic or real-time MIMO hardware acceptance test.

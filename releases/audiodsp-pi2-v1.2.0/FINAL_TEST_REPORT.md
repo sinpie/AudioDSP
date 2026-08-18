@@ -13,7 +13,7 @@ The later complete fixed-microphone end-to-end run also passed: exactly one
 L+Woofer, one R+Woofer and one Woofer-only generation sweep; all 67 option
 variants and 134 FIR WAVs; 136/136 usable acoustic validation captures; two
 successful low-SNR retries; and generated-FIR preview/apply/restore.  See
-`docs/FULL_OPTION_E2E_REPORT_20260818.md`.  After the transaction test, the
+`../../AUDIODSP_REPRODUCTION_DOCS/FULL_OPTION_E2E_REPORT_20260818.md`.  After the transaction test, the
 original managed FIR and the user's RefinedTone preview were restored.
 
 ## Profile and Web matrix
@@ -107,7 +107,7 @@ original managed FIR and the user's RefinedTone preview were restored.
 - SISO and MIMO builds now persist JSON and Markdown room-tuning audits that
   separate FIR/MIMO-correctable findings from placement/treatment limits,
   unmeasured items and required runtime/post-measurement validation.
-- See `MIMO_VALIDATION_REPORT.md` for metrics and the remaining sound-producing
+- See `../../AUDIODSP_REPRODUCTION_DOCS/MIMO_VALIDATION_REPORT_20260818.md` for metrics and the remaining sound-producing
   Pi 4/5 MIMO acceptance tests. The acoustic sweep above validates SISO only.
 
 ## Final read-only live check
@@ -198,3 +198,11 @@ change the profile, FIR, volume or persistent audio configuration. Pre-deploymen
   `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`.
   Previous Web code is recoverable from
   `/usr/local/bin/audiodsp-profile-web.py.pre-disclosure-final-20260818`.
+
+## 2026-08-19 final silent validation and identity migration
+
+- The canonical SISO engine passed the Flat/none/0 dB baseline plus 18 target/preset and 94 selectable-option 32768-tap scenarios. Precision L/R/W/L+W/R+W closes the crossover before build; Standard L/R/W uses the same-clock complex model. Neither path requires an impossible late mandatory sweep.
+- Standalone Woofer LPF is no longer compared with a full-range target. Target-fit MAE/P90 is evaluated on the audible Front+Woofer sum and the UI names the exact stage/control or measurement to change when a gate fails.
+- Exact Chrome CDP tests passed at 390×844 and 1440×1200 for all pages and all six workflow tabs: no document overflow, one visible panel, correct ARIA/hash state, disclosure toggling and zero unexpected navigation.
+- Production identity is `audiodsp-pi2` / `audiodsp` / `audiodsp-ethernet`; new-account SSH and sudo were verified before legacy identity removal. Active-path legacy-name searches returned zero.
+- Final live preservation check: all three services active, CamillaDSP PID `7731`, Speaker FIR SHA-256 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`, saved/actual U7 volume `0 dB` on eight uniform channels. No sound was played and no FIR/profile/volume was changed.

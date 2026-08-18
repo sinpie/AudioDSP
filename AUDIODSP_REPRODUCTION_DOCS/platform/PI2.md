@@ -56,4 +56,6 @@ Pi 2는 onboard Wi-Fi가 없으므로 USB Wi-Fi는 별도 driver/NetworkManager 
 
 ## 기존 운용 장치
 
-기존 장치는 무중단 이전 때문에 hostname `gsonic-pi2`, user `gsonic`을 유지할 수 있다. 서비스와 앱 파일은 `audiodsp-*`, 상태는 `/var/lib/audiodsp`다. 새 SD는 반드시 위의 새 이름을 사용한다.
+기존 장치도 hostname `audiodsp-pi2`, user `audiodsp`, 서비스·앱 `audiodsp-*`, 상태 `/var/lib/audiodsp`로 통일한다. SSH와 sudo를 새 계정으로 확인하기 전에는 기존 계정을 제거하지 않는 단계적 이전 절차를 따른다.
+
+2026-08-19 production 장치는 이 절차를 완료했다. 새 `audiodsp` 계정은 기존 장치 이전 때문에 UID 1001이며, 신규 SD의 UID 1000과 달라도 파일 소유권과 실행에는 문제가 없다. Ethernet 연결 이름은 `audiodsp-ethernet`이고 UUID/IP 할당 방식은 유지했다. 이전 과정에서 CamillaDSP PID `7731`, Speaker FIR SHA, 저장/실제 U7 볼륨 `0 dB`를 보존했다.

@@ -79,7 +79,7 @@ temporarily bypasses CamillaDSP and disables the U7 Mic/Line capture switches.
 Each generated SISO result saves browser-downloadable `Room_Tuning_Report.json`
 and `.md`, explicitly separating FIR-correctable, limited, physical-treatment,
 not-measured and not-certified room factors.
-See `docs/MIMO_ROOM_TUNING.md` and `MIMO_VALIDATION_REPORT.md` for the common
+See `../../AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md` and `../../AUDIODSP_REPRODUCTION_DOCS/MIMO_VALIDATION_REPORT_20260818.md` for the common
 design, Pi2 block, silent validation evidence, and remaining Pi4/5 real tests.
 
 Three nearby listening positions can be measured for L/R or L/R plus woofer.
@@ -101,9 +101,12 @@ Primus-like and Strong woofer-control presets are provided.
 Independent L/R/Woofer correction defaults to a 100 Hz LR4 digital crossover:
 Front HPF, Woofer LPF and a three-position cut-only sum guard are embedded in
 the same 32768-tap WAVs. This adds no CamillaDSP filter stage or block latency.
-The UI does not call the acoustic sum PASS without reliable phase and a joint
-Front+Woofer prediction; final acceptance still requires a low-level validation
-sweep after Preview. Combined L+Woofer/R+Woofer mode cannot split independent
+The recommended precision session measures L/R/W and L+Woofer/R+Woofer at the
+same one/three positions. Only L/R/W design the FIR; the two sums verify the
+absolute complex closure without independent normalization. If that model and
+the final FIR prediction pass, no later validation sweep is required. The
+faster standard L/R/W session still requires a low-level validation sweep after
+Preview. Combined L+Woofer/R+Woofer mode cannot split independent
 branches and therefore requires crossover OFF.
 The result page verifies the actual truncated FIR FFT, normalized target-fit
 MAE/P90, maximum transfer, finite samples and early impulse position.
@@ -122,5 +125,5 @@ Bash syntax, UI/measurement safety features, target disk identity, every copied
 payload hash, `cmdline.txt`, and the final FAT volume.
 
 See `AUDIODSP_REQUIREMENTS_VERIFIED.md` for the feature-by-feature record and
-`docs/README.md` for the complete reproduction, architecture, API, platform,
+`../../AUDIODSP_REPRODUCTION_DOCS/README.md` for the complete reproduction, architecture, API, platform,
 testing, and recovery documentation.

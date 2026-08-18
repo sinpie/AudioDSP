@@ -34,8 +34,8 @@ test -f "$PAYLOAD_DIR/audiodsp-profile-monitor.py"
 test -f "$PAYLOAD_DIR/audiodsp-profile-monitor.service"
 test -f "$PAYLOAD_DIR/audiodsp-dsp-ready"
 test -f "$PAYLOAD_DIR/audiodsp-ready.service"
-test -f "$PAYLOAD_DIR/audiodsp-pi2-ethernet-apply"
-test -f "$PAYLOAD_DIR/audiodsp-pi2-ethernet-apply.service"
+test -f "$PAYLOAD_DIR/audiodsp-ethernet-apply"
+test -f "$PAYLOAD_DIR/audiodsp-ethernet-apply.service"
 command -v python3 >/dev/null
 command -v aplay >/dev/null
 command -v flock >/dev/null
@@ -157,10 +157,10 @@ systemctl enable audiodsp-ready.service
 # Pi 2 Model B Rev 1.1 has no onboard Wi-Fi. Create a persistent, explicit
 # NetworkManager Ethernet profile on the normal boot after this first-run job.
 systemctl enable NetworkManager.service 2>/dev/null || true
-install -m 0700 "$PAYLOAD_DIR/audiodsp-pi2-ethernet-apply" /usr/local/sbin/audiodsp-pi2-ethernet-apply
-install -m 0644 "$PAYLOAD_DIR/audiodsp-pi2-ethernet-apply.service" /etc/systemd/system/audiodsp-pi2-ethernet-apply.service
+install -m 0700 "$PAYLOAD_DIR/audiodsp-ethernet-apply" /usr/local/sbin/audiodsp-ethernet-apply
+install -m 0644 "$PAYLOAD_DIR/audiodsp-ethernet-apply.service" /etc/systemd/system/audiodsp-ethernet-apply.service
 systemctl daemon-reload
-systemctl enable audiodsp-pi2-ethernet-apply.service
+systemctl enable audiodsp-ethernet-apply.service
 cat > "$BOOT_ROOT/network-config" <<'NETCONFIGEOF'
 # AudioDSP Pi 2 Ethernet-only networking.
 network:
@@ -177,7 +177,7 @@ NETCONFIGEOF
     echo "completed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo 'hostname=audiodsp-pi2'
     echo 'service=camilladsp.service'
-    echo 'network_next_boot=audiodsp-pi2-ethernet-apply.service'
+    echo 'network_next_boot=audiodsp-ethernet-apply.service'
     echo 'capture=plughw:CARD=U7,DEV=0'
     echo 'playback=audiodsp_dsp_to_u7_dev0'
     echo 'profiles=speaker_strong_bass,headphone_falls_back_to_speaker,bypass_per_profile'

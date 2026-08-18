@@ -28,6 +28,10 @@
 - 합성·parser 검증은 통과했지만 실제 방 성능과 Pi 4/5 지속 부하는 아직 실기 인증 전이다. 10분 이상의 CPU/XRUN/온도/USB 검사와 사용하지 않은 위치의 전후 재측정이 필수다.
 - Pi 5는 설계상 호환 대상이며, 실제 U7 장시간 시험 전까지 하드웨어 검증 완료로 표시하지 않는다.
 
+### Pi 5 2 GB 메모리 판정
+
+현재 2×4/8경로는 실시간 46 MiB, 생성 309 MiB의 보수적 계획값이다. 향후 5.1 입력 6개를 main 5개+독립 subwoofer 2개 출력에 완전 dense로 연결하는 42경로 worst case도 실시간 135 MiB, 생성 530 MiB다. 64-bit CPython의 같은 배열 생명주기 실제 allocation probe peak는 138.64 MiB였다. OS Lite와 AudioDSP 전용이라면 2 GB에 충분하다. 단, 42경로의 연산량은 약 64.6 M partition complex MAC/s이므로 메모리 PASS가 실시간 CPU/XRUN PASS를 뜻하지 않는다. 5.1은 diagonal FIR부터 지원하고 저역 MIMO group을 분리하는 설계를 우선한다.
+
 ## 설치
 
 1. `WRITE_FINAL_SD_CARD.cmd`를 관리자 권한으로 실행한다.
@@ -55,6 +59,7 @@ Pi 5에서 최종 release로 선언하려면 다음을 별도로 기록한다.
 - `/api/volume` 8채널 read/write
 - 2/4 convolution에서 10분 CPU/XRUN/온도
 - 8 convolution MIMO 2.1/2.2에서 10분 CPU/XRUN/온도와 effective chunksize 1024 확인
+- 최종 5.1 지원 전 6경로 diagonal과 저역-group MIMO를 각각 시험; 42경로 완전 dense는 별도 성능 수락 전 비지원
 - UMIK level test와 한 개 full 32768-tap build
 - reboot 후 volume/profile 복원
 

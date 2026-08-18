@@ -1,11 +1,11 @@
 # AudioDSP 재현 문서
 
-이 폴더는 AudioDSP v1.2 릴리스를 다시 만들고, 수정하고, 실제 Raspberry Pi에서 안전하게 검증하기 위한 기준 문서 모음이다. 최종 배포 기준은 다음 두 디렉터리다.
+이 폴더는 AudioDSP v1.2 릴리스를 다시 만들고, 수정하고, 실제 Raspberry Pi에서 안전하게 검증하기 위한 단일 기준 문서 모음이다. 공통 실행 소스는 `source/common`, 플랫폼 overlay는 `source/platforms`, SD writer와 외부 binary/image 입력은 다음 두 디렉터리에 있다.
 
-- Pi 2: `D:\GSonic\RaspberryPi_SD\releases\audiodsp-pi2-v1.2.0`
-- Pi 4 / Pi 5: `D:\GSonic\RaspberryPi_SD\releases\audiodsp-pi4-pi5-v1.2.0`
+- Pi 2: `releases/audiodsp-pi2-v1.2.0`
+- Pi 4 / Pi 5: `releases/audiodsp-pi4-pi5-v1.2.0`
 
-`pi2-strong-bass-4ch-v1.1.0`과 각 릴리스의 `legacy-v1-reference`는 이력 확인용이다. 새 릴리스를 만들 때 이 파일들을 기준 소스로 되돌리지 않는다.
+완성 payload와 시험 묶음은 `python tools/materialize_releases.py --platform <pi2|pi3|pi4|pi5> --assemble`로 `build/<platform>`에 만든다. `build`는 생성물이며 직접 편집하지 않는다. 과거 중복 release tree는 제거했고 필요한 이력은 Git에만 보존한다.
 
 ## 문서 지도
 
@@ -36,7 +36,8 @@
 - Xonar U7: 입력 2채널, 출력 4채널, 48 kHz
 - CamillaDSP I/O: `S32_LE`; U7 공유 출력 dmix: `S24_3LE`
 - FIR: stereo IEEE float32 WAV, 48 kHz, 32768 taps, 디지털 preamp 없음
-- L/R/Woofer 개별 룸보정은 기본 ON/100 Hz LR4 디지털 crossover를 Front/Rear FIR WAV 안에 내장한다. 별도 runtime filter와 block latency 증가는 0이며, 최종 acoustic 합산은 phase 신뢰도와 세 위치 복소합 검증을 별도로 통과해야 한다.
+- 새 session의 권장 룸보정은 위치마다 L/R/W/L+Woofer/R+Woofer를 먼저 측정한다. L/R/W만 FIR 설계에 사용하고 실제 합산 두 응답은 정규화하지 않은 복소 closure에만 사용하므로, 검증 PASS 뒤에는 FIR 계산 후 별도 합산 sweep을 요구하지 않는다.
+- 분리 룸보정은 기본 ON/100 Hz LR4 디지털 crossover를 Front/Rear FIR WAV 안에 내장한다. 별도 runtime filter와 block latency 증가는 0이며, phase 신뢰 시 세 위치 실제 복소합 최대값을, 불신뢰 시 보수적 상한을 사용한다.
 - Factory/Speaker FIR SHA-256: `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`
 - 출력 볼륨: U7 `PCM,0`, 웹/API 범위 -60~0 dB, 초기 저장값 -10 dB
 - Web Status는 입력→DSP→라우팅→U7 selector→실제 출력의 반응형 SVG signal console을 표시한다.
@@ -50,10 +51,10 @@
 관리자 권한 PowerShell에서 SD를 쓰기 전 비파괴 검사만 실행한다.
 
 ```powershell
-Set-Location 'D:\GSonic\RaspberryPi_SD\releases\audiodsp-pi2-v1.2.0'
+Set-Location '.\releases\audiodsp-pi2-v1.2.0'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\write_pi2_sd_as_admin.ps1 -ValidateOnly -NoPause
 
-Set-Location 'D:\GSonic\RaspberryPi_SD\releases\audiodsp-pi4-pi5-v1.2.0'
+Set-Location '.\releases\audiodsp-pi4-pi5-v1.2.0'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\write_final_sd_as_admin.ps1 -ValidateOnly -NoPause
 ```
 
@@ -61,4 +62,4 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\write_final_sd_as_admi
 
 ## 식별자
 
-새 설치는 앱, 서비스, 상태 경로, 사용자와 호스트 이름에 `audiodsp`를 사용한다. 현재 운용 중인 기존 Pi 2는 중단 없는 이전을 위해 `gsonic-pi2`/`gsonic` 계정을 유지할 수 있지만 설치된 앱 경로와 서비스는 AudioDSP 이름을 쓴다. 코드의 `AUDIODSP_*` 환경변수가 우선이며 `GSONIC_*`는 이전 릴리스 테스트와 점진적 마이그레이션만을 위한 호환 계층이다.
+앱, 서비스, 상태 경로, 사용자와 호스트 이름은 `audiodsp`를 사용한다. 코드·systemd·시험 launcher의 환경변수도 `AUDIODSP_*`만 허용한다. 기존 장치는 새 계정의 SSH/sudo를 먼저 검증하는 단계적 절차로 이전한다.

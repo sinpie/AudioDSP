@@ -40,9 +40,12 @@ permanent apply.
 Independent L/R/Woofer and sub-MIMO correction defaults to a 100 Hz LR4 digital
 crossover. Front HPF and Woofer LPF are embedded in the generated 32768-tap WAV
 or MIMO FIR bank, so no extra runtime filter stage or block latency is added.
-SISO adds a three-position cut-only constructive-sum guard; MIMO includes the
-complex crossover branches in its transfer matrix. Acoustic PASS still needs
-reliable phase/model checks and an applied low-level validation sweep.
+SISO adds a one/three-position cut-only sum guard; MIMO includes the complex
+crossover branches in its transfer matrix. The recommended precision SISO
+session measures L/R/W plus L+Woofer/R+Woofer before calculation and needs no
+later sweep when its absolute complex closure and final prediction pass. The
+faster standard SISO and sub-MIMO paths retain their explicit post-Preview
+acoustic validation requirement.
 
 The Status screen includes a responsive vector signal console from U7 Line
 input through DSP/routing to the physical output. `Speaker` and `Headphone` are
@@ -75,9 +78,11 @@ neighbor noise as solved.
 
 Bass-phase alignment includes both measured acoustic arrival and generated FIR
 delay while keeping L/R phase common. MIMO restores actuator-relative arrival
-phase, anchors 70–130 Hz level to the existing SISO result, regularizes adjacent
-frequency bins and blocks apply if modeled low-bass late/early energy worsens by
-more than 0.5 dB. A non-improving value is never labeled decay improvement.
+phase, first normalizes the deployable SISO base bank, anchors 70–130 Hz level,
+regularizes adjacent frequency bins and separates one common target-shape level
+alignment from reported physical headroom attenuation. Apply is blocked if the
+smoothed-transfer low-bass late/early proxy worsens by more than 1.5 dB. This
+proxy is never labeled an actual RT60/decay improvement.
 
 Completed measurement steps are navigation controls only. Data is kept until a
 changed setting is explicitly applied or a level test, position restart, or
@@ -106,8 +111,8 @@ the target disk, copied payload hashes, generated Wi-Fi script, command line,
 FAT volume and final disk identity.
 
 See `AUDIODSP_REQUIREMENTS_VERIFIED.md` for the full verification record and
-`docs/README.md` for the complete reproduction and maintenance documentation.
-See `docs/MIMO_ROOM_TUNING.md` for research sources, topology rules, the exact
+`../../AUDIODSP_REPRODUCTION_DOCS/README.md` for the complete reproduction and maintenance documentation.
+See `../../AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md` for research sources, topology rules, the exact
 optimization/safety pipeline, measurement instructions and explicit limits.
-`MIMO_VALIDATION_REPORT.md` records the silent numerical/runtime/backup tests
+`../../AUDIODSP_REPRODUCTION_DOCS/MIMO_VALIDATION_REPORT_20260818.md` records the silent numerical/runtime/backup tests
 and the remaining real-room and Pi4/Pi5 load acceptance work.

@@ -24,11 +24,11 @@
 - Added `GET /api/volume` and strict `PUT /api/volume` for integer -60..0 dB.
 - Saved volume is restored after boot/USB reset; physical-knob changes are
   reported separately and volume-only writes do not restart CamillaDSP.
-- Added volume persistence/backup, boundary/error/concurrency tests and full
-  reproduction documentation under `docs/`.
+- Added volume persistence/backup, boundary/error/concurrency tests and linked
+  the single canonical reproduction documentation tree.
 
-- Rebranded new-install runtime identifiers from GSonic to AudioDSP while
-  retaining legacy environment-variable fallback for gradual upgrades.
+- Standardized all new-install and runtime identifiers on AudioDSP and
+  removed the obsolete environment-variable fallback.
 - Added separate Status, Measurement/Correction and Profile/Settings screens
   with PC/mobile responsive navigation and explicit next actions.
 - Added non-destructive clickable measurement steps and dependency-aware

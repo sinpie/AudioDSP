@@ -31,21 +31,23 @@
 - step click은 navigation뿐이며 데이터 mutation을 하지 않는다.
 - 편집한 설정은 `변경 적용` 전까지 기존 결과에 영향을 주지 않는다.
 - 재검사/재측정/재계산 버튼은 초기화 범위를 confirm 문구로 정확히 말한다.
-- 진행 중에는 progress, percent, 단계명, ETA를 1초 polling한다.
+- 진행 중에는 progress, percent, 단계명, ETA를 1초 polling한다. Polling은 DOM 수치만 바꾸며 페이지 전체를 새로고침하지 않는다. 작업 완료·위치 증가·물리 출력 변경처럼 화면 구조가 실제로 달라질 때만 한 번 reload한다.
 - Level 결과는 OK/NOT OK, background, white-noise RMS, 추정 signal, SNR, peak를 카드로 보여준다.
 - 활성 session의 ID, 생성 시각, 상태, 완료 위치, 이어갈 단계, FIR 결과 유무와 주석 편집은 1–6 단계 탭 바로 위에 항상 표시한다. 주석 저장은 별도 metadata만 바꾸며 어떤 측정·FIR 단계도 초기화하지 않는다.
-- session은 생성 즉시 자동 저장한다. 1단계의 저장 session 목록은 최신순으로 ID·시각·측정 구성·완료 단계·위치·FIR 유무·주석을 함께 보여주고, `이어하기`는 파일 무결성을 확인한 뒤 저장된 1–6 완료 지점 전체를 복원한다. 작업 중 session 전환은 차단한다.
+- session은 생성 즉시 자동 저장한다. 1단계의 저장 session 목록은 최신순으로 ID·시각·측정 구성·완료 단계·위치·FIR 유무·주석을 함께 보여주고, `이어하기`는 파일 무결성을 확인한 뒤 저장된 1–6 완료 지점 전체를 복원한다. `삭제`는 복구 불가 범위와 현재 정식 FIR 불변을 confirm에 표시하고 정확한 session 하나만 지운다. 작업 중 session 전환·삭제는 차단한다.
 - 저장 session 목록은 ID·날짜·주석 client-side 검색을 제공한다. 활성 주석을 편집하면 즉시 `저장되지 않은 주석` 상태를 표시하고, 저장 전에 페이지를 떠날 때만 확인한다.
 - 레벨 검사를 누르는 순간 현재 U7 물리 출력을 session의 `measurement_profile`로 고정한다. 화면은 현재/고정 경로의 일치 여부를 별도 lock 카드로 보여주고, 불일치하면 위치 측정과 A/B를 비활성화한다.
 - 생성 결과의 Preview/Apply 버튼은 고정된 한 출력 체인만 제공한다. 경로 정보가 없는 schema-1 이전 session에만 수동 확인 경고와 두 버튼을 보이는 호환 모드를 쓴다.
 - 백색소음과 sweep 출력은 별도 slider이며 fresh session은 둘 다 -42 dBFS다. 현재 Woofer 실효값을 계산하고 높은 조합을 색+문구로 경고하며 실제 위치 sweep 전 confirm에 수치를 다시 표시한다.
+- 새 session의 권장 측정 구성은 `정밀 분리+합산 · L/R/W/L+W/R+W · 위치당 5회`다. L/R/W만 설계하고 L+W/R+W는 같은 위치의 복소합 closure에만 쓰며, FIR 생성 뒤 다시 측정하라고 요구하지 않는다. 더 빠른 `표준 분리 SISO · L/R/W`도 동일-clock 복소 합산 모델로 3단계 측정만 사용한다. 정밀 구성은 물리 합산 closure까지 검증해 배선·극성·상대레벨 오류를 더 잘 찾는 권장 품질 옵션이다.
 - Target을 바꾸면 1 kHz 기준 곡선과 bass/treble preference를 즉시 SVG에 반영한다.
 - L/R/Woofer와 sub MIMO에서는 디지털 crossover를 주요 옵션으로 표시하고 기본 ON/100 Hz로 둔다. 설명은 Front LR4 HPF, Woofer LR4 LPF, 32768탭 WAV 내장, 추가 block latency 0을 함께 말한다. 합산 L/R 모드에서는 숨은 OFF 값과 독립 branch가 없다는 이유를 표시한다.
 - 결과 그래프는 각 채널의 측정 전 ±공간 편차, 적용 후 예상, target을 구분한다.
 - 결과의 `Woofer 최종 trim`은 FIR 계산 옵션을, `측정 시 Woofer 감쇄`는 sweep SNR 확보용 측정 조건을 별도 항목으로 표시한다.
 - 결과에 기록된 `algorithm_revision`이 현재 엔진과 다르면 측정 원본은 보존하되 이전 계산임을 경고하고 4단계 FIR 재계산 전 Preview/Apply를 차단한다.
 - 최신 결과라도 `self_validation.overall_pass=false`이면 다운로드와 A/B Preview는 허용하지만 정식 Apply는 UI와 엔진 양쪽에서 차단한다.
-- 자동 검증 체크리스트는 모든 core/FIR, 독립 3위치, L/R/Woofer target-fit, crossover 합산, SNR 판정을 `PASS`, `FAIL`, `N/A`로 표시한다. FAIL 행은 빨간색과 함께 설정 변경·재측정·배치 확인 순서의 직접 행동 지침을 제공한다.
+- 자동 검증 체크리스트는 모든 core/FIR, 독립 3위치, L/R/Woofer target-fit, crossover 합산, SNR 판정을 `PASS`, `FAIL`, `대기`, `해당 없음`으로 표시한다. FAIL 행은 빨간색과 함께 실제 화면의 `1 · 연결·Cal`, `2 · 레벨 확인`, `3 · 위치 측정`, `4 · FIR 계산`, `5 · 검토·A/B` 단계명과 실제 select/button 문구를 사용한 직접 행동 지침을 제공한다. 안내에 언급된 단계는 바로 여는 버튼도 함께 만들며, 탭 이동만으로 측정값은 바뀌지 않는다. 실행할 수 없는 사후 측정을 해결 방법으로 쓰지 않는다.
+- 체크리스트 바로 위에서 MAE를 판정 대역 평균 절대오차, P90을 주파수 지점 90%가 그 값 이내인 오차로 설명한다. 합산 FAIL은 signed median error를 사용해 Target보다 높은지/낮은지와 dB를 밝히고, `Woofer 최종 trim`, `우퍼 과잉 억제`, `Phase 방식`, `Crossover 주파수`의 실제 표시명으로 변경 방향을 안내한다.
 - 결과 카드는 crossover 상태를 `pass`, `limited_unverified_phase`, `fail_target`, `fail_upper_guard`로 구분하고, WAV 형식 검증만 통과한 결과를 acoustic PASS로 표시하지 않는다.
 - Pi4/5는 SISO와 MIMO Stereo/2.1/2.2를 구분한다. Pi2는 MIMO 항목과 차단 이유를 보이되 선택할 수 없다.
 - MIMO 결과는 타깃 MAE, 좌석 편차, 평활 전달함수 기반 impulse-tail proxy, 기존 SISO 저역 레벨 기준 offset, 해 혼합 강도, 제어원 coherence, crossover, 실제 output별 headroom과 전체 보정 가능성 분류표를 보인다. impulse-tail proxy는 RT60/잔향 예측이 아니며 1.5 dB 초과 악화 시 적용을 차단한다.
