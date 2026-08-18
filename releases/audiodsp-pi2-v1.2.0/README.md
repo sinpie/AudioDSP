@@ -77,10 +77,13 @@ design, Pi2 block, silent validation evidence, and remaining Pi4/5 real tests.
 Three nearby listening positions can be measured for L/R or L/R plus woofer.
 The engine uses regularized sweep deconvolution, spatial dB averaging and
 variance weighting, frequency-dependent smoothing, natural-rolloff protection,
-boost/cut/transfer limits, magnitude correction, optional bass-only excess
-phase correction and time alignment. Woofer-only and combined validation
-sweeps are 12 dB below the Front sweep while their deconvolution references
-are scaled identically. Every sweep has its own SNR gate. Octave-band
+boost/cut/transfer limits, magnitude correction, common-L/R optional bass-only
+excess phase correction and acoustic-plus-FIR time alignment. White noise and
+sweep have independent sliders with a -42 dBFS safe default. Separate Woofer
+attenuation defaults to -9 dB and its deconvolution reference is scaled
+identically; combined mode treats the value as the final Woofer trim. Every
+sweep has a frequency-dependent SNR/confidence gate, and Woofer quality uses
+its detected sustained -3 dB acoustic passband. Octave-band
 noise-compensated Schroeder EDT/T20 diagnoses decay; only reliable long-decay
 bass resonances receive up to 3 dB additional cut, while late reverberation is
 never inverted. The result is always a stereo float32

@@ -109,6 +109,7 @@ def main() -> int:
         staged = web.stage_restore_archive(backup_body, "mimo-backup.zip")
         require("Speaker_MIMO.json" in staged["mimo"], "MIMO bank was not validated during restore staging")
         web.discard_restore_staging()
+        require(not web.RESTORE_STATE_PATH.exists() and not list(web.RESTORE_STAGING_ROOT.glob("*")), "MIMO backup review left restore staging files")
         manager.set_mimo_enabled("speaker", False, restart=False)
         require(manager.status()["resolved"]["convolution_channels"] == 2, "SISO fallback after MIMO off failed")
         os.environ["AUDIODSP_PLATFORM_CLASS"] = "pi2"

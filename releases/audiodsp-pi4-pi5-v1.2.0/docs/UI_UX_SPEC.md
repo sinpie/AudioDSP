@@ -30,10 +30,11 @@
 - 재검사/재측정/재계산 버튼은 초기화 범위를 confirm 문구로 정확히 말한다.
 - 진행 중에는 progress, percent, 단계명, ETA를 1초 polling한다.
 - Level 결과는 OK/NOT OK, background, white-noise RMS, 추정 signal, SNR, peak를 카드로 보여준다.
+- 백색소음과 sweep 출력은 별도 slider이며 fresh session은 둘 다 -42 dBFS다. 현재 Woofer 실효값을 계산하고 높은 조합을 색+문구로 경고하며 실제 위치 sweep 전 confirm에 수치를 다시 표시한다.
 - Target을 바꾸면 1 kHz 기준 곡선과 bass/treble preference를 즉시 SVG에 반영한다.
 - 결과 그래프는 각 채널의 측정 전 ±공간 편차, 적용 후 예상, target을 구분한다.
 - Pi4/5는 SISO와 MIMO Stereo/2.1/2.2를 구분한다. Pi2는 MIMO 항목과 차단 이유를 보이되 선택할 수 없다.
-- MIMO 결과는 타깃 MAE, 좌석 편차, modal-tail 모델값, 제어원 coherence, headroom과 전체 보정 가능성 분류표를 보인다.
+- MIMO 결과는 타깃 MAE, 좌석 편차, modal late/early 모델값, 기존 SISO 저역 레벨 기준 offset, 해 혼합 강도, 제어원 coherence, headroom과 전체 보정 가능성 분류표를 보인다.
 - 다운로드와 A/B는 비파괴라고 명시하고, 정식 적용 버튼만 덮어쓰기 경고를 낸다.
 
 ## 설정 화면

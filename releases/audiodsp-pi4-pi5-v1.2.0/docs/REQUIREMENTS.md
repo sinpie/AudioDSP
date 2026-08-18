@@ -47,8 +47,8 @@
 - NOT OK이면 사용자가 기기 볼륨을 수동 조절하고 다시 검사한다.
 - 측정 재생 중 CamillaDSP를 direct bypass하고 U7 Mic/Line capture switch를 끈다. 종료·실패·취소 때 원상 복구한다.
 - L/R 또는 L/R/Woofer를 청취 위치 근처 세 지점에서 각각 측정한다.
-- L/R/Woofer 모드는 소스를 따로 측정하며 중앙 위치 bulk delay로 Front/Woofer 시간 정렬을 계산한다.
-- Woofer 단독/합산 측정음은 Front보다 12 dB 낮추고 reference도 같은 비율로 낮춰 응답 크기는 정확히 보존한다.
+- L/R/Woofer 모드는 소스를 따로 측정하며 중앙 위치의 음향 bulk delay와 생성 FIR 지연을 합산해 Front/Woofer 시간 정렬을 계산한다.
+- 백색소음/sweep은 독립 slider와 -42 dBFS 안전 기본값을 사용한다. Woofer 분리 측정 감쇄는 기본 -9 dB이고 reference도 같은 비율로 낮춰 응답 크기를 보존한다. 합산 모드의 값은 최종 Woofer trim과 동일하다.
 - 각 sweep의 무음 pre-roll과 활성 구간으로 개별 SNR을 검증하며 6 dB 미만은 거부하고 15 dB 미만은 경고한다.
 - 옥타브별 noise-compensated Schroeder EDT/T20 잔향을 산출한다. 신뢰 가능한 300 Hz 이하 장시간 공진만 최대 3 dB cut-only로 더 감쇄하고 late reverb는 역보정하지 않는다.
 - 출력은 48 kHz stereo float32, 32768 taps의 Front WAV와 필요할 때 Rear WAV다.
@@ -103,7 +103,7 @@
 - 주파수별 Tikhonov regularization, SISO prior, 자연 저역·support penalty, 공통 target phase, row-sum headroom projection과 인과 지연을 적용한다.
 - 출력 bank는 48 kHz stereo float32, 정확히 32768 taps인 WAV 네 개이며 CamillaDSP에서는 8 convolution path가 된다.
 - MIMO 범위는 기본 20~120 Hz이고 80/120/150 Hz 중 선택한다. 범위 위에서는 SISO로 부드럽게 복귀한다.
-- 결과에는 condition/coherence, target MAE, 위치간 편차, headroom, causality와 modeled modal tail을 표시한다. modal tail이 0.5 dB보다 악화되면 경고하며 잔향 개선으로 인증하지 않는다.
+- 결과에는 condition/coherence, target MAE, 위치간 편차, headroom, causality와 modeled modal tail을 표시한다. modal tail이 0.5 dB보다 악화되면 전체 셀프검증을 실패시켜 적용을 차단하며, 그 이하라도 실제 값이 개선되지 않으면 잔향 개선으로 인증하지 않는다.
 - 현재 구현은 ART와 같은 다중 음원 제어 계열이지만 Dirac ART의 독점 구현과 동등하다고 주장하지 않는다. 지속 방사장 억제, 좌표 기반 wave-field control과 비선형 제어는 범위 밖이다.
 
 ## 네트워크와 이름

@@ -85,7 +85,14 @@ MIMO 결과의 `/download/all`은 네 MIMO WAV, MIMO manifest, JSON/Markdown 보
 `result`에는 `self_validation`(실제 FIR FFT/target-fit/전달 이득/impulse),
 `room_decay`(채널별 octave T20→RT60), `graphs.*.actual_correction_db`,
 `graphs.*.effective_target_db`, `graphs.*.decay_control_db`가 포함된다. 각 측정
-응답에는 `measurement_quality`, `room_decay`, `temporal`, `group_delay`가 저장된다. MIMO 결과는 `kind=mimo_2x4`, `mimo`, `mimo_files`, `room_tuning_audit`를 추가한다.
+응답에는 `measurement_quality`의 대역별 SNR/confidence와 Woofer 적응형 통과대역,
+`room_decay`, `temporal`, `group_delay`가 저장된다. 새 session의
+`noise_level_dbfs`와 `level_dbfs` 기본은 각각 -42다. 플랫폼 capability에는
+오프라인 단계별 ETA가 들어간다. 실행 PID가 사라졌으면 raw session 파일을
+조회만으로 변경하지 않고 응답에 `interrupted_worker=true`인 복구 오류 view를 반환한다.
+MIMO 결과는 `kind=mimo_2x4`, `mimo`, `mimo_files`, `room_tuning_audit`를 추가하며,
+`mimo.target_level_normalization`, `solution_blend`, `prediction.*.before/after_modal_tail_db`와
+`self_validation.core_checks.predicted_modal_tail_non_regression`을 포함한다.
 
 ## 백업
 

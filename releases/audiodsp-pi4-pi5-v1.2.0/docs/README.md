@@ -38,7 +38,9 @@
 - Factory/Speaker FIR SHA-256: `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`
 - 출력 볼륨: U7 `PCM,0`, 웹/API 범위 -60~0 dB, 초기 저장값 -10 dB
 - Pi 2 초기 chunksize 2048; Pi 4/5 초기 chunksize 1024
+- 백색소음/sweep 기본 -42 dBFS, Woofer 분리 측정 감쇄 기본 -9 dB; 적응형 통과대역 SNR과 중단 worker 복구
 - MIMO: Pi4/5만 2×4/8 convolution, 활성 chunksize 최소 1024; Pi2 선택·적용 차단
+- MIMO 상대 도달 phase·SISO 저역 레벨 anchor·modal late/early 비악화 검증
 - 네트워크는 DHCP만 사용하며 고정·비상 주소를 만들지 않는다.
 
 ## 가장 빠른 재현 검사

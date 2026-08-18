@@ -75,9 +75,9 @@ ls -l /var/lib/audiodsp/calibration
 cat /var/lib/audiodsp/measurements/current.json
 ```
 
-NOT OK는 오류가 아니라 측정 품질 보호다. background noise를 줄이고 기기 볼륨을 조금씩 올리되 peak clipping을 피한다. 실제 sweep를 shell에서 임의 실행하지 말고 UI session 흐름을 사용한다.
+NOT OK는 오류가 아니라 측정 품질 보호다. 기본 White/Sweep -42 dBFS에서 시작해 background noise를 줄이고 기기 볼륨 또는 측정 출력을 조금씩 올리되 peak clipping과 UI의 높은 출력 경고를 피한다. 실제 sweep를 shell에서 임의 실행하지 말고 UI session 흐름을 사용한다.
 
-측정 중 중단되면 UI cancel을 먼저 사용한다. engine은 child PID를 정리하고 CamillaDSP/U7 input 상태를 복원한다. 강제 종료 후에는 `systemctl start camilladsp`와 U7 Line source를 확인한다.
+측정 중 중단되면 UI cancel을 먼저 사용한다. engine은 child PID를 정리하고 CamillaDSP/U7 input 상태를 복원한다. worker가 비정상 종료되면 상태 API가 PID와 command line을 확인해 `interrupted_worker` 오류로 표시하므로 `current.json`을 수동 편집하지 말고 session 기록을 보존한 채 재시도 또는 새 session을 선택한다. 강제 종료 후에는 `systemctl start camilladsp`와 U7 Line source를 확인한다.
 
 ## Pi 2 부하와 latency
 

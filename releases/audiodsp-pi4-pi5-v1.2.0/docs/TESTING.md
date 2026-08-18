@@ -84,7 +84,8 @@ sudo /usr/local/bin/audiodsp-measurement.py self-test-targets
 
 6 target × 3 preset × Front/Woofer의 실제 32768탭 FFT와 bass-phase 대표
 조합을 검증한다. Offline engine test는 합성 0.60초 감쇠의 Schroeder T20,
-우퍼 측정/reference -12 dB 비율, 개별 SNR, 잔향 cut-only 동작도 확인한다.
+조절 가능한 Woofer 측정/reference 비율, 적응형 -3 dB 통과대역 SNR, 잔향 cut-only,
+음향+FIR 총지연 정렬과 중단 worker 복구도 확인한다.
 
 ## 4. MIMO 무음 시험
 
@@ -100,7 +101,7 @@ python3 /tmp/test_mimo_runtime.py \
   --camilladsp /usr/local/bin/camilladsp
 ```
 
-첫 명령은 Stereo/2.1/2.2 각각 finite, 인과성, 최악 상관입력 row sum ≤1, 타깃 MAE·좌석편차 비퇴행, 네 WAV×32768탭을 검사한다. 두 번째는 격리된 임시 config에서 8 Conv와 2→8→4 mixer를 실제 CamillaDSP `--check`로 검사하고 Pi2 enable 거부를 확인한다. 둘 다 오디오 장치를 열거나 소리를 내지 않는다.
+첫 명령은 Stereo/2.1/2.2 각각 상대 bulk-delay 복원, 기존 SISO 저역 기준 레벨 고정, finite, 인과성, 최악 상관입력 row sum ≤1, 타깃 MAE·좌석편차·modeled late/early 비퇴행, 네 WAV×32768탭을 검사한다. 두 번째는 격리된 임시 config에서 8 Conv와 2→8→4 mixer를 실제 CamillaDSP `--check`로 검사하고 Pi2 enable 거부와 MIMO 백업 임시파일 회수를 확인한다. 둘 다 오디오 장치를 열거나 소리를 내지 않는다.
 
 ## 5. 실제 Pi 무중단 배포 확인
 

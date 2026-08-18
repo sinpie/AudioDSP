@@ -95,3 +95,10 @@ U7 `PCM Playback Volume`은 raw 0~127, -127~0 dB이며 8개 재생 채널을 가
 5. CamillaDSP가 안정적으로 살아 있으면 준비 서비스가 `DSP ready`를 Front L/R에 믹스한다.
 
 Pi별 부팅·네트워크 차이는 `platform` 문서를 따른다.
+
+## 2026-08-18 유지보수 불변조건
+
+- 측정 White/Sweep fresh default는 각각 -42 dBFS이며 Woofer 분리 감쇄 기본은 -9 dB다.
+- SISO bass phase는 L/R 공통이고 Front/Woofer 음향+FIR 총지연을 정렬한다.
+- MIMO는 제어원 상대 bulk phase를 복원하고 70~130 Hz 기존 SISO 레벨에 anchor하며 modeled late/early 0.5 dB 악화를 적용 차단한다.
+- 중단 worker 상태 조회는 원본 session을 덮어쓰지 않으며, restore staging은 성공·실패·교체·취소 모두 관리 디렉터리를 회수한다.
