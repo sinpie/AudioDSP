@@ -29,6 +29,11 @@ navigates and never deletes data. Affected downstream data is invalidated only
 after a changed setting is explicitly applied or the user starts a new level
 check, position set, or FIR build.
 
+The Status screen also presents a responsive vector signal console: U7 Line
+input → CamillaDSP → Front/Rear routing → physical U7 selector → speaker chain.
+The two profile cards are named `Speaker output chain` and `Headphone-jack
+output chain`; in this installation both physical paths feed speakers.
+
 Profile WAV uploads are also staged: select, inspect the browser-computed SVG
 response, A/B listen, then apply. Permanent files are not overwritten before
 the final confirmation. Double-submit protection and destructive-action
@@ -58,6 +63,9 @@ normalized and unknown settings are ignored safely.
   automatically; reboot/USB reset restores the last Web/API-saved value.
 - The physical U7 button chooses Speaker/Headphones. The Web UI displays it in
   real time; it does not emulate the undocumented hardware output command.
+- A level check binds its session to that physical U7 output. Changing the
+  selector stops later sweeps/Preview, and Apply can overwrite only the profile
+  that was actually measured.
 - Quiet female English `Speaker`, `Headphones`, and boot `DSP ready` prompts are
   mixed into Front L/R only.
 
@@ -71,7 +79,7 @@ temporarily bypasses CamillaDSP and disables the U7 Mic/Line capture switches.
 Each generated SISO result saves browser-downloadable `Room_Tuning_Report.json`
 and `.md`, explicitly separating FIR-correctable, limited, physical-treatment,
 not-measured and not-certified room factors.
-See `docs/MIMO_ROOM_TUNING.md` and `MIMO_VALIDATION_REPORT.md` for the common
+See `../../AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md` and `../../AUDIODSP_REPRODUCTION_DOCS/MIMO_VALIDATION_REPORT_20260818.md` for the common
 design, Pi2 block, silent validation evidence, and remaining Pi4/5 real tests.
 
 Three nearby listening positions can be measured for L/R or L/R plus woofer.
@@ -90,6 +98,16 @@ never inverted. The result is always a stereo float32
 48 kHz 32768-tap Front FIR and, when requested, a Rear FIR. Harman, Flat,
 Bruel & Kjaer, RTings, AcoustiX and Not Dr Toole targets are previewed as SVG;
 Primus-like and Strong woofer-control presets are provided.
+Independent L/R/Woofer correction defaults to a 100 Hz LR4 digital crossover:
+Front HPF, Woofer LPF and a three-position cut-only sum guard are embedded in
+the same 32768-tap WAVs. This adds no CamillaDSP filter stage or block latency.
+The recommended precision session measures L/R/W and L+Woofer/R+Woofer at the
+same one/three positions. Only L/R/W design the FIR; the two sums verify the
+absolute complex closure without independent normalization. If that model and
+the final FIR prediction pass, no later validation sweep is required. The
+faster standard L/R/W session still requires a low-level validation sweep after
+Preview. Combined L+Woofer/R+Woofer mode cannot split independent
+branches and therefore requires crossover OFF.
 The result page verifies the actual truncated FIR FFT, normalized target-fit
 MAE/P90, maximum transfer, finite samples and early impulse position.
 
@@ -107,5 +125,5 @@ Bash syntax, UI/measurement safety features, target disk identity, every copied
 payload hash, `cmdline.txt`, and the final FAT volume.
 
 See `AUDIODSP_REQUIREMENTS_VERIFIED.md` for the feature-by-feature record and
-`docs/README.md` for the complete reproduction, architecture, API, platform,
+`../../AUDIODSP_REPRODUCTION_DOCS/README.md` for the complete reproduction, architecture, API, platform,
 testing, and recovery documentation.

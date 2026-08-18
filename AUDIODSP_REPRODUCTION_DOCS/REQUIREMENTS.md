@@ -46,14 +46,15 @@
 - 먼저 5초 무음과 5초 저레벨 백색소음을 측정해 background, signal, SNR, peak, clipping을 평가한다.
 - NOT OK이면 사용자가 기기 볼륨을 수동 조절하고 다시 검사한다.
 - 측정 재생 중 CamillaDSP를 direct bypass하고 U7 Mic/Line capture switch를 끈다. 종료·실패·취소 때 원상 복구한다.
-- L/R 또는 L/R/Woofer를 청취 위치 근처 세 지점에서 각각 측정한다.
-- L/R/Woofer 모드는 소스를 따로 측정하며 중앙 위치 bulk delay로 Front/Woofer 시간 정렬을 계산한다.
-- Woofer 단독/합산 측정음은 Front보다 12 dB 낮추고 reference도 같은 비율로 낮춰 응답 크기는 정확히 보존한다.
+- Fast 1위치 또는 Standard 3위치에서 합산 L/R, 표준 L/R/Woofer, 권장 정밀 L/R/W/L+Woofer/R+Woofer 구성을 제공한다.
+- 정밀 모드는 L/R/W만 설계하고 같은 위치의 L+Woofer/R+Woofer를 절대 복소합 closure에만 사용한다. 이를 별도 normalize·평균·재보정하지 않으며 PASS 후 불필요한 사후 sweep을 요구하지 않는다.
+- L/R/Woofer 모드는 소스를 따로 측정하며 중앙 bulk delay, FIR energy delay, 세 위치 robust 복소합으로 Front/Woofer 공통 극성·상대 지연을 계산한다.
+- Woofer 단독/합산 측정 감쇄 기본은 Front보다 9 dB 낮고 -18~0 dB에서 조절한다. 분리 측정은 reference도 같은 비율로 낮춰 응답 크기를 보존하고, 합산 응답은 같은 Woofer scale을 실제 복소합에 유지한다.
 - 각 sweep의 무음 pre-roll과 활성 구간으로 개별 SNR을 검증하며 6 dB 미만은 거부하고 15 dB 미만은 경고한다.
 - 옥타브별 noise-compensated Schroeder EDT/T20 잔향을 산출한다. 신뢰 가능한 300 Hz 이하 장시간 공진만 최대 3 dB cut-only로 더 감쇄하고 late reverb는 역보정하지 않는다.
 - 출력은 48 kHz stereo float32, 32768 taps의 Front WAV와 필요할 때 Rear WAV다.
 - Target은 Harman, Flat, Brüel & Kjær, RTINGS, AcoustiX, Not Dr. Toole을 제공하고 선택 곡선을 즉시 SVG로 보여준다.
-- 우퍼 preset은 none, Primus360 수준, Strong을 제공한다. 기본은 Strong + woofer trim -9 dB다.
+- 우퍼 preset은 none, Primus360 수준, Strong을 제공한다. 기준 기본은 `추가 억제 없음 + Woofer trim 0 dB`이며 Primus/Strong/음수 trim은 target 기준 튜닝 뒤의 의도적 추가 감쇄다.
 - magnitude-only 또는 저역 excess-phase 옵션을 제공한다.
 - 사용자가 보정 대역, 최대 boost/cut, bass/treble tilt, 공간 가중을 고를 수 있다.
 - 결과는 전/후 예상 곡선, 공간 편차, 진단, impulse peak delay, hash를 보여준다.
@@ -68,6 +69,7 @@
 - 설정을 편집만 한 상태도 기존 결과를 유지한다.
 - 변경된 설정을 실제 적용하거나 level/position/build를 다시 실행할 때 영향받는 단계 이후만 초기화한다.
 - 새 session은 기존 session 폴더를 보존하고 현재 포인터만 새 session으로 바꾼다.
+- 저장 session은 주석·완료 단계와 함께 다시 불러올 수 있고, 명시적 확인 뒤 정확한 session 하나만 삭제할 수 있다. 삭제해도 정식 profile FIR은 바뀌지 않는다.
 
 ## 백업과 복구
 
@@ -102,8 +104,8 @@
 - 세 청취 위치에서 각 actuator를 독립 sweep하고, 좌표 없는 세 측정점에 robust weighted complex pressure matching을 적용한다.
 - 주파수별 Tikhonov regularization, SISO prior, 자연 저역·support penalty, 공통 target phase, row-sum headroom projection과 인과 지연을 적용한다.
 - 출력 bank는 48 kHz stereo float32, 정확히 32768 taps인 WAV 네 개이며 CamillaDSP에서는 8 convolution path가 된다.
-- MIMO 범위는 기본 20~120 Hz이고 80/120/150 Hz 중 선택한다. 범위 위에서는 SISO로 부드럽게 복귀한다.
-- 결과에는 condition/coherence, target MAE, 위치간 편차, headroom, causality와 modeled modal tail을 표시한다. modal tail이 0.5 dB보다 악화되면 경고하며 잔향 개선으로 인증하지 않는다.
+- MIMO 범위는 기본 20~150 Hz이고 상한 80/120/150 Hz 중 선택한다. 범위 위에서는 SISO로 부드럽게 복귀한다.
+- 결과에는 condition/coherence, target MAE, 위치간 편차, headroom, causality와 modeled modal tail을 표시한다. modal-tail proxy가 1.5 dB보다 악화되면 적용을 차단하며 잔향 개선으로 인증하지 않는다.
 - 현재 구현은 ART와 같은 다중 음원 제어 계열이지만 Dirac ART의 독점 구현과 동등하다고 주장하지 않는다. 지속 방사장 억제, 좌표 기반 wave-field control과 비선형 제어는 범위 밖이다.
 
 ## 네트워크와 이름

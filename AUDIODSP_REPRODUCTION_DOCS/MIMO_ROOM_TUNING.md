@@ -14,13 +14,19 @@ AudioDSP의 MIMO는 Dirac ART의 복제품이 아니다. 공개 연구의 robust
 
 같은 T5S의 좌·우 입력은 두 우퍼가 아니다. 알고리즘과 보고서는 이를 `sub_pair` 한 제어원으로 취급한다. 독립 우퍼 모드는 실제로 서로 다른 위치에 놓고 U7 Rear L/R에 각각 연결한 경우에만 선택한다.
 
+Sub가 있는 topology는 기본 ON/100 Hz LR4 crossover의 complex minimum-phase branch spectrum을 전달행렬 자체에 포함한다. 따라서 최적화가 Front HPF/Woofer LPF를 우회하지 않으며, 결과는 8개 convolution path WAV에 이미 내장된다. 주파수별 noise confidence를 위치 가중치에 반영하고, `correction_low_hz` 아래에서는 최적화를 하지 않되 crossover routing은 유지한다. Woofer trim은 regularization 힌트가 아니라 Rear physical-output row-sum의 실제 transfer 상한으로 적용한다.
+
+보고서의 `before/after_modal_tail_db`는 512점 평활 전달함수에서 만든 impulse-tail proxy다. 실제 RT60이나 late reverberation 예측이 아니며 1.5 dB 넘게 악화될 때 적용을 차단하는 보수적 ringing gate로만 쓴다. 실제 잔향 판정은 저장된 deconvolution impulse의 octave EDT/T20과 적용 후 측정으로 한다.
+
 ## 연구 근거와 채택 범위
 
 - Dirac의 공개 ART 설명은 여러 스피커를 공동 제어하는 MIMO, 최소 두 스피커, 주로 20–150 Hz의 능동 저역 제어를 설명한다. Stereo L/R도 서로 지원할 수 있어 sub가 필수는 아니지만, 실용적인 지원 스피커는 충분한 저역 재생 능력이 필요하다. 3개 이상의 유효 측정 위치를 요구하고 제어원·측정점이 늘면 공간 제어가 개선될 수 있다고 설명한다.
   - <https://www.dirac.com/resources/art-technology>
+  - <https://www.dirac.com/products/art>
   - <https://helpdesk.dirac.com/en/dirac-art/Dirac-Live-Processor-ART-Stereo>
   - <https://helpdesk.dirac.com/en/dirac-art/Setup-Guide-c3cb>
-  - <https://www.dirac.com/wp-content/uploads/2025/05/ART_Use-case-definition-and-setup-guidelines.pdf>
+  - <https://helpdesk.dirac.com/en/dirac-art/How-to-ART-Channel-Group-and-Support-Settings-8382>
+  - <https://www.dirac.com/wp-content/uploads/2024/06/Dirac-MIMO-framework-for-active-room-treatment-and-Unison-.pdf>
 - 공개 MIMO loudspeaker-room 보정 연구는 모든 스피커·위치의 전달함수를 공동 최적화하고 regularization, pre-ringing/robustness 제약으로 재생 오차와 공간 편차를 줄이는 틀을 제시한다. AudioDSP는 이 계열의 제약 최적화를 사용한다.
   - DOI 10.1109/TASL.2013.2245650, *Compensation of Loudspeaker–Room Responses in a Robust MIMO Control Framework*
 - 최근 weighted pressure matching 연구는 공간 가중과 주파수별 안정화가 다중점 sound-field control의 강건성에 중요함을 다룬다.
@@ -55,10 +61,13 @@ AudioDSP의 MIMO는 Dirac ART의 복제품이 아니다. 공개 연구의 robust
 
 추가 안전 처리:
 
+- MIMO 전에 L/R base FIR 두 개를 SISO와 같은 `normalize_fir_bank` 한 번으로 먼저 정규화한다. 정규화하지 않은 설계 중간값과 headroom 제한을 마친 MIMO bank를 비교해 false FAIL을 만들지 않는다.
 - MIMO 범위는 20–80/120/150 Hz 중 선택하며 끝에서 30 Hz raised-cosine으로 기존 SISO FIR에 전이한다.
 - 영위상 역필터를 요구하지 않고 기존 SISO 응답의 가중 도착 phase를 목표 phase로 유지한다.
 - 모든 경로에 하나의 공통 인과 지연을 적용하고 32768탭으로 절단·후단 taper한다.
 - 주파수별 각 물리 출력의 `|L path| + |R path|`를 0.999 이하로 투영한다. 변환·절단 후 다시 최악 상관입력 row sum을 검사하고 필요한 최소 global scale만 적용한다.
+- target MAE는 40 Hz부터 MIMO 상한 또는 130 Hz까지의 한 공통 reference-band level만 맞춘 뒤 응답 형상을 평가한다. 위치별·주파수별 normalize는 금지한다. 상관입력 headroom 때문에 생기는 broadband 감쇄는 `headroom.global_scale_db`와 raw graph로 별도 표시하므로, 단순 볼륨 저하를 음색 실패로 오판하지 않으면서 실제 감쇄를 숨기지도 않는다.
+- 두 programme speaker뿐인 `MIMO Stereo`는 전용 support 제어원이 없어 큰 cross-feed가 stereo target을 손상시키기 쉽다. 선택 강도의 15%만 기존 SISO에서 벗어나도록 제한한다. `MIMO 2.2`는 자유도가 큰 대신 narrow solution의 tail 위험을 줄이기 위해 선택 강도의 85%를 사용한다.
 - NaN/Inf, 정확한 tap/rate/format, manifest SHA-256, 인과성, headroom, 예측 타깃 오차와 공간 편차 비퇴행을 통과해야 Preview/Apply가 열린다.
 - 출력은 `MIMO_Front_Left_LR_32768.wav` 등 네 stereo float32 WAV다. 각 WAV의 채널 0/1은 입력 L/R에서 해당 물리 출력으로 가는 두 전달 경로다.
 
@@ -91,7 +100,7 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 | SBIR·초기반사·명료도 | 진단/배치 | C50/C80/D50·반사창 진단, 깊은 null boost 금지 | 벽 거리, 스피커/좌석 이동, 1차 반사 흡음 |
 | 중·고역 late reverb | 물리 처리 | EDT/T20 보고만 함 | 흡음·확산·가구·배치 필요 |
 | L/R 감도·음색 | FIR 보정 가능 | 독립 L/R magnitude | 지향성 차이와 power response는 별도 문제 |
-| 메인–우퍼 합산 | 제한적/MIMO | 레벨·지연·극성·저역 phase | 아날로그 crossover와 비선형은 변경 불가 |
+| 메인–우퍼 합산 | 제한적/MIMO | FIR 내장 LR4 HPF/LPF, 레벨·지연·극성·저역 phase, 세 위치 복소합 | 적용 후 검증 sweep 전에는 확정하지 않으며 아날로그 crossover와 비선형은 변경 불가 |
 | 고조파 왜곡·압축·잡음 | 미측정 | 현재 없음 | 다중 레벨 Farina harmonic 분리 측정 필요; 선형 FIR로 보정 불가 |
 | 지향성·오프축/power response | 미측정 | 현재 없음 | 회전/근접 다각도 측정 필요 |
 | IACC·양이간 공간감 | 미측정 | 현재 없음 | 단일 UMIK-1로 직접 측정 불가; 2마이크/더미헤드 필요 |
@@ -105,7 +114,28 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 - Pi 2: 기존 SISO 2/4 convolution만 지원한다. MIMO 모드는 UI에서 비활성이고 API/CLI도 활성화를 거부한다. 측정·오프라인 계산 코드는 공통이지만 실시간 8경로를 적용하지 않는다.
 - Pi 4/Pi 5: MIMO 8 convolution을 허용한다. 활성화 시 effective chunksize는 최소 1024다. 적용 후 실제 CPU load, XRUN, USB 안정성을 확인해야 하며 Pi 5도 실기 장시간 검증 전에는 무조건적인 성능 보장을 하지 않는다.
 
-Pi 5 메모리는 이 AudioDSP 전용이면 2 GB를 권장한다. 8경로 32768탭 float32 원본 계수는 합계 1 MiB이고 partition FFT/history/work buffer도 수십 MiB 규모라 실시간 DSP에 충분하다. 오프라인 MIMO 생성 코드도 920 MiB인 Pi 2 무음 fixture에서 실행된다. 4 GB는 다른 서버를 함께 운영하거나 큰 page cache를 원하는 경우의 선택 여유일 뿐이며, 8 GB 이상을 포함해 RAM 증설 자체는 이 DSP의 음질·latency를 개선하지 않는다. 실제 병목은 CPU와 USB/XRUN 안정성이므로 Pi 5 2 GB 실기 장시간 검증으로 확정한다.
+### Pi 5 2 GB와 5.1 확장 worst case
+
+`tools/estimate_dsp_memory.py`와 `test_resource_budget.py`의 계획 모델은 48 kHz, 32768 taps, chunksize 1024를 기준으로 한다. CamillaDSP 수치는 1024-sample partition 32개, float32 complex spectrum/history와 4배 구현 여유를 포함한다. 생성 수치는 64-bit CPython의 complex/float object, FFTW·긴 녹음 한 채널 처리 256 MiB와 2배 live-bank 여유를 포함한다.
+
+| 구성 | FIR 경로 | 원시 계수 | 실시간 DSP 계획 | 필터 생성 계획 | partition complex MAC/s |
+|---|---:|---:|---:|---:|---:|
+| 현재 2입력×4출력 dense | 8 | 1.00 MiB | 46 MiB | 309 MiB | 12.3 M |
+| 5.1 독립 채널별 FIR | 6 | 0.75 MiB | 40 MiB | 296 MiB | 9.2 M |
+| 5.1 입력×5 main+dual-sub 완전 dense | 42 | 5.25 MiB | 135 MiB | 530 MiB | 64.6 M |
+
+42경로와 같은 Python object를 실제 할당한 64-bit probe peak는 138.64 MiB였다. 530 MiB는 이 측정치에 response/FFTW와 큰 안전 여유를 더한 상한이다. 따라서 Raspberry Pi OS Lite, AudioDSP Web과 CamillaDSP만 운용하는 Pi 5 2 GB는 실시간 FIR과 오프라인 생성 모두 메모리 안에 들어온다. 필터 생성기는 큰 path spectrum을 causalization 전에 해제하고 전체 bank scaling을 제자리에서 수행해 old/new bank 중복을 피한다. 생성 중 새 backup 복원·대형 upload 등 다른 무거운 작업은 동시에 시작하지 않는다.
+
+다만 42경로 완전 dense 5.1은 메모리보다 CPU가 약 5.25배 커지는 것이 문제다. Pi 5 실기에서 1024 chunksize, 실제 U7/향후 6+출력 interface로 10분 이상 XRUN·온도·CPU를 통과하기 전에는 지원으로 표시하지 않는다. 실용적인 5.1은 우선 6개 diagonal FIR을 쓰고, MIMO는 150 Hz 이하의 독립 subwoofer/저역 actuator group에만 제한한다. swap은 실시간 오디오 여유로 계산하지 않는다.
+
+4 GB는 다른 서버·database·desktop을 함께 운영하거나 매우 큰 session archive를 동시에 다룰 때의 선택 여유다. RAM 증설 자체는 음질이나 latency를 개선하지 않는다. 현재 2×4 MIMO의 실제 병목도 CPU와 USB/XRUN 안정성이므로 새 Pi 5 2 GB에서 장시간 수락 시험으로 최종 확정한다.
+
+## 2026-08-19 무음 알고리즘 회귀 결과
+
+- `Flat / 추가 억제 없음 / Woofer trim 0 dB` 기준 합성 session은 MIMO Stereo, MIMO 2.1, MIMO 2.2 모두 finite/headroom/causality/타깃·공간 비악화/modal-tail 비악화 모델 검증을 PASS했다.
+- MIMO 전용 UI 값 19개를 실제 32768탭×8경로로 생성했다. 구조·형식·headroom 검사는 19/19 PASS했다.
+- 비기준 조합 중 crossover 60/70/80 Hz, Harman target, `Safe · 높은 안정성 + 지원 제어원 제한 12 dB`의 다섯 합성 조합은 평활 전달함수 impulse-tail proxy가 허용 비악화 범위를 넘어서 `fail_model`로 안전 차단됐다. 이는 프로그램 오류가 아니라 해당 합성 room에서 기준을 만족하지 못한 결과이며, Web은 `4 · FIR 계산`의 실제 항목명으로 강도·상한·지원 제한·crossover 조정 순서를 안내한다.
+- Sub topology의 기준 모델 PASS는 동일-clock 복소 전달행렬에 대한 적용 게이트이며 `pass_multichannel_complex_model`로 표시된다. FIR 생성 뒤 합산 sweep을 필수로 요구하지 않는다. 다만 이것이 곧 방 전체의 실기 PASS라는 뜻은 아니다. 선택적인 저레벨 acoustic audit와 Pi5 10분 CPU/XRUN 검증을 별도 수행해야 실제 하드웨어 성능을 수락할 수 있다.
 
 ## 의도적으로 하지 않는 것
 

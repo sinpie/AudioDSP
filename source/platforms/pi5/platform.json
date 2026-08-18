@@ -1,0 +1,11 @@
+{
+  "id": "pi5",
+  "inherits": "pi4",
+  "family": "arm64",
+  "models": ["Raspberry Pi 5"],
+  "memory_min_mb": 2048,
+  "mimo_supported": true,
+  "default_chunksize": 1024,
+  "release": "releases/audiodsp-pi4-pi5-v1.2.0",
+  "notes": "Uses the Pi 4/5 ARM64 bundle unchanged; chunksize can be lowered in the Web UI after load testing."
+}

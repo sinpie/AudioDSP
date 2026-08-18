@@ -9,11 +9,28 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $script:StageRoot = $PSScriptRoot
+$script:RepoRoot = Split-Path -Parent (Split-Path -Parent $script:StageRoot)
+$script:BundleRoot = Join-Path $script:RepoRoot 'build\pi2'
+$script:BundleAssembler = Join-Path $script:RepoRoot 'tools\materialize_releases.py'
 $script:WriterLog = Join-Path $script:StageRoot $(
     if ($PostImageOnly) { 'pi2-postimage-console.log' } else { 'pi2-writer-console.log' }
 )
 $script:TranscriptStarted = $false
 $script:ResolvedDiskNumber = $null
+
+function Invoke-BundleAssembly {
+    if (-not (Test-Path -LiteralPath $script:BundleAssembler -PathType Leaf)) {
+        throw "Bundle assembler is missing: $script:BundleAssembler"
+    }
+    $python = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($null -eq $python) {
+        throw 'Python 3 is required to assemble the canonical AudioDSP bundle.'
+    }
+    & $python.Source $script:BundleAssembler --platform pi2 --assemble
+    if ($LASTEXITCODE -ne 0) {
+        throw "Bundle assembly failed with exit code $LASTEXITCODE"
+    }
+}
 
 function Assert-Administrator {
     $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -143,7 +160,7 @@ function Assert-BashSyntax {
 function Assert-FinalBundle {
     $image = Join-Path $script:StageRoot '2026-06-18-raspios-trixie-armhf-lite.img.xz'
     $firstRun = Join-Path $script:StageRoot 'firstrun.sh'
-    $payload = Join-Path $script:StageRoot 'payload'
+    $payload = Join-Path $script:BundleRoot 'payload'
     $starter = Join-Path $payload 'audiodsp-camilladsp-start'
     $config = Join-Path $payload 'camilladsp.yml'
     $camilla = Join-Path $payload 'camilladsp'
@@ -164,13 +181,16 @@ function Assert-FinalBundle {
     $dspReady = Join-Path $payload 'audiodsp-dsp-ready'
     $dspReadyService = Join-Path $payload 'audiodsp-ready.service'
     $dspReadyWave = Join-Path $payload 'announce_dsp_ready_48k_front_lr.wav'
-    $ethernetApply = Join-Path $payload 'audiodsp-pi2-ethernet-apply'
-    $ethernetService = Join-Path $payload 'audiodsp-pi2-ethernet-apply.service'
+    $ethernetApply = Join-Path $payload 'audiodsp-ethernet-apply'
+    $ethernetService = Join-Path $payload 'audiodsp-ethernet-apply.service'
     $privateKey = Join-Path $script:StageRoot 'audiodsp_pi_ed25519'
     $publicKey = Join-Path $script:StageRoot 'audiodsp_pi_ed25519.pub'
-    $matrixTest = Join-Path $script:StageRoot 'test_profile_matrix.py'
-    $measurementTest = Join-Path $script:StageRoot 'test_measurement_engine.py'
-    $mimoTest = Join-Path $script:StageRoot 'test_mimo_runtime.py'
+    $matrixTest = Join-Path $script:BundleRoot 'test_profile_matrix.py'
+    $measurementTest = Join-Path $script:BundleRoot 'test_measurement_engine.py'
+    $targetOptionTest = Join-Path $script:BundleRoot 'test_target_option_matrix.py'
+    $mimoAlgorithmTest = Join-Path $script:BundleRoot 'test_mimo_algorithm_matrix.py'
+    $mimoTest = Join-Path $script:BundleRoot 'test_mimo_runtime.py'
+    $resourceTest = Join-Path $script:BundleRoot 'test_resource_budget.py'
     $imager = 'C:\Program Files\Raspberry Pi Ltd\Imager\rpi-imager.exe'
 
     foreach ($requiredFile in @(
@@ -178,7 +198,7 @@ function Assert-FinalBundle {
         $fir, $service, $asound, $outputProfile, $profileManager, $profileWeb, $measurement, $mimo,
         $cal0, $cal90, $targetHarman,
         $profileWebService, $u7Monitor, $u7Service, $dspReady, $dspReadyService,
-        $dspReadyWave, $ethernetApply, $ethernetService, $matrixTest, $measurementTest, $mimoTest,
+        $dspReadyWave, $ethernetApply, $ethernetService, $matrixTest, $measurementTest, $targetOptionTest, $mimoAlgorithmTest, $mimoTest, $resourceTest,
         $privateKey, $publicKey, $imager
     )) {
         if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
@@ -201,7 +221,7 @@ function Assert-FinalBundle {
     foreach ($linuxTextFile in @(
         $firstRun, $starter, $config, $service, $asound, $outputProfile,
         $profileManager, $profileWeb, $measurement, $mimo, $profileWebService, $u7Monitor, $u7Service,
-        $dspReady, $dspReadyService, $ethernetApply, $ethernetService, $matrixTest, $measurementTest, $mimoTest
+        $dspReady, $dspReadyService, $ethernetApply, $ethernetService, $matrixTest, $measurementTest, $targetOptionTest, $mimoAlgorithmTest, $mimoTest, $resourceTest
     )) {
         Assert-LfNoBom -Path $linuxTextFile
     }
@@ -251,11 +271,12 @@ function Assert-FinalBundle {
         $managerText -notmatch 'convolution_channels' -or
         $managerText -notmatch 'MAX_FIR_FRAMES = 262144' -or
         $managerText -notmatch 'selector_status' -or
+        $managerText -notmatch 'resolve_preview' -or
         $managerText -notmatch 'remain active for one second') {
         throw 'The FIR profile manager is missing fallback, bypass, or FIR validation support.'
     }
 
-    $webText = Get-Content -LiteralPath $profileWeb -Raw
+    $webText = Get-Content -LiteralPath $profileWeb -Raw -Encoding UTF8
     if ($webText -notmatch 'client_svg_graph' -or
         $webText -notmatch '/bypass' -or
         $webText -notmatch '/chunksize' -or
@@ -274,7 +295,18 @@ function Assert-FinalBundle {
         $webText -notmatch '/api/volume' -or
         $webText -notmatch 'output_volume_control' -or
         $webText -notmatch 'output-volume-control' -or
-        $webText -notmatch 'non_destructive_step_navigation' -or
+        $webText -notmatch 'non_destructive_measurement_tabs' -or
+        $webText -notmatch 'role="tablist"' -or
+        $webText -notmatch 'Woofer 최종 trim' -or
+        $webText -notmatch 'session-overview' -or
+        $webText -notmatch '/measurement/delete-session' -or
+        $webText -notmatch 'lrw_sum' -or
+        $webText -notmatch 'predicted_target_and_spatial_non_regression' -or
+        $webText -notmatch 'Safe · 높은 안정성' -or
+        $webText -notmatch 'build-fieldset' -or
+        $webText -notmatch 'validation-checklist' -or
+        $webText -notmatch '\-\-step-accent' -or
+        $webText -notmatch 'summary::after' -or
         $webText -notmatch 'room_tuning_audit' -or
         $webText -notmatch 'output-level-warning' -or
         $webText -notmatch '−42부터 시작' -or
@@ -283,6 +315,17 @@ function Assert-FinalBundle {
         $webText -notmatch 'ThreadingHTTPServer\(\(WEB_HOST, WEB_PORT\)' -or
         $webText -notmatch 'active-profile' -or
         $webText -notmatch 'id="u7-physical"' -or
+        $webText -notmatch 'signal_flow_diagram' -or
+        $webText -notmatch 'measurement-path-lock' -or
+        $webText -notmatch 'name="crossover_enabled"' -or
+        $webText -notmatch 'additional_block_latency_samples' -or
+        $webText -notmatch 'aria-current="page"' -or
+        $webText -notmatch 'aria-current="step"' -or
+        $webText -notmatch 'class="skip-link"' -or
+        $webText -notmatch 'id="main-content"' -or
+        $webText -notmatch 'file-picker-label' -or
+        $webText -notmatch '\-\-on-accent' -or
+        $webText -notmatch 'RESULT_ALGORITHM_REVISION' -or
         $webText -match 'action="/switch"') {
         throw 'The profile Web UI is missing display-only U7 state, client SVG, theme, bypass, or port support.'
     }
@@ -308,10 +351,26 @@ function Assert-FinalBundle {
         'time_alignment_safe',
         'automatic_room_correction_db',
         'preference_correction_db',
+        'CROSSOVER_FREQUENCIES',
+        'apply_joint_crossover_guard',
+        'additional_block_latency_samples',
         '--fatal-errors',
         'audiodsp_announce',
         'install-pair',
-        'MIMO_MODES'
+        'MIMO_MODES',
+        'ensure_measurement_output_path',
+        'validate_result_profile',
+        'validate_result_revision',
+        'RESULT_ALGORITHM_REVISION',
+        'set-session-note',
+        'load-session',
+        'delete-session',
+        'session_integrity',
+        'lrw_sum',
+        'evaluate_premeasured_sum_model',
+        'pass_independent_complex_model',
+        'normalization_applied": False',
+        '/var/lib/audiodsp/u7-selector-state.json'
     )) {
         if ($measurementText -notmatch [regex]::Escape($requiredText)) {
             throw "Measurement engine validation is missing: $requiredText"
@@ -319,7 +378,7 @@ function Assert-FinalBundle {
     }
 
     $mimoText = Get-Content -LiteralPath $mimo -Raw
-    foreach ($requiredText in @('weighted pressure matching', 'MIMO_manifest.json', 'correlated_input_headroom', 'mimo_one_sub', 'bulk_delay_samples', 'spectral_continuity', 'solution_blend', 'target_level_normalization', 'predicted_modal_tail_non_regression')) {
+    foreach ($requiredText in @('weighted pressure matching', 'MIMO_manifest.json', 'correlated_input_headroom', 'mimo_one_sub', 'bulk_delay_samples', 'spectral_continuity', 'solution_blend', 'target_level_normalization', 'siso_bank_normalization', 'before_level_alignment_db', 'predicted_modal_tail_non_regression', 'response_confidence', 'crossover_spectra', 'physical_output_limits', 'pass_multichannel_complex_model', 'application_requires_post_filter_measurement": False')) {
         if ($mimoText -notmatch [regex]::Escape($requiredText)) {
             throw "MIMO engine validation is missing: $requiredText"
         }
@@ -337,7 +396,7 @@ function Assert-FinalBundle {
         'usermod -s /bin/bash audiodsp',
         '/usr/bin/cancel-rename audiodsp',
         'hostname=audiodsp-pi2',
-        'audiodsp-pi2-ethernet-apply.service',
+        'audiodsp-ethernet-apply.service',
         'audiodsp-profile-manager.py activate speaker --no-restart',
         'audiodsp-profile-manager.py set-chunksize 2048 --no-restart',
         'audiodsp-web.service',
@@ -372,6 +431,8 @@ try {
         Write-Warning "Transcript is unavailable; continuing with console output: $($_.Exception.Message)"
     }
 
+    Write-Host 'Assembling the canonical AudioDSP Pi 2 bundle...' -ForegroundColor Cyan
+    Invoke-BundleAssembly
     Write-Host 'Validating the complete AudioDSP SD bundle...' -ForegroundColor Cyan
     $bundle = Assert-FinalBundle
     Write-Host 'Bundle validation: PASS' -ForegroundColor Green

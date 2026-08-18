@@ -31,7 +31,7 @@ flowchart LR
 | HID 감시 | `/usr/local/bin/audiodsp-profile-monitor.py` | U7 Speaker/Headphones 실제 상태 읽기, 프로필 전환, 안내음 요청 |
 | 출력 전환 helper | `/usr/local/bin/audiodsp-output-profile` | manager 호출과 Front L/R 안내음 믹스 |
 | 웹 | `/usr/local/bin/audiodsp-profile-web.py` | 세 화면, HTTP API, staged upload/backup, client SVG, 실제 볼륨 polling |
-| 측정 엔진 | `/usr/local/bin/audiodsp-measurement.py` | 독점 측정, sweep 분석, 공간 결합, FIR 계산, 진행 상태 |
+| 측정 엔진 | `/usr/local/bin/audiodsp-measurement.py` | 독점 측정, L/R/W 및 선택적 L+W/R+W 복소 closure, sweep 분석, 공간 결합, FIR 계산, 진행 상태 |
 | MIMO 엔진 | `/usr/local/bin/audiodsp-mimo.py` | Pi4/5 전용 2×4 robust pressure matching, 8-path FIR bank와 영구 한계 보고서 생성 |
 | 준비 안내 | `/usr/local/bin/audiodsp-dsp-ready` | CamillaDSP 준비 확인 후 `DSP ready` 재생 |
 
@@ -75,6 +75,7 @@ MIMO bank는 `/etc/camilladsp/profiles/mimo`의 manifest와 네 stereo float32 W
 
 - 관리자 CLI는 `/run/audiodsp-profile-manager.lock`의 `flock`으로 설정·FIR·config 변경을 직렬화한다.
 - 측정은 별도 measurement lock과 audio-exclusive lock을 쓴다.
+- 정밀 분리+합산 session은 L/R/W만 FIR 설계에 사용하고 L+W/R+W는 같은 위치의 절대 복소합 검증에만 사용한다. 검증 응답을 다시 평균하거나 normalize하지 않는다.
 - JSON과 config는 임시 파일 작성 후 `os.replace`로 원자 교체한다.
 - Web은 thread-per-request지만 모든 변경은 관리자 CLI의 프로세스 lock을 통과한다.
 - status는 관련 파일 mtime/size signature로 cache한다.

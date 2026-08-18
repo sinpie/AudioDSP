@@ -23,6 +23,8 @@ Preamp 출력과 U7 입력을 연결하므로 기존 preamp 노브와 소스 볼
 
 T5S가 오른쪽 스피커의 오른편에 있어도 현재 보정은 Woofer를 하나의 source로 측정하고 같은 FIR을 Rear L/R에 넣는다. 이는 케이블·입력 호환을 위한 두 채널 복제이며 두 개의 독립 서브우퍼를 뜻하지 않는다.
 
+L/R/Woofer 개별 룸보정의 기본 digital crossover는 Front L/R에 LR4 HPF, Rear L/R에 같은 Woofer LR4 LPF를 적용한다. 두 전달함수와 합산 guard는 각각의 32768탭 WAV 안에 들어가므로 위 채널 수와 CamillaDSP pipeline stage는 변하지 않는다. T5S 본체의 analog low-pass가 켜져 있으면 디지털 LPF와 직렬로 겹쳐 실제 acoustic slope/phase가 달라지므로 가능한 bypass/LFE 또는 가장 높은 cutoff로 두고 적용 후 합산 sweep으로 확인한다. 하드웨어 설정을 바꿀 수 없다면 측정값이 그 analog 특성을 포함하지만 LR4 이론합과 같다고 가정해서는 안 된다.
+
 ## 샘플 형식
 
 - Camilla capture: 2ch, `S32_LE`, 48 kHz
@@ -56,6 +58,8 @@ amixer -D hw:U7 set 'PCM',0 117
 상단 dial 클릭의 output 선택은 U7 HID report에서 감지한다. 현재 확인된 state는 Headphones `0x30`, Speaker `0xA0`이며 button press mask가 함께 들어온다. 웹은 이를 읽어 active 카드와 실제 상태를 갱신한다.
 
 U7 hardware output selector를 바꾸는 공개 ALSA command가 확인되지 않았으므로 웹에서 LED를 바꾸는 control은 제공하지 않는다. U7 물리 버튼으로 바꾼다.
+
+현재 현장 구성은 U7 Speaker output과 Headphone jack 양쪽 모두 서로 다른 스피커 경로에 연결되어 있다. 따라서 웹 표시는 `스피커/헤드폰 기기 종류`가 아니라 `Speaker 출력 체인/Headphone 잭 출력 체인` 두 개의 독립 룸/FIR 프로필로 해석한다. 레벨 검사 때 선택된 물리 경로가 측정 session에 고정되며, 도중에 상단 버튼을 눌러 다른 체인으로 바뀌면 측정과 A/B를 즉시 차단한다.
 
 ## 측정 연결
 

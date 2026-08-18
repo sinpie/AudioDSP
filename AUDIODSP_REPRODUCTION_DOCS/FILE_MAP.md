@@ -1,20 +1,29 @@
 # 파일 지도
 
+## Canonical source
+
+| 파일 | 역할 |
+|---|---|
+| `source/common/payload/*` | Pi 2/3/4/5가 공유하는 유일한 runtime·asset 원본 |
+| `source/common/tests/*` | 공유하는 유일한 무음 회귀 시험 원본 |
+| `source/platforms/pi2/payload/*` | ARMv7/Pi2 전용 config·Ethernet helper overlay |
+| `source/platforms/pi4/payload/*` | ARM64/Pi4 전용 config overlay |
+| `source/platforms/pi3/platform.json` | Pi2 overlay를 상속하는 Pi3 manifest |
+| `source/platforms/pi5/platform.json` | Pi4 overlay를 상속하는 Pi5 manifest |
+| `tools/materialize_releases.py` | canonical source+overlay+architecture binary를 `build/<platform>`에 조립·검사 |
+| `build/<platform>` | 무시되는 생성 bundle; 직접 편집 금지 |
+
 ## Release root
 
 | 파일 | 역할 |
 |---|---|
 | `*.img.xz` | 고정 Raspberry Pi OS Lite image |
-| `camilladsp-linux-*.tar.gz` | upstream archive 기록 |
 | `firstrun.sh` | image 첫 부팅 설치기 |
 | `write_*_sd_as_admin.ps1` | 검증·대상 확인·image 기록·FAT payload 복사 |
 | `WRITE_*.cmd` | 관리자 writer 실행 진입점 |
 | `verify_*.ps1`, `VERIFY_*.cmd` | 작성 후 또는 live 검증 진입점 |
 | `audiodsp_pi_ed25519(.pub)` | 새 설치 SSH key pair; private 취급 |
-| `test_profile_matrix.py` | exhaustive isolated profile/Web/HID/volume 시험 |
-| `test_measurement_engine.py` | 합성 measurement/DSP 시험 |
-| `test_mimo_runtime.py` | 무음 2×4 bank 형식, 실제 CamillaDSP parser, Pi2 차단 시험 |
-| `SHA256SUMS.txt` | 릴리스 파일 inventory |
+| `payload/camilladsp` | architecture 전용 외부 binary 하나만 보관; 나머지 payload는 build에서 생성 |
 
 ## Payload → 설치 위치
 
@@ -61,8 +70,8 @@
 
 Pi 2:
 
-- `audiodsp-pi2-ethernet-apply`
-- `audiodsp-pi2-ethernet-apply.service`
+- `audiodsp-ethernet-apply`
+- `audiodsp-ethernet-apply.service`
 - `write_pi2_sd_as_admin.ps1`
 - `verify_audiodsp_pi2.ps1`
 
@@ -75,4 +84,4 @@ Pi 4/5:
 
 ## 제외 파일
 
-`__pycache__`, `.pyc`, `*.log`는 실행 부산물이며 기준 소스도 checksum 대상도 아니다. `legacy-v1-reference`는 이전 장애 분석에만 사용한다.
+`__pycache__`, `.pyc`, `*.log`는 실행 부산물이며 기준 소스가 아니다. 과거 중복 payload/docs/legacy tree는 release에서 제거하고 Git 이력으로만 보존한다.

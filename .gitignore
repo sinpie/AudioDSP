@@ -3,6 +3,7 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/AGENTS.md
 !/diagnostics/
 /diagnostics/*
 !/diagnostics/refine_tonal_fir.py
@@ -12,8 +13,16 @@
 !/diagnostics/capture_option_validation.py
 !/diagnostics/merge_option_matrix.py
 !/diagnostics/validate_live_apply_restore.py
+!/diagnostics/validate_saved_session_silently.py
+!/diagnostics/render_ui_cdp.py
 !/AUDIODSP_REPRODUCTION_DOCS/
 !/AUDIODSP_REPRODUCTION_DOCS/**
+!/source/
+!/source/**
+!/tools/
+!/tools/**
+!/build/
+/build/**
 !/releases/
 /releases/*
 !/releases/audiodsp-pi2-v1.2.0/

@@ -76,7 +76,7 @@ Schema 2 `profile-settings.json`에는 다음 key가 정식이다.
 
 볼륨은 settings에 포함되므로 복원 때 저장값도 바뀐다. 관리자 snapshot 복원은 CamillaDSP를 재시작하며 시작 래퍼가 복원된 볼륨을 적용한다.
 
-## GSonic → AudioDSP 이름 변경
+## AudioDSP 식별자 통일
 
 신규 설치:
 
@@ -86,15 +86,15 @@ Schema 2 `profile-settings.json`에는 다음 key가 정식이다.
 - share: `/usr/local/share/audiodsp`
 - service/binary: `audiodsp-*`
 
-기존 운용 Pi는 hostname/user를 즉시 바꾸면 SSH와 서비스 소유권 위험이 있으므로 그대로 둘 수 있다. 앱 파일·서비스·state만 AudioDSP로 이전해도 기능상 문제없다.
+기존 장치는 먼저 Web backup과 `/var/lib/audiodsp` snapshot을 만든다. 이어서 `audiodsp` 계정·SSH·sudo를 만들고 새 계정의 로그인을 실제 확인한 뒤 hostname과 소유권을 바꾼다. 설치·실행·시험 환경변수는 `AUDIODSP_<NAME>`만 사용한다. 이전 식별자 fallback은 제거되어 있으므로 복원한 오래된 systemd override도 함께 점검한다.
 
-Python의 `environment()`는 `AUDIODSP_<NAME>`을 먼저 보고 없으면 `GSONIC_<NAME>`을 본다. 이 fallback은 다음 용도다.
+2026-08-19 production Pi 2 이전 백업:
 
-- 기존 자동 시험 environment
-- 기존 설치에서 점진적으로 서비스 파일을 바꿀 때
-- 회귀 fixture
+- `audiodsp-pre-final-20260819.tar.gz`: 이전 전 앱·설정 상태
+- `legacy-identity-home-20260819.tar.gz`: 이전 계정 home
+- `legacy-identity-residuals-20260819.tar.gz`: 제거 전 잔여 unit/config/payload
 
-새 문서, 서비스, payload에는 `GSONIC_` 변수를 추가하지 않는다. 호환 제거는 별도 major migration에서 backup restore와 테스트 launcher를 먼저 전환한 뒤 한다.
+로컬 `diagnostics/pretest-backups`와 Pi의 root 전용 `/var/backups/audiodsp`에 같은 복구본을 둔다. 이전 완료 조건은 새 계정 SSH와 passwordless sudo, 세 서비스 active, CamillaDSP PID·Speaker FIR SHA·U7 볼륨 불변, 활성 `/etc`·`/usr/local`·`/var/lib/audiodsp`·`/boot`의 이전 식별자 검색 0건이다.
 
 ## 릴리스 간 복원
 

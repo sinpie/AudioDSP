@@ -1,6 +1,6 @@
 # AudioDSP MIMO 무음 검증 보고서
 
-날짜: 2026-08-18
+최초 작성: 2026-08-18 · 최신 무음 회귀: 2026-08-19
 
 ## 범위
 
@@ -14,9 +14,9 @@
 
 | 토폴로지 | Left target MAE dB | Right target MAE dB | Left 좌석편차 dB | Right 좌석편차 dB | 최종 최대 row sum |
 |---|---:|---:|---:|---:|---:|
-| MIMO Stereo | 6.431 → 3.622 | 5.032 → 3.457 | 0.731 → 0.672 | 0.691 → 0.621 | 0.999 |
-| MIMO 2.1 | 6.431 → 3.138 | 5.032 → 2.973 | 0.731 → 0.670 | 0.691 → 0.619 | 0.999 |
-| MIMO 2.2 | 6.431 → 2.829 | 5.032 → 2.608 | 0.731 → 0.661 | 0.691 → 0.610 | 0.999 |
+| MIMO Stereo | 3.279 → 3.347 | 2.223 → 2.274 | 0.731 → 0.730 | 0.691 → 0.690 | 0.969 |
+| MIMO 2.1 | 3.279 → 2.694 | 2.223 → 2.081 | 0.731 → 0.597 | 0.691 → 0.606 | 0.887 |
+| MIMO 2.2 | 3.279 → 2.711 | 2.223 → 2.229 | 0.731 → 0.593 | 0.691 → 0.505 | 0.875 |
 
 공통 검증:
 
@@ -26,8 +26,12 @@
 - 공통 인과 지연 검사: PASS
 - 최악 상관입력 physical-output headroom: PASS
 - 예측 target MAE와 좌석 편차 비퇴행: PASS
+- Flat/추가 억제 없음/Woofer trim 0 dB 기준 세 토폴로지 모델: PASS
+- MIMO UI 19개 옵션 bank의 finite/형식/headroom/인과 구조: 19/19 PASS
 
-Modal late/early energy는 최적화의 보장 항목이 아니다. 특정 토폴로지/채널에서 0.5 dB보다 나빠지면 결과에 경고하고 decay 개선으로 판정하지 않는다.
+Target MAE는 실제 SISO base bank를 먼저 공통 정규화한 뒤, 한 저역 reference-band level만 맞춰 음색 형상을 비교한다. 위치별·주파수별 normalize는 하지 않는다. 실제 broadband 감쇄는 별도 `headroom.global_scale_db`로 남긴다.
+
+Modal late/early energy는 평활 전달함수 기반 ringing proxy이며 실제 RT60 예측이 아니다. 1.5 dB보다 악화되면 적용을 차단한다. 19개 옵션 중 crossover 60/70/80 Hz, Harman target, Safe/지원 제한 12 dB의 다섯 합성 조합은 이 기준으로 `fail_model`이 되었고, UI가 실제 4단계 메뉴명으로 조정을 안내하는 것을 확인했다.
 
 ### 실제 CamillaDSP parser·관리자 — PASS
 
@@ -52,8 +56,18 @@ Modal late/early energy는 최적화의 보장 항목이 아니다. 특정 토�
 
 - Python/shell/PowerShell 정적 parse
 - measurement 합성 end-to-end: magnitude/bass-phase 32768탭, actual FIR target 검증, natural roll-off, decay control PASS
-- profile matrix: 4096 상태(3968 valid, 128 expected error), 3136 ordered transitions, 실제 CamillaDSP config 28종, Web/HID/volume/backup/concurrency PASS
+- profile matrix: 4096 상태(3968 valid, 128 expected error), 3136 ordered transitions, 실제 CamillaDSP config 28종, Web/HID/volume/backup/session 삭제/FAIL 가이드/concurrency PASS
 - Pi2/Pi4-Pi5 SD writer `-ValidateOnly`: image/binary/Factory FIR/필수 payload/정책 PASS
+
+### Pi 5 2 GB / 5.1 메모리 worst-case — PASS (계획·무음 allocation)
+
+- 현재 2×4/8경로: 원시 FIR 1.00 MiB, runtime 계획 46 MiB, 생성 계획 309 MiB
+- 5.1 diagonal/6경로: 원시 FIR 0.75 MiB, runtime 계획 40 MiB, 생성 계획 296 MiB
+- 5.1 + dual-sub 완전 dense 6×7/42경로: 원시 FIR 5.25 MiB, runtime 계획 135 MiB, 생성 계획 530 MiB
+- 42경로 64-bit CPython 실제 배열 allocation peak: 138.64 MiB
+- generator는 path spectrum 조기 해제와 in-place bank scaling을 사용한다.
+
+2 GB 용량 판정은 PASS다. 42경로 연산량은 약 64.6 M partition complex MAC/s이므로 CPU/XRUN은 별도 Pi 5 실기 판정이며 아직 PASS가 아니다. 권장 5.1 구조는 채널별 diagonal FIR + 150 Hz 이하 저역 actuator group MIMO다.
 
 ## 완료되지 않은 실기 항목
 
@@ -69,4 +83,4 @@ Modal late/early energy는 최적화의 보장 항목이 아니다. 특정 토�
 
 ## 종료 시 라이브 상태 확인
 
-2026-08-18 종료 점검은 읽기 전용으로만 수행했다. 연결된 production Pi 2의 CamillaDSP PID는 2036이었고 `camilladsp`, `audiodsp-web`, `audiodsp-profile-monitor`는 모두 active였다. 최근 30분 journal의 XRUN/underrun/overrun 일치는 0회였으며 Speaker FIR SHA-256은 기존 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99` 그대로였다. 소리 재생, 서비스 재시작, 프로필·설정 변경은 하지 않았다.
+2026-08-19 최종 점검은 읽기 전용으로만 수행했다. 연결된 production Pi 2의 CamillaDSP PID는 `7731`이었고 `camilladsp`, `audiodsp-web`, `audiodsp-profile-monitor`는 모두 active였다. Speaker FIR SHA-256은 기존 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99` 그대로였고 U7 저장/실제 볼륨은 `0 dB`, 8채널 동일이었다. 소리 재생, CamillaDSP 재시작, 프로필·FIR·볼륨 변경은 하지 않았다. Pi 2의 새 식별자는 hostname `audiodsp-pi2`, user `audiodsp`, Ethernet profile `audiodsp-ethernet`이며 이전 식별자는 활성 경로에서 제거했다.

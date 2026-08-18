@@ -1,0 +1,10 @@
+{
+  "id": "pi2",
+  "family": "armv7-low-memory",
+  "models": ["Raspberry Pi 2 Model B"],
+  "memory_min_mb": 768,
+  "mimo_supported": false,
+  "default_chunksize": 2048,
+  "release": "releases/audiodsp-pi2-v1.2.0",
+  "notes": "Primary low-memory ARMv7 release source."
+}

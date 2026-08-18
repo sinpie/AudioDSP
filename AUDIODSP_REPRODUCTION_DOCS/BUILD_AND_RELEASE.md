@@ -26,9 +26,9 @@ Writer는 OS나 CamillaDSP를 인터넷에서 내려받지 않는다. 릴리스 
 
 Hash가 달라지면 writer의 expected hash를 단순히 새 값으로 바꾸지 않는다. 출처, architecture, 기능 시험을 확인하고 릴리스 버전을 올린다.
 
-## 공통 소스 동기화
+## 공통 소스와 플랫폼 overlay
 
-다음은 Pi 2와 Pi 4/5 payload가 byte-equivalent여야 한다.
+다음 공통 파일은 `source/common`에 한 번만 둔다.
 
 - `audiodsp-profile-manager.py`
 - `audiodsp-profile-web.py`
@@ -39,9 +39,9 @@ Hash가 달라지면 writer의 expected hash를 단순히 새 값으로 바꾸�
 - `audiodsp-output-profile`
 - systemd service와 ALSA config
 - FIR, announcement, target, calibration asset
-- `test_profile_matrix.py`, `test_measurement_engine.py`, `test_mimo_runtime.py`
+- `test_profile_matrix.py`, `test_measurement_engine.py`, `test_target_option_matrix.py`, `test_mimo_algorithm_matrix.py`, `test_mimo_runtime.py`, `test_resource_budget.py`
 
-플랫폼 차이는 `firstrun.sh`, writer, network helper/template, OS image, CamillaDSP binary다. 공통 파일을 동기화한 후 Pi 4/5의 초기 chunksize 1024 설정이 `firstrun.sh`와 base `camilladsp.yml`에 유지되는지 확인한다.
+플랫폼 차이는 `source/platforms/<pi>/payload`, release의 `firstrun.sh`, writer, network helper/template, OS image, CamillaDSP binary다. `tools/materialize_releases.py`가 공통+overlay를 `build/<platform>`에 합치므로 release payload를 수동 복사하지 않는다. Pi3는 Pi2 overlay, Pi5는 Pi4 overlay를 상속한다.
 
 ## Text encoding
 
@@ -54,16 +54,26 @@ Writer의 `Assert-LfNoBom`과 Git Bash `bash -n` 검사를 우회하지 않는�
 ## Source 검사
 
 ```powershell
-$pi2 = 'D:\GSonic\RaspberryPi_SD\releases\audiodsp-pi2-v1.2.0'
-$pi45 = 'D:\GSonic\RaspberryPi_SD\releases\audiodsp-pi4-pi5-v1.2.0'
+$repo = (Resolve-Path '.').Path
+$pi2 = Join-Path $repo 'releases\audiodsp-pi2-v1.2.0'
+$pi45 = Join-Path $repo 'releases\audiodsp-pi4-pi5-v1.2.0'
 
 py -3 -m py_compile `
-  "$pi2\payload\audiodsp-profile-manager.py" `
-  "$pi2\payload\audiodsp-profile-web.py" `
-  "$pi2\payload\audiodsp-measurement.py" `
-  "$pi2\payload\audiodsp-mimo.py" `
-  "$pi2\test_profile_matrix.py" `
-  "$pi2\test_mimo_runtime.py"
+  .\source\common\payload\audiodsp-profile-manager.py `
+  .\source\common\payload\audiodsp-profile-web.py `
+  .\source\common\payload\audiodsp-measurement.py `
+  .\source\common\payload\audiodsp-mimo.py `
+  .\source\common\tests\test_profile_matrix.py `
+  .\source\common\tests\test_measurement_engine.py `
+  .\source\common\tests\test_target_option_matrix.py `
+  .\source\common\tests\test_mimo_algorithm_matrix.py `
+  .\source\common\tests\test_mimo_runtime.py `
+  .\source\common\tests\test_resource_budget.py
+
+foreach ($platform in 'pi2','pi3','pi4','pi5') {
+  py -3 .\tools\materialize_releases.py --platform $platform --assemble
+  py -3 .\tools\materialize_releases.py --platform $platform --check
+}
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$pi2\write_pi2_sd_as_admin.ps1" -ValidateOnly -NoPause
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$pi45\write_final_sd_as_admin.ps1" -ValidateOnly -NoPause
@@ -76,14 +86,14 @@ Writer preflight는 새 핵심 기능의 source marker도 검사한다. 볼륨 r
 Pi 2:
 
 ```powershell
-Set-Location 'D:\GSonic\RaspberryPi_SD\releases\audiodsp-pi2-v1.2.0'
+Set-Location '.\releases\audiodsp-pi2-v1.2.0'
 .\WRITE_PI2_SD_CARD.cmd
 ```
 
 Pi 4/5:
 
 ```powershell
-Set-Location 'D:\GSonic\RaspberryPi_SD\releases\audiodsp-pi4-pi5-v1.2.0'
+Set-Location '.\releases\audiodsp-pi4-pi5-v1.2.0'
 .\WRITE_FINAL_SD_CARD.cmd
 ```
 
@@ -101,23 +111,21 @@ Pi 4/5 writer는 SSID/password를 묻고 secret을 출력하지 않는다. 두 w
 - `DSP ready` 안내
 - DHCP 주소 확인, 고정 주소 없음
 
-## 체크섬 생성
+## 무결성 검사
 
-모든 소스·문서 변경과 검증이 끝난 마지막 단계에서 릴리스별 `SHA256SUMS.txt`를 다시 만든다. `.log`, `.pyc`, `__pycache__`, 기존 checksum 자체는 제외한다. 경로는 릴리스 root 상대, slash 구분으로 정렬한다.
-
-Checksum 생성 후 임의 표본이 아니라 모든 줄을 다시 hash해 일치하는지 검증한다. Writer가 고정하는 image/Camilla/FIR hash는 `SHA256SUMS.txt`와 별도로 source 안에서도 검증된다.
+공통 source와 생성 bundle의 byte 일치는 `materialize_releases.py --check`가 전 파일을 검사한다. Writer는 고정 OS image, architecture CamillaDSP binary, Factory FIR SHA-256과 필수 source marker를 별도로 검사한다. 중복된 정적 `SHA256SUMS.txt`는 source 변경마다 낡는 문제 때문에 제거했다.
 
 ## 릴리스 문서
 
-각 릴리스 root에는 최소 다음을 둔다.
+각 릴리스 root에는 플랫폼 전용 항목만 둔다.
 
 - `README.md`
 - `RELEASE_NOTES_<version>.md`
 - `FINAL_TEST_REPORT.md`
-- `MIMO_VALIDATION_REPORT.md`
 - `AUDIODSP_REQUIREMENTS_VERIFIED.md`
-- `AGENTS.md`
-- `docs/` 재현 문서 사본
-- `SHA256SUMS.txt`
+- OS image와 architecture CamillaDSP binary
+- writer/verify/firstrun/network 입력
+
+공통 문서·payload·tests를 release root에 복제하지 않는다. 재현 문서는 `AUDIODSP_REPRODUCTION_DOCS`, 실행/시험 원본은 `source/common`, 생성 결과는 `build/<platform>`이 정본이다.
 
 완료 보고에는 실제 시험 플랫폼, Pi 5 실기 여부, Camilla PID/FIR hash 유지 여부, volume API 결과를 명시한다.
