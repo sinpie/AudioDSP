@@ -59,6 +59,7 @@ DEFAULT_CORRECTION_PREFERENCES = {
 MAX_REQUEST = 33 * 1024 * 1024
 GRAPH_CACHE: dict[tuple[str, str, bool], str] = {}
 STAGING_LOCK = threading.Lock()
+RESTORE_LOCK = threading.RLock()
 STATUS_LOCK = threading.Lock()
 STATUS_CACHE: dict[str, object] = {"signature": None, "value": None}
 VOLUME_LOCK = threading.Lock()
@@ -96,6 +97,7 @@ def manager(*arguments: str) -> dict:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        timeout=45,
     )
     output = result.stdout.strip()
     try:
@@ -396,7 +398,7 @@ def backup_archive(status: dict) -> tuple[bytes, str, dict]:
         for name, payload in entries.items():
             archive.writestr(name, payload)
         archive.writestr("README.txt", "AudioDSP versioned backup. Restore from Profile & Settings > Backup & Recovery.\n")
-    stamp = time.strftime("%Y%m%d-%H%M%S")
+    stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}"
     return memory.getvalue(), f"AudioDSP_backup_{stamp}.zip", manifest
 
 
@@ -412,6 +414,20 @@ def restore_staging_status() -> dict:
         return {"active": False}
 
 
+def remove_restore_staging_directory(directory: Path) -> None:
+    """Remove one server-created staging directory without following links."""
+    try:
+        root = RESTORE_STAGING_ROOT.resolve()
+        if directory.is_symlink():
+            raise RuntimeError("restore staging directory must not be a symbolic link")
+        candidate = directory.resolve(strict=True)
+    except FileNotFoundError:
+        return
+    if candidate == root or candidate.parent != root or not candidate.is_dir():
+        raise RuntimeError("restore staging cleanup path is outside the managed directory")
+    shutil.rmtree(candidate)
+
+
 def latest_system_backup() -> Path | None:
     """Return only a server-created rollback archive from the managed directory."""
     try:
@@ -424,7 +440,45 @@ def latest_system_backup() -> Path | None:
         return None
 
 
-def stage_restore_archive(payload: bytes, original_name: str) -> dict:
+def inspect_restore_staging(directory: Path, original_name: str, version: int) -> dict:
+    settings_report = manager("validate-settings", str(directory / "profile-settings.json"))
+    if (directory / "correction-preferences.json").is_file():
+        preference_report = measurement("validate-preferences", str(directory / "correction-preferences.json"))
+    else:
+        preference_report = measurement_status().get("correction_preferences", {})
+    fir_report = {}
+    for name in BACKUP_PROFILE_NAMES:
+        path = directory / "profiles" / name
+        if path.is_file():
+            fir_report[name] = manager("validate-wav", str(path))
+    mimo_report = {}
+    for name in ("Speaker_MIMO.json", "Headphone_MIMO.json"):
+        path = directory / "profiles" / "mimo" / name
+        if path.is_file():
+            mimo_report[name] = manager("validate-mimo", str(path))
+    calibration_report = {}
+    for name, orientation in (("7200660.txt", "0"), ("7200660_90deg.txt", "90")):
+        path = directory / "calibration" / name
+        if path.is_file():
+            calibration_report[orientation] = measurement("validate-cal", orientation, str(path))
+    return {
+        "active": True,
+        "directory": str(directory),
+        "original_name": Path(original_name).name,
+        "schema_version": version,
+        "app_version": "1.2.0",
+        "settings": settings_report["normalized"],
+        "correction_preferences": preference_report,
+        "unknown_settings": settings_report.get("ignored_unknown_keys", []),
+        "firs": fir_report,
+        "mimo": mimo_report,
+        "calibrations": calibration_report,
+        "staged_unix": time.time(),
+    }
+
+
+def _stage_restore_archive(payload: bytes, original_name: str) -> dict:
+    previous_staging = restore_staging_status()
     try:
         archive = zipfile.ZipFile(io.BytesIO(payload), "r")
     except zipfile.BadZipFile as exc:
@@ -465,54 +519,48 @@ def stage_restore_archive(payload: bytes, original_name: str) -> dict:
         if item.get("bytes") != len(contents[name]) or item.get("sha256") != hashlib.sha256(contents[name]).hexdigest():
             raise RuntimeError(f"백업 무결성 검증 실패: {name}")
 
-    token = f"{time.strftime('%Y%m%d-%H%M%S')}-{hashlib.sha256(payload).hexdigest()[:10]}"
+    token = f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}-{hashlib.sha256(payload).hexdigest()[:10]}"
     directory = RESTORE_STAGING_ROOT / token
     directory.mkdir(parents=True, exist_ok=False)
-    for name in data_names:
-        atomic_bytes(directory / name, contents[name])
-    settings_report = manager("validate-settings", str(directory / "profile-settings.json"))
-    if (directory / "correction-preferences.json").is_file():
-        preference_report = measurement("validate-preferences", str(directory / "correction-preferences.json"))
-    else:
-        preference_report = measurement_status().get("correction_preferences", {})
-    fir_report = {}
-    for name in BACKUP_PROFILE_NAMES:
-        path = directory / "profiles" / name
-        if path.is_file():
-            fir_report[name] = manager("validate-wav", str(path))
-    mimo_report = {}
-    for name in ("Speaker_MIMO.json", "Headphone_MIMO.json"):
-        path = directory / "profiles" / "mimo" / name
-        if path.is_file():
-            mimo_report[name] = manager("validate-mimo", str(path))
-    calibration_report = {}
-    for name, orientation in (("7200660.txt", "0"), ("7200660_90deg.txt", "90")):
-        path = directory / "calibration" / name
-        if path.is_file():
-            calibration_report[orientation] = measurement("validate-cal", orientation, str(path))
-    report = {
-        "active": True,
-        "directory": str(directory),
-        "original_name": Path(original_name).name,
-        "schema_version": version,
-        "app_version": manifest.get("app_version", "unknown"),
-        "settings": settings_report["normalized"],
-        "correction_preferences": preference_report,
-        "unknown_settings": settings_report.get("ignored_unknown_keys", []),
-        "firs": fir_report,
-        "mimo": mimo_report,
-        "calibrations": calibration_report,
-        "staged_unix": time.time(),
-    }
-    atomic_bytes(RESTORE_STATE_PATH, (json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
+    try:
+        for name in data_names:
+            atomic_bytes(directory / name, contents[name])
+        report = inspect_restore_staging(directory, original_name, version)
+        report["app_version"] = manifest.get("app_version", "unknown")
+        atomic_bytes(RESTORE_STATE_PATH, (json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
+    except Exception:
+        remove_restore_staging_directory(directory)
+        raise
+    if previous_staging.get("active"):
+        previous_directory = Path(previous_staging["directory"])
+        if previous_directory != directory:
+            remove_restore_staging_directory(previous_directory)
     return report
 
 
+def stage_restore_archive(payload: bytes, original_name: str) -> dict:
+    with RESTORE_LOCK:
+        return _stage_restore_archive(payload, original_name)
+
+
 def discard_restore_staging() -> None:
+    with RESTORE_LOCK:
+        _discard_restore_staging()
+
+
+def _discard_restore_staging() -> None:
+    staged = restore_staging_status()
+    if staged.get("active"):
+        remove_restore_staging_directory(Path(staged["directory"]))
     RESTORE_STATE_PATH.unlink(missing_ok=True)
 
 
 def apply_restore_staging() -> dict:
+    with RESTORE_LOCK:
+        return _apply_restore_staging()
+
+
+def _apply_restore_staging() -> dict:
     staged = restore_staging_status()
     if not staged.get("active"):
         raise RuntimeError("검토 중인 백업이 없습니다.")
@@ -530,6 +578,7 @@ def apply_restore_staging() -> dict:
         for name in BACKUP_CALIBRATION_NAMES
     }
     previous_preferences = CORRECTION_PREFERENCES_PATH.read_bytes() if CORRECTION_PREFERENCES_PATH.is_file() else None
+    manager_rollback: Path | None = None
     try:
         for name in BACKUP_CALIBRATION_NAMES:
             source = directory / "calibration" / name
@@ -542,8 +591,15 @@ def apply_restore_staging() -> dict:
         if current.get("preview", {}).get("active"):
             manager("restore-profile")
         result = manager("restore-snapshot", str(directory))
+        rollback_value = result.get("restored_snapshot", {}).get("automatic_backup")
+        manager_rollback = Path(rollback_value) if isinstance(rollback_value, str) else None
         if "90" in staged.get("calibrations", {}):
-            measurement("calibration-changed", "90")
+            try:
+                measurement("calibration-changed", "90")
+            except Exception:
+                if manager_rollback is not None:
+                    manager("restore-snapshot", str(manager_rollback))
+                raise
     except Exception:
         for name, previous in previous_calibration.items():
             target = CAL_DIR / name
@@ -556,7 +612,7 @@ def apply_restore_staging() -> dict:
         else:
             atomic_bytes(CORRECTION_PREFERENCES_PATH, previous_preferences, 0o644)
         raise
-    discard_restore_staging()
+    _discard_restore_staging()
     result["browser_restore"] = {"automatic_backup": str(automatic_backup), "source": staged["original_name"]}
     return result
 
@@ -584,7 +640,7 @@ def system_health() -> dict:
 
 def service_active(name: str) -> bool:
     return subprocess.run(
-        ["systemctl", "is-active", "--quiet", name], check=False
+        ["systemctl", "is-active", "--quiet", name], check=False, timeout=3
     ).returncode == 0
 
 
@@ -872,6 +928,94 @@ def file_summary(info: dict | None) -> str:
     )
 
 
+MEASUREMENT_MODE_OPTIONS = (
+    ("lr", "L+Woofer / R+Woofer · 합산 SISO · 3위치"),
+    ("lrw", "Front L / Front R / Woofer · 분리 SISO · 3위치"),
+    ("mimo_stereo", "MIMO Stereo · Front L/R 2제어원 · Pi4/5"),
+    ("mimo_one_sub", "MIMO 2.1 · Front L/R+T5S 3제어원 · Pi4/5"),
+    ("mimo_dual_sub", "MIMO 2.2 · Front L/R+독립 우퍼 2대 · Pi4/5"),
+)
+MEASUREMENT_MODE_HELP = {
+    "lr": "각 sweep에서 Front L+Rear L(Woofer), Front R+Rear R(Woofer)가 함께 재생됩니다. 하나의 공통 FIR을 Front에 처리한 뒤 Woofer로 복사하는 구성입니다.",
+    "lrw": "Front L, Front R, Woofer를 각각 따로 측정합니다. Front와 Woofer FIR·레벨·저역 위상을 독립 설계할 수 있습니다.",
+    "mimo_stereo": "Front L/R을 각각 독립 측정해 두 스피커를 공동 최적화합니다. Woofer 상대레벨은 사용하지 않습니다.",
+    "mimo_one_sub": "Front L, Front R, 한 대의 T5S를 세 독립 물리 제어원으로 측정합니다. T5S의 stereo 입력은 한 우퍼로 취급합니다.",
+    "mimo_dual_sub": "Front L/R과 서로 다른 위치·배선의 우퍼 두 대를 네 독립 제어원으로 측정합니다.",
+}
+
+
+def measurement_mode_options(selected: str, mimo_supported: bool) -> str:
+    return "".join(
+        f'<option value="{value}" data-help="{html.escape(MEASUREMENT_MODE_HELP[value], quote=True)}" '
+        f'{"selected" if selected == value else ""} '
+        f'{"disabled" if value.startswith("mimo_") and not mimo_supported else ""}>{label}</option>'
+        for value, label in MEASUREMENT_MODE_OPTIONS
+    )
+
+
+def measurement_output_fields(sweep_dbfs: int, noise_dbfs: int, woofer_db: int) -> str:
+    effective = sweep_dbfs + woofer_db
+    return f'''
+      <label class="level-slider">백색소음 출력 <output>{noise_dbfs} dBFS</output>
+        <input name="noise_level_dbfs" type="range" min="-54" max="-6" step="1" value="{noise_dbfs}" data-unit="dBFS">
+        <small>5초 레벨 검사 전용 · −42부터 시작, SNR을 보며 단계 조절</small>
+      </label>
+      <label class="level-slider">Sweep 출력 <output>{sweep_dbfs} dBFS</output>
+        <input name="level_dbfs" type="range" min="-54" max="0" step="1" value="{sweep_dbfs}" data-unit="dBFS">
+        <small>실제 응답 측정 · 낮게 시작하고 SNR/예상 peak로 단계 조절</small>
+      </label>
+      <label class="level-slider woofer-level-slider"><span class="woofer-level-heading">Woofer 측정 감쇄</span> <output>{woofer_db} dB</output>
+        <input name="woofer_measurement_attenuation_db" type="range" min="-18" max="0" step="1" value="{woofer_db}" data-unit="dB">
+        <small><span class="woofer-level-meaning">응답에서 복원 · SNR에만 영향</span><br>Woofer sweep 실효값 <b class="effective-woofer-level">{effective} dBFS</b></small>
+      </label>
+      <p class="form-note output-level-warning" role="status" aria-live="polite"></p>'''
+
+
+MEASUREMENT_LEVEL_SCRIPT = """<script>(()=>{
+  const refresh=(form)=>{
+    form.querySelectorAll('.level-slider input[type=range]').forEach(input=>{
+      const output=input.closest('.level-slider').querySelector('output');
+      if(output) output.textContent=`${input.value} ${input.dataset.unit}`;
+    });
+    const sweep=form.querySelector('[name=level_dbfs]');
+    const noise=form.querySelector('[name=noise_level_dbfs]');
+    const woofer=form.querySelector('[name=woofer_measurement_attenuation_db]');
+    const effective=form.querySelector('.effective-woofer-level');
+    if(sweep&&woofer&&effective) effective.textContent=`${Number(sweep.value)+Number(woofer.value)} dBFS`;
+    const mode=form.querySelector('.measurement-mode-select');
+    const route=form.querySelector('.mode-route');
+    if(mode&&route){
+      const option=mode.options[mode.selectedIndex];
+      route.textContent=option?.dataset.help||'';
+      const wooferBox=form.querySelector('.woofer-level-slider');
+      if(wooferBox){
+        const heading=wooferBox.querySelector('.woofer-level-heading');
+        const meaning=wooferBox.querySelector('.woofer-level-meaning');
+        const stereoOnly=mode.value==='mimo_stereo';
+        wooferBox.classList.toggle('not-used',stereoOnly);
+        if(heading) heading.textContent=mode.value==='lr'?'Woofer 재생 trim':stereoOnly?'Woofer 설정 사용 안 함':'Woofer 측정 감쇄';
+        if(meaning) meaning.textContent=mode.value==='lr'?'합산 응답 조건 · 최종 적용값과 동일':stereoOnly?'Front L/R만 측정':'deconvolution에서 복원 · SNR에만 영향';
+      }
+    }
+    const warning=form.querySelector('.output-level-warning');
+    if(warning&&sweep&&noise&&woofer){
+      const stereoOnly=mode?.value==='mimo_stereo';
+      const effectiveWoofer=Number(sweep.value)+Number(woofer.value);
+      const loud=Number(noise.value)>-24||Number(sweep.value)>-18||(!stereoOnly&&effectiveWoofer>-24);
+      warning.classList.toggle('loud',loud);
+      warning.innerHTML=loud
+        ? '<b>높은 출력 주의:</b> 실제 음압·UMIK peak를 확인하고 한 단계씩 올리세요. 야간이나 우퍼 근접 측정에는 권장하지 않습니다.'
+        : '<b>안전 시작 범위:</b> 먼저 레벨 검사를 실행하고, NOT OK일 때만 기기 볼륨 또는 측정 출력을 조금씩 올리세요.';
+    }
+  };
+  document.querySelectorAll('.measurement-output-form').forEach(form=>{
+    form.addEventListener('input',()=>refresh(form));
+    form.addEventListener('change',()=>refresh(form));
+    refresh(form);
+  });
+})();</script>"""
+
+
 def measurement_panel(job: dict, preview: dict) -> str:
     state = str(job.get("state", "idle"))
     busy = state in ("running", "processing", "cancelling")
@@ -920,73 +1064,70 @@ def measurement_panel(job: dict, preview: dict) -> str:
     )
     controls = ""
     if state == "idle":
-        mode_options = ''.join(
-            f'<option value="{value}" {"disabled" if value.startswith("mimo_") and not mimo_supported else ""}>{label}</option>'
-            for value, label in (
-                ("lrw", "L / R / Woofer · SISO · 3위치"), ("lr", "L / R · SISO · 3위치"),
-                ("mimo_stereo", "MIMO Stereo · L/R 2제어원 · Pi4/5"),
-                ("mimo_one_sub", "MIMO 2.1 · L/R+T5S 3제어원 · Pi4/5"),
-                ("mimo_dual_sub", "MIMO 2.2 · L/R+독립 우퍼2대 · Pi4/5"),
-            )
-        )
+        mode_options = measurement_mode_options("lrw", mimo_supported)
+        output_fields = measurement_output_fields(-42, -42, -9)
         controls = f"""
-        <form method="post" action="/measurement/new" class="measure-form">
-          <label>측정 구성<select name="mode">{mode_options}</select></label>
+        <form method="post" action="/measurement/new" class="measure-form measurement-output-form">
+          <label>측정 구성<select name="mode" class="measurement-mode-select">{mode_options}</select></label>
           <label>UMIK 방향<select name="orientation"><option value="90" selected>90° · 천장 방향 · 권장</option></select></label>
-          <label>측정 출력<select name="level_dbfs"><option value="-48">-48 dBFS · 야간 매우 작게</option><option value="-42" selected>-42 dBFS · 야간 기본</option><option value="-36">-36 dBFS · 작게</option><option value="-30">-30 dBFS · 일반</option><option value="-24">-24 dBFS · 크게</option></select></label>
+          {output_fields}
           <label>Sweep 길이<select name="sweep_seconds"><option value="4">4초 · 시험</option><option value="8" selected>8초 · 권장</option><option value="12">12초 · 정밀</option><option value="14">14초 · 저레벨 정밀</option></select></label>
           <button>새 측정 Session</button>
+          <p class="form-note mode-route">{html.escape(MEASUREMENT_MODE_HELP['lrw'])}</p>
+          <p class="form-note output-safety-note"><b>먼저 레벨 검사:</b> 숫자가 클수록 소리가 큽니다. 백색소음 검사는 Front L/R만 재생하며 Woofer SNR은 각 sweep에서 별도로 판정합니다. −12 dBFS 이상은 큰 출력이므로 입력 peak와 실제 청감 레벨을 확인하며 단계적으로 올리세요.</p>
         </form>"""
     else:
         disabled = " disabled" if busy else ""
         level_ok = bool(level.get("ok"))
         position_disabled = " disabled" if busy or not level_ok else ""
         mode = str(job.get("mode", "lrw"))
-        mode_options = ''.join(
-            f'<option value="{value}" {"selected" if mode == value else ""} {"disabled" if value.startswith("mimo_") and not mimo_supported else ""}>{label}</option>'
-            for value, label in (
-                ("lrw", "L / R / Woofer · SISO · 3위치"), ("lr", "L / R · SISO · 3위치"),
-                ("mimo_stereo", "MIMO Stereo · L/R 2제어원 · Pi4/5"),
-                ("mimo_one_sub", "MIMO 2.1 · L/R+T5S 3제어원 · Pi4/5"),
-                ("mimo_dual_sub", "MIMO 2.2 · L/R+독립 우퍼2대 · Pi4/5"),
-            )
-        )
+        mode_options = measurement_mode_options(mode, mimo_supported)
         level_dbfs = int(job.get("level_dbfs", -42))
+        noise_level_dbfs = int(job.get("noise_level_dbfs", job.get("level_dbfs", -42)))
+        woofer_measurement_attenuation_db = int(job.get("woofer_measurement_attenuation_db", -9))
         sweep_seconds = int(job.get("sweep_seconds", 8))
+        output_fields = measurement_output_fields(level_dbfs, noise_level_dbfs, woofer_measurement_attenuation_db)
         session_settings = f"""
-        <form method="post" action="/measurement/configure" class="measure-form session-settings" onsubmit="return confirm('변경 적용 시 영향을 받는 단계만 초기화합니다. 단순 단계 이동은 측정값을 지우지 않습니다. 적용할까요?')">
-          <label>측정 구성<select name="mode">{mode_options}</select></label>
+        <form method="post" action="/measurement/configure" class="measure-form measurement-output-form session-settings" onsubmit="return confirm('변경 적용 시 영향을 받는 단계만 초기화합니다. 단순 단계 이동은 측정값을 지우지 않습니다. 적용할까요?')">
+          <label>측정 구성<select name="mode" class="measurement-mode-select">{mode_options}</select></label>
           <label>UMIK 방향<select name="orientation"><option value="90" selected>90° · 천장 방향 · 권장</option></select></label>
-          <label>측정 출력<select name="level_dbfs">{''.join(f'<option value="{value}" {"selected" if value == level_dbfs else ""}>{value} dBFS</option>' for value in (-48, -42, -36, -30, -24))}</select></label>
+          {output_fields}
           <label>Sweep 길이<select name="sweep_seconds">{''.join(f'<option value="{value}" {"selected" if value == sweep_seconds else ""}>{value}초</option>' for value in (4, 8, 12, 14))}</select></label>
           <button>변경 적용</button>
-          <p class="form-note">구성·sweep 변경은 3위치 측정 이후만, 출력 레벨 변경은 레벨 검사 이후를 초기화합니다. 값이 같으면 모두 유지됩니다.</p>
+          <p class="form-note mode-route">{html.escape(MEASUREMENT_MODE_HELP.get(mode, ''))}</p>
+          <p class="form-note">측정 구성·출력 레벨·Woofer 상대레벨을 실제 적용하면 레벨 검사 이후 결과를 초기화합니다. 슬라이더를 움직이기만 해서는 바뀌지 않으며 <b>변경 적용</b>을 눌러야 합니다.</p>
         </form>
-        <details class="session-tools"><summary>Session 관리</summary><p class="muted">현재 session 폴더는 보존한 채 새 session을 만들어 처음부터 시작할 수 있습니다.</p><form method="post" action="/measurement/new" onsubmit="return confirm('현재 session 기록은 디스크에 보존하고 새 측정을 시작합니다. 현재 진행 화면을 새 session으로 바꿀까요?')"><input type="hidden" name="mode" value="{mode}"><input type="hidden" name="orientation" value="90"><input type="hidden" name="level_dbfs" value="{level_dbfs}"><input type="hidden" name="sweep_seconds" value="{sweep_seconds}"><button class="secondary">새 Session으로 처음부터</button></form></details>"""
+        <details class="session-tools"><summary>Session 관리</summary><p class="muted">현재 session 폴더는 보존한 채 새 session을 만들어 처음부터 시작할 수 있습니다.</p><form method="post" action="/measurement/new" onsubmit="return confirm('현재 session 기록은 디스크에 보존하고 새 측정을 시작합니다. 현재 진행 화면을 새 session으로 바꿀까요?')"><input type="hidden" name="mode" value="{mode}"><input type="hidden" name="orientation" value="90"><input type="hidden" name="level_dbfs" value="{level_dbfs}"><input type="hidden" name="noise_level_dbfs" value="{noise_level_dbfs}"><input type="hidden" name="woofer_measurement_attenuation_db" value="{woofer_measurement_attenuation_db}"><input type="hidden" name="sweep_seconds" value="{sweep_seconds}"><button class="secondary">현재 설정으로 새 Session</button></form></details>"""
         if positions >= total:
             position_control = f'<form method="post" action="/measurement/restart-positions" id="measurement-step-3" onsubmit="return confirm(\'3위치 측정을 처음부터 다시 시작합니다. 기존 측정·검증·생성 FIR 결과를 초기화할까요?\')"><button{position_disabled}>3위치 처음부터 재측정</button></form>'
         else:
-            position_control = f'<form method="post" action="/measurement/position" id="measurement-step-3"><button{position_disabled}>위치 {positions + 1}/{total} 개별 측정 시작</button></form>'
+            woofer_effective = level_dbfs + woofer_measurement_attenuation_db
+            position_confirmation = f"실제 측정음을 재생합니다. Front sweep {level_dbfs} dBFS · Woofer 실효 {woofer_effective} dBFS입니다. 마이크 위치와 주변을 확인하고 시작할까요?"
+            position_control = f'<form method="post" action="/measurement/position" id="measurement-step-3" onsubmit="return confirm(\'{position_confirmation}\')"><button{position_disabled}>위치 {positions + 1}/{total} 연속 캡처 → 일괄 계산 · Sweep {level_dbfs} dBFS</button></form>'
             if positions > 0:
                 position_control += f'<form method="post" action="/measurement/restart-positions" onsubmit="return confirm(\'완료한 위치 측정을 버리고 위치 1부터 다시 시작할까요?\')"><button{disabled} class="secondary">3위치 처음부터 다시</button></form>'
         controls = f"""
         {session_settings}
         <div class="measure-actions">
-          <form method="post" action="/measurement/level" id="measurement-step-2" onsubmit="return confirm('레벨 검사를 다시 실행하면 기기 볼륨이 달라졌을 수 있으므로 기존 3위치 측정과 FIR 결과를 초기화합니다. 계속할까요?')"><button{disabled}>5초 무음 + 5초 백색소음 레벨 검사</button></form>
+          <form method="post" action="/measurement/level" id="measurement-step-2" onsubmit="return confirm('레벨 검사를 다시 실행하면 기기 볼륨이 달라졌을 수 있으므로 기존 3위치 측정과 FIR 결과를 초기화합니다. 계속할까요?')"><button{disabled}>5초 무음 + 5초 백색소음 · {noise_level_dbfs} dBFS</button></form>
           {position_control}
           {f'<form method="post" action="/measurement/validation"><button{disabled}>중앙에서 L+Woofer / R+Woofer 합산 검증</button></form>' if job.get('mode') == 'lrw' and positions == total and not job.get('validation') else ''}
           {f'<form method="post" action="/measurement/cancel"><button class="danger">작업 취소</button></form>' if busy else ''}
-        </div>{'<p class="muted">위치 측정은 레벨 검사가 OK일 때 활성화됩니다. NOT OK면 기기 볼륨을 수동 조절한 뒤 같은 버튼으로 다시 검사하세요.</p>' if not level_ok else ''}"""
+        </div><p class="muted">백색소음 레벨 검사는 Front L/R만 재생합니다. Woofer는 실제 sweep에서 견고하게 검출한 −3 dB 통과대역으로 SNR·peak를 판정합니다. 검출 실패 시에만 15–300 Hz를 사용합니다.{' NOT OK면 기기 볼륨을 수동 조절한 뒤 같은 버튼으로 다시 검사하세요.' if not level_ok else ''}</p><p class="muted"><b>빠른 측정:</b> 위치 1은 Front L → Woofer → Front R 순서입니다. 한 위치의 sweep을 DSP 재시작이나 FFT 대기 없이 먼저 연속 녹음하고, 소리가 모두 멈춘 뒤 응답을 일괄 계산합니다. 완료된 채널은 재시도할 때 다시 재생하지 않습니다.</p>"""
         if positions == total and not busy:
             target_labels = (("harman", "Harman Kardon"), ("rtings", "RTINGS"), ("acoustix", "AcoustiX Default"), ("toole", "Not Dr. Toole"), ("bk", "Brüel & Kjær"), ("flat", "Flat"))
             target_options = ''.join(f'<option value="{value}" {"selected" if preferences.get("target", "harman") == value else ""}>{label}</option>' for value, label in target_labels)
             preset_options = ''.join(f'<option value="{value}" {"selected" if preferences.get("preset", "strong") == value else ""}>{label}</option>' for value, label in (("strong", "T5S 강한 억제 · 현재 선호"), ("primus360", "Primus 360 수준"), ("none", "추가 억제 없음")))
             phase_options = ''.join(f'<option value="{value}" {"selected" if preferences.get("phase_mode", "bass") == value else ""}>{label}</option>' for value, label in (("bass", "저역 음량 + excess phase"), ("magnitude", "음량만 · 최소위상")))
+            if mode == "lr":
+                woofer_trim_control = f'<label>Woofer 최종 trim<input type="hidden" name="woofer_trim_db" value="{woofer_measurement_attenuation_db}"><output>{woofer_measurement_attenuation_db} dB · 합산 측정값과 고정</output></label>'
+            else:
+                woofer_trim_control = '<label>Woofer 최종 trim<select name="woofer_trim_db">' + "".join(f'<option value="{value}" {"selected" if value == preferences.get("woofer_trim_db", -9) else ""}>{value} dB</option>' for value in range(0, -19, -1)) + '</select></label>'
             controls += """
             <form method="post" action="/measurement/build" id="measurement-step-4" class="measure-form build-options" onsubmit="return confirm('측정 원본은 유지하고 기존 생성 FIR/A-B 임시 결과만 초기화한 뒤 다시 계산합니다. 계속할까요?')">
               <label>기준 음색 Target<select name="target" id="target-choice">""" + target_options + """</select></label>
               <label>우퍼 과잉 억제<select name="preset">""" + preset_options + """</select></label>
-              <label>Woofer 최종 trim<select name="woofer_trim_db">""" + "".join(f'<option value="{value}" {"selected" if value == preferences.get("woofer_trim_db", -9) else ""}>{value} dB</option>' for value in range(0, -19, -1)) + """</select></label>
+              """ + woofer_trim_control + """
               <label>Phase 방식<select name="phase_mode">""" + phase_options + """</select></label>
               <button>설정으로 32768탭 FIR 생성</button>
               <details class="advanced"><summary>고급 보정 설정 · 기본값은 안전 권장값</summary><div class="advanced-grid">
@@ -1044,7 +1185,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
         <div class="result-box" id="measurement-step-5"><h3>적용 전 검토 · 생성 결과</h3>
           <p><b>{html.escape(str(result.get('target')))}</b> · {html.escape(str(result.get('preset')))} · {result.get('taps')} taps · Front peak tap {left.get('peak_tap', '?')} ({left.get('peak_delay_ms', '?')} ms)</p>
           <p><code>{html.escape(str(result.get('front_sha256', '')))}</code></p>
-          <div class="diagnostic-grid"><div><small>공간 평균</small><b>{html.escape(str(result.get('spatial_mode', 'equal')))}</b></div><div><small>룸보정 범위</small><b>{limits.get('low_hz', '?')}–{limits.get('high_hz', '?')} Hz</b></div><div><small>추가 취향</small><b>Bass {preference.get('bass_db_at_20_hz', 0):+} / Treble {preference.get('treble_db_at_20_khz', 0):+} dB</b></div><div><small>L/R 중앙값 차이</small><b>{diagnostics.get('lr_median_difference_db', '?')} dB</b></div><div><small>공간편차 중앙값</small><b>{diagnostics.get('spatial_std_median_db', '?')} dB</b></div><div><small>측정 SNR 최소/중앙</small><b>{diagnostics.get('measurement_snr_min_db', '?')} / {diagnostics.get('measurement_snr_median_db', '?')} dB</b></div><div><small>FIR 셀프검증</small><b>{'PASS' if self_validation.get('overall_pass') else '확인 필요'}</b></div><div><small>우퍼 측정 보호</small><b>{job.get('woofer_measurement_attenuation_db', -12)} dB</b></div></div>
+          <div class="diagnostic-grid"><div><small>공간 평균</small><b>{html.escape(str(result.get('spatial_mode', 'equal')))}</b></div><div><small>룸보정 범위</small><b>{limits.get('low_hz', '?')}–{limits.get('high_hz', '?')} Hz</b></div><div><small>추가 취향</small><b>Bass {preference.get('bass_db_at_20_hz', 0):+} / Treble {preference.get('treble_db_at_20_khz', 0):+} dB</b></div><div><small>L/R 중앙값 차이</small><b>{diagnostics.get('lr_median_difference_db', '?')} dB</b></div><div><small>공간편차 중앙값</small><b>{diagnostics.get('spatial_std_median_db', '?')} dB</b></div><div><small>측정 SNR 최소/중앙</small><b>{diagnostics.get('measurement_snr_min_db', '?')} / {diagnostics.get('measurement_snr_median_db', '?')} dB</b></div><div><small>FIR 셀프검증</small><b>{'PASS' if self_validation.get('overall_pass') else '확인 필요'}</b></div><div><small>Woofer 상대레벨</small><b>{job.get('woofer_measurement_attenuation_db', -9)} dB</b></div></div>
           <div class="measure-actions target-fit">{fit_html}</div>
           {f'<details class="decay-report"><summary>잔향/공진 T20→RT60 보기</summary><div class="decay-grid">{decay_html}</div><p class="muted">late reverb는 불안정한 역보정을 하지 않습니다. 신뢰 가능한 300 Hz 이하 장시간 공진만 최대 3 dB 추가 감쇄합니다.</p></details>' if decay_html else ''}
           <div class="diagnostic-note"><b>자동 진단</b><ul>{warning_html}</ul></div>
@@ -1067,18 +1208,20 @@ def measurement_panel(job: dict, preview: dict) -> str:
             mimo = result.get("mimo", {})
             prediction = mimo.get("prediction", {})
             metric_cards = "".join(
-                f'<div><small>{channel.title()} target MAE</small><b>{values.get("before_target_mae_db", "?")} → {values.get("after_target_mae_db", "?")} dB</b><small>좌석 편차 {values.get("before_spatial_std_db", "?")} → {values.get("after_spatial_std_db", "?")} dB</small></div>'
+                f'<div><small>{channel.title()} target MAE</small><b>{values.get("before_target_mae_db", "?")} → {values.get("after_target_mae_db", "?")} dB</b><small>좌석 편차 {values.get("before_spatial_std_db", "?")} → {values.get("after_spatial_std_db", "?")} dB<br>저역 late/early {values.get("before_modal_tail_db", "?")} → {values.get("after_modal_tail_db", "?")} dB · 낮을수록 양호</small></div>'
                 for channel, values in prediction.items()
             )
             topology = html.escape(str(mimo.get("topology", "mimo")))
             headroom = mimo.get("headroom", {})
             diversity = mimo.get("actuator_diversity", {})
+            normalization = mimo.get("target_level_normalization", {})
+            target_offsets = normalization.get("target_offset_db", {})
             result_html = f"""
             <div class="result-box" id="measurement-step-5"><h3>MIMO 2×4 적용 전 검토</h3>
               <p><b>{topology}</b> · {result.get('taps')} taps × 8 convolution paths · 공동 제어 {mimo.get('frequency_range_hz', ['?', '?'])[0]}–{mimo.get('frequency_range_hz', ['?', '?'])[1]} Hz</p>
-              <div class="diagnostic-grid">{metric_cards}<div><small>최악 상관입력 row sum</small><b>{headroom.get('maximum_correlated_input_row_sum', '?')}</b><small>global {headroom.get('global_scale_db', '?')} dB</small></div><div><small>제어원 최대 coherence</small><b>{diversity.get('maximum_coherence', '?')}</b><small>1에 가까우면 독립성 부족</small></div><div><small>Self validation</small><b>{'PASS' if self_validation.get('overall_pass') else 'FAIL · 적용 차단'}</b></div></div>
+              <div class="diagnostic-grid">{metric_cards}<div><small>최악 상관입력 row sum</small><b>{headroom.get('maximum_correlated_input_row_sum', '?')}</b><small>global {headroom.get('global_scale_db', '?')} dB</small></div><div><small>제어원 최대 coherence</small><b>{diversity.get('maximum_coherence', '?')}</b><small>1에 가까우면 독립성 부족</small></div><div><small>저역 기준 레벨 고정</small><b>L {target_offsets.get('left', '?')} / R {target_offsets.get('right', '?')} dB</b><small>{normalization.get('reference_band_hz', ['?', '?'])[0]}–{normalization.get('reference_band_hz', ['?', '?'])[1]} Hz 기존 SISO 기준</small></div><div><small>MIMO 해 강도</small><b>{html.escape(str(mimo.get('strength', '?')))} · blend {mimo.get('solution_blend', '?')}</b><small>기존 안정 해와 공동제어 해의 혼합</small></div><div><small>Self validation</small><b>{'PASS' if self_validation.get('overall_pass') else 'FAIL · 적용 차단'}</b></div></div>
               <div class="diagnostic-note"><b>자동 진단</b><ul>{warning_html}</ul></div>{audit_html}
-              <p class="muted">예측은 측정한 세 위치의 선형 모델에만 유효합니다. 실제 적용 전 Preview, 이후 별도 위치 재측정과 XRUN/CPU 확인이 필요합니다.</p>
+              <p class="muted">예측은 측정한 세 위치의 선형 모델에만 유효합니다. 저역 late/early 지표가 0.5 dB 넘게 악화되면 적용을 차단하며, 개선되지 않은 값을 잔향 개선으로 표시하지 않습니다. 실제 적용 전 Preview, 이후 별도 위치 재측정과 XRUN/CPU 확인이 필요합니다.</p>
               <div class="measure-actions"><a class="button" download href="/api/measurement/download/all">MIMO WAV 4개 + 보고서 ZIP</a><a class="button secondary" download href="/api/measurement/download/report-md">한계 포함 보고서 MD</a><a class="button secondary" download href="/api/measurement/download/report-json">전체 결과 JSON</a></div>
               <div class="result-box"><b>A/B 청취 비교</b><p class="muted">현재 상태: <span class="pill">{preview_label}</span> · MIMO는 실제 4채널 Speaker 출력 전용입니다.</p><div class="measure-actions"><form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="speaker"><button>이번 MIMO · Speaker 테스트</button></form><form method="post" action="/measurement/restore"><button>기존 튜닝 듣기</button></form></div></div>
               <div class="measure-actions" id="measurement-step-6"><form method="post" action="/measurement/apply" onsubmit="return confirm('검증된 MIMO bank를 Speaker에 설치합니다. 기존 bank와 설정은 자동 백업됩니다. 정식 적용할까요?')"><input type="hidden" name="profile" value="speaker"><button{' disabled' if not self_validation.get('overall_pass') else ''}>Speaker MIMO 정식 적용</button></form></div>
@@ -1087,20 +1230,30 @@ def measurement_panel(job: dict, preview: dict) -> str:
     error = f'<div class="failure">{html.escape(str(job.get("error")))}</div>' if job.get("error") else ""
     level_html = ""
     if level:
-        level_html = f'''<div class="level-result {'ok' if level.get('ok') else 'not-ok'}"><div class="level-verdict"><b>{'OK' if level.get('ok') else 'NOT OK'}</b><span>{html.escape(str(level.get('verdict', '')))}</span></div><div class="metric-grid"><div><small>무음 배경 RMS</small><b>{level.get('background_rms_dbfs', '?')} dBFS</b></div><div><small>백색소음 RMS</small><b>{level.get('white_noise_rms_dbfs', '?')} dBFS</b></div><div><small>추정 신호 RMS</small><b>{level.get('estimated_signal_rms_dbfs', '?')} dBFS</b></div><div><small>신호/배경 SNR</small><b>{level.get('snr_db', '?')} dB</b></div><div><small>입력 peak</small><b>{level.get('peak_dbfs', '?')} dBFS</b></div></div></div>'''
+        level_html = f'''<div class="level-result {'ok' if level.get('ok') else 'not-ok'}"><div class="level-verdict"><b>{'OK' if level.get('ok') else 'NOT OK'}</b><span>{html.escape(str(level.get('verdict', '')))}</span></div><div class="metric-grid"><div><small>요청 백색소음 출력</small><b>{level.get('requested_white_noise_level_dbfs', job.get('noise_level_dbfs', '?'))} dBFS</b></div><div><small>무음 배경 RMS</small><b>{level.get('background_rms_dbfs', '?')} dBFS</b></div><div><small>백색소음 입력 RMS</small><b>{level.get('white_noise_rms_dbfs', '?')} dBFS</b></div><div><small>추정 신호 RMS</small><b>{level.get('estimated_signal_rms_dbfs', '?')} dBFS</b></div><div><small>신호/배경 SNR</small><b>{level.get('snr_db', '?')} dB</b></div><div><small>입력 peak</small><b>{level.get('peak_dbfs', '?')} dBFS</b></div></div></div>'''
+    mode = str(job.get("mode", "lrw"))
+    mode_label = dict(MEASUREMENT_MODE_OPTIONS).get(mode, mode)
+    configured_output = ""
+    if state != "idle":
+        configured_sweep = int(job.get("level_dbfs", -42))
+        configured_noise = int(job.get("noise_level_dbfs", job.get("level_dbfs", -42)))
+        configured_woofer = int(job.get("woofer_measurement_attenuation_db", -9))
+        woofer_semantics = "합산 응답 조건이며 최종 재생 trim과 동일" if mode == "lr" else ("사용하지 않음" if mode == "mimo_stereo" else "측정 감쇄는 deconvolution에서 복원되며 SNR에만 영향")
+        configured_output = f'''<div class="measurement-output-summary"><div><small>현재 측정 경로</small><b>{html.escape(mode_label)}</b><span>{html.escape(MEASUREMENT_MODE_HELP.get(mode, ''))}</span></div><div><small>현재 출력 설정</small><b>White {configured_noise} · Sweep {configured_sweep} dBFS</b><span>Woofer {configured_woofer} dB · 실효 {configured_sweep + configured_woofer} dBFS<br>{html.escape(woofer_semantics)}</span></div></div>'''
     return f"""
     <section class="measurement card-wide" data-job-state="{html.escape(state)}" data-job-position="{positions}" data-job-updated="{job.get('updated_unix', 0)}">
       <div class="section-head"><div><h2>UMIK-1 측정 · 32768탭 자동 보정</h2><p class="muted">실제 측정은 청취 위치 3곳, UMIK 천장 방향 90°. 재생 중 CamillaDSP direct bypass 및 U7 입력 OFF.</p></div><span class="pill">{'UMIK 연결' if job.get('umik_connected') else 'UMIK 없음'}</span></div>
       <div class="workflow" aria-label="Calibration workflow">{workflow}</div>
       {error}<div class="job-status"><div><b id="job-stage">{html.escape(str(job.get('stage', '대기')))}</b><span id="job-eta">{eta_text}</span></div><progress id="job-progress" max="100" value="{progress:.2f}"></progress><small id="job-percent">{progress:.0f}%</small></div>
       <p class="muted">Session: {html.escape(str(job.get('session_id', '없음')))} · 위치 {positions}/{total} · Calibration {html.escape(str(calibration.get('orientation', '90')))}° / {html.escape(str(calibration.get('serial', '7200660')))}</p>
+      {configured_output}
       {'' if mimo_supported else '<p class="diagnostic-note"><b>MIMO 비활성</b> · Pi 2는 측정/UI 코드를 공유하지만 실시간 8경로 적용을 차단합니다. SISO L/R/W 보정은 그대로 사용할 수 있습니다.</p>'}
       <details class="cal-card" id="measurement-step-1" {'open' if current_step == 1 else ''}><summary class="cal-head"><span class="state-icon">μ</span><div><b>1 · UMIK calibration</b><p class="muted">0°/90° 파일 상태 · 클릭해서 펼치기 · 단계 이동만으로는 값이 지워지지 않습니다.</p></div></summary><div class="cal-slots">
         <form method="post" action="/measurement/calibration" enctype="multipart/form-data" class="cal-slot" onsubmit="return confirm('90° calibration 교체를 적용하면 이 파일로 측정한 레벨·3위치 응답·생성 FIR 결과가 초기화됩니다. 계속할까요?')"><input type="hidden" name="orientation" value="90"><div><b>90° · 천장 방향</b><span class="pill">룸 측정용</span></div><p>{cal90_summary}</p><label>miniDSP 90° TXT<input required type="file" name="file" accept="text/plain,.txt"></label><button>90° 파일 교체 적용</button></form>
         <form method="post" action="/measurement/calibration" enctype="multipart/form-data" class="cal-slot"><input type="hidden" name="orientation" value="0"><div><b>0° · 마이크 정면</b><span class="pill neutral">근접 진단용</span></div><p>{cal0_summary}</p><label>miniDSP 0° TXT<input required type="file" name="file" accept="text/plain,.txt"></label><button>0° 파일 교체 적용</button></form>
       </div></details>
-      {level_html}{controls}{result_html}
-      <details><summary>알고리즘과 안전 제한</summary><p>세 위치 대표 응답에는 저역 1/12-oct, 중역 1/6-oct, 고역 1/3-oct 가변 smoothing을 사용합니다. 위치 편차가 큰 null은 주파수별 regularization으로 boost를 축소하고, 반 옥타브 중앙값으로 추정한 스피커 자연 roll-off 밖은 boost하지 않습니다. 옥타브별 noise-compensated Schroeder EDT/T20으로 잔향을 진단하고 신뢰 가능한 300 Hz 이하 장시간 공진만 cut-only로 최대 3 dB 더 감쇄합니다. late reverb는 역보정하지 않습니다. 고역은 magnitude 위주, 저역은 선택적으로 중앙 위치 excess phase와 시간 정렬을 보정하며 causality delay를 제한합니다. 최종 FIR 최대 전달 이득은 0 dB 이하입니다.</p></details>
+      {level_html}{controls}{result_html}{MEASUREMENT_LEVEL_SCRIPT}
+      <details><summary>알고리즘과 안전 제한</summary><p>세 위치 대표 응답에는 저역 1/12-oct, 중역 1/6-oct, 고역 1/3-oct 가변 smoothing을 사용합니다. Sweep 정합 deconvolution에 더해 pre/post-roll noise PSD로 대역별 SNR을 계산하고, 6–15 dB 신뢰도 ramp로 오염된 위치·대역의 보정과 boost를 줄입니다. 순간 생활소음은 100 ms sweep-envelope 이상치로 표시하며 원본 impulse/잔향을 잘라내지 않습니다. 위치 편차가 큰 null은 주파수별 regularization으로 boost를 축소하고, 반 옥타브 중앙값으로 추정한 스피커 자연 roll-off 밖은 boost하지 않습니다. 옥타브별 noise-compensated Schroeder EDT/T20으로 잔향을 진단하고 신뢰 가능한 300 Hz 이하 장시간 공진만 cut-only로 최대 3 dB 더 감쇄합니다. late reverb는 역보정하지 않습니다. 고역은 magnitude 위주이며 L/R은 공통 phase를 사용합니다. 저역 phase 모드는 FIR 자체 지연과 음향 도달 지연을 합산해 Front/Woofer를 정렬하고, L/R 잔차가 안전 한계를 넘으면 phase 보정을 자동 축소·해제합니다. MIMO는 제거했던 제어원별 bulk delay를 복원한 복소 응답으로 계산하고, 기존 SISO 저역 레벨을 기준으로 타깃을 고정하며 spectral continuity·기존 해 혼합·저역 late/early 비악화 검사를 적용합니다. 모든 최종 FIR의 최대 전달 이득은 0 dB 이하입니다.</p></details>
     </section>"""
 
 
@@ -1318,14 +1471,14 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
     button:hover,.button:hover{{background:var(--accent-hover);transform:translateY(-1px)}}button.secondary,.button.secondary{{background:transparent;color:var(--text);border:1px solid var(--border);box-shadow:none}}button.secondary:hover,.button.secondary:hover{{background:var(--accent-soft);color:var(--accent)}}button:focus-visible,.button:focus-visible,input:focus-visible{{outline:3px solid color-mix(in srgb,var(--accent) 38%,transparent);outline-offset:2px}}
     .mode{{background:color-mix(in srgb,var(--surface-strong) 72%,transparent);border:1px solid var(--border);border-radius:12px;padding:12px}}.mode label{{display:block;margin:9px 0;line-height:1.45}}.bypass{{display:flex;align-items:center;justify-content:space-between;gap:12px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent);border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:14px}}.bypass.enabled{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-strong))}}.bypass small{{display:block;color:var(--muted);margin-top:3px}}.missing{{color:var(--warning)}}.bad,.failure{{color:var(--danger)}}
     .notice{{background:var(--success-bg);color:var(--success);padding:13px 15px;border-radius:11px;margin:12px 0}}.failure{{background:var(--danger-bg);padding:13px 15px;border-radius:11px;margin:12px 0}}.graphbox>.muted{{word-break:keep-all}}.graph-scroll{{overflow-x:auto;overscroll-behavior-inline:contain}}.response{{display:block;width:100%;height:auto;margin-top:10px;border-radius:12px}}
-    .card-wide{{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:clamp(16px,2.5vw,24px);margin:16px 0;box-shadow:var(--shadow)}}.next-action{{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:18px 20px;margin:16px 0;border:1px solid color-mix(in srgb,var(--accent) 48%,var(--border));border-radius:18px;background:linear-gradient(135deg,var(--accent-soft),var(--surface));box-shadow:var(--shadow)}}.next-action small{{color:var(--accent);font-weight:900;text-transform:uppercase;letter-spacing:.08em}}.next-action h2{{margin:4px 0}}.next-action p{{margin:0;color:var(--muted)}}.section-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}}.section-head h2{{margin-bottom:6px}}.output-volume output{{min-width:6ch;color:var(--accent);font-size:clamp(1.7rem,5vw,2.5rem);font-weight:900;text-align:right;font-variant-numeric:tabular-nums}}.output-volume form{{display:grid;gap:12px;margin-top:14px}}.output-volume input[type=range]{{width:100%;height:28px;accent-color:var(--accent);cursor:pointer}}.volume-actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}.volume-presets{{display:flex;gap:6px;flex:1;flex-wrap:wrap}}.volume-note{{margin-bottom:4px;font-weight:700}}.job-status{{padding:14px;border:1px solid var(--border);border-radius:12px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent);margin:14px 0}}progress{{width:100%;height:13px;accent-color:var(--accent);margin:10px 0 4px}}.measure-form{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:10px;align-items:end;padding:14px;border:1px solid var(--border);border-radius:12px;margin:14px 0}}.measure-form label{{display:grid;gap:6px;color:var(--muted);font-size:.86rem}}.build-options>.advanced{{grid-column:1/-1;margin:2px 0 0;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.advanced-grid{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-top:12px}}.measure-actions{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}}.measure-actions form{{margin:0}}button.danger{{background:var(--danger)}}.target-preview,.result-box{{border-top:1px solid var(--border);margin-top:16px;padding-top:16px}}#target-graph,#measurement-result-graph{{display:block;width:100%;height:auto;background:var(--graph-bg);border-radius:12px;margin-top:10px}}details{{margin-top:14px;border-top:1px solid var(--border);padding-top:12px}}summary{{cursor:pointer;font-weight:700}}
+.card-wide{{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:clamp(16px,2.5vw,24px);margin:16px 0;box-shadow:var(--shadow)}}.next-action{{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:18px 20px;margin:16px 0;border:1px solid color-mix(in srgb,var(--accent) 48%,var(--border));border-radius:18px;background:linear-gradient(135deg,var(--accent-soft),var(--surface));box-shadow:var(--shadow)}}.next-action small{{color:var(--accent);font-weight:900;text-transform:uppercase;letter-spacing:.08em}}.next-action h2{{margin:4px 0}}.next-action p{{margin:0;color:var(--muted)}}.section-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}}.section-head h2{{margin-bottom:6px}}.output-volume output{{min-width:6ch;color:var(--accent);font-size:clamp(1.7rem,5vw,2.5rem);font-weight:900;text-align:right;font-variant-numeric:tabular-nums}}.output-volume form{{display:grid;gap:12px;margin-top:14px}}.output-volume input[type=range]{{width:100%;height:28px;accent-color:var(--accent);cursor:pointer}}.volume-actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}.volume-presets{{display:flex;gap:6px;flex:1;flex-wrap:wrap}}.volume-note{{margin-bottom:4px;font-weight:700}}.job-status{{padding:14px;border:1px solid var(--border);border-radius:12px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent);margin:14px 0}}progress{{width:100%;height:13px;accent-color:var(--accent);margin:10px 0 4px}}.measure-form{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end;padding:14px;border:1px solid var(--border);border-radius:12px;margin:14px 0}}.measure-form label{{display:grid;gap:6px;color:var(--muted);font-size:.86rem}}.level-slider{{padding:10px;border:1px solid var(--border);border-radius:11px;background:var(--surface-strong)}}.level-slider output{{color:var(--accent);font-weight:900;font-variant-numeric:tabular-nums}}.level-slider input[type=range]{{width:100%;height:24px;accent-color:var(--accent);cursor:pointer}}.level-slider small{{line-height:1.35}}.level-slider.not-used{{opacity:.48}}.measurement-output-summary{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0}}.measurement-output-summary>div{{display:grid;gap:4px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.measurement-output-summary small{{color:var(--muted)}}.measurement-output-summary span{{color:var(--muted);font-size:.8rem;line-height:1.4}}.output-safety-note,.output-level-warning{{padding:9px;border-radius:9px;background:var(--success-bg);color:var(--success)}}.output-level-warning{{grid-column:1/-1;margin:0}}.output-safety-note,.output-level-warning.loud{{background:var(--warning-bg);color:var(--warning)}}.build-options>.advanced{{grid-column:1/-1;margin:2px 0 0;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.advanced-grid{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-top:12px}}.measure-actions{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}}.measure-actions form{{margin:0}}button.danger{{background:var(--danger)}}.target-preview,.result-box{{border-top:1px solid var(--border);margin-top:16px;padding-top:16px}}#target-graph,#measurement-result-graph{{display:block;width:100%;height:auto;background:var(--graph-bg);border-radius:12px;margin-top:10px}}details{{margin-top:14px;border-top:1px solid var(--border);padding-top:12px}}summary{{cursor:pointer;font-weight:700}}
     .workflow{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px;margin:18px 0}}.flow-step{{display:flex;align-items:center;gap:7px;padding:10px 8px;border:1px solid var(--border);border-radius:12px;color:var(--muted);background:color-mix(in srgb,var(--surface-strong) 64%,transparent);font-size:.78rem;text-decoration:none}}a.flow-step{{cursor:pointer}}a.flow-step:hover{{border-color:var(--accent);transform:translateY(-1px)}}.flow-step>span{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;background:var(--border);color:var(--text);font-weight:800}}.flow-step.done{{color:var(--success)}}.flow-step.done>span{{background:var(--success-bg);color:var(--success)}}.flow-step.current{{border-color:var(--accent);color:var(--text);background:var(--accent-soft);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 14%,transparent)}}.flow-step.current>span{{background:var(--accent);color:white}}.flow-step.future{{opacity:.56}}[id^="measurement-step-"]{{scroll-margin-top:18px}}.form-note{{grid-column:1/-1;margin:0;color:var(--muted);font-size:.8rem;line-height:1.45}}.cal-card{{display:grid;gap:14px;padding:14px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent)}}.cal-head{{display:flex;gap:10px;align-items:center}}.cal-head p,.cal-card p{{margin:5px 0 0}}.cal-slots{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.cal-slot{{display:grid;grid-template-columns:1fr auto;gap:8px 12px;padding:12px;margin:0;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.cal-slot>div{{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:8px}}.cal-slot>p{{grid-column:1/-1;color:var(--muted);font-size:.82rem}}.cal-slot label{{display:grid;gap:5px;color:var(--muted);font-size:.82rem}}.cal-slot input[type=file]{{margin:0}}.pill.neutral{{background:var(--border);color:var(--muted)}}
     .level-result{{margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:14px}}.level-result.ok{{border-color:var(--success);background:color-mix(in srgb,var(--success-bg) 55%,transparent)}}.level-result.not-ok{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 8%,var(--surface-strong))}}.level-verdict{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}.level-verdict>b{{font-size:1.05rem}}.metric-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-top:12px}}.metric-grid>div{{display:grid;gap:3px;padding:9px;border-radius:10px;background:var(--surface-strong)}}.metric-grid small{{color:var(--muted)}}button:disabled{{cursor:not-allowed;opacity:.45;transform:none;box-shadow:none}}
     .diagnostic-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:12px 0}}.diagnostic-grid>div{{display:grid;gap:4px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.diagnostic-grid small{{color:var(--muted)}}.diagnostic-note{{padding:12px;border-left:4px solid var(--accent);border-radius:8px;background:var(--accent-soft)}}.diagnostic-note ul{{margin:6px 0 0;padding-left:20px}}.target-fit{{margin:10px 0}}.decay-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}}.decay-grid>div{{display:grid;gap:5px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.decay-grid small{{color:var(--muted);font-weight:800}}.decay-grid span{{display:flex;justify-content:space-between;gap:8px;font-size:.82rem}}
     .stage-workflow{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding-top:16px;border-top:1px solid var(--border)}}.stage-step{{display:grid;grid-template-columns:30px 1fr;column-gap:8px;align-items:center;padding:10px;border:1px solid var(--border);border-radius:12px;color:var(--muted)}}.stage-step span{{grid-row:1/3;display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:var(--border);font-weight:900;color:var(--text)}}.stage-step b{{font-size:.88rem;color:var(--text)}}.stage-step small{{font-size:.72rem}}.stage-step.done span{{background:var(--success-bg);color:var(--success)}}.stage-step.current{{border-color:var(--accent);background:var(--accent-soft)}}.stage-step.current span{{background:var(--accent);color:white}}.stage-summary{{display:flex;align-items:center;gap:12px;padding:14px;margin:12px 0;border-radius:13px;background:color-mix(in srgb,var(--accent-soft) 56%,var(--surface-strong));border:1px solid color-mix(in srgb,var(--accent) 45%,var(--border))}}.stage-summary>div{{flex:1}}.stage-summary p{{margin:4px 0 0;color:var(--muted);font-size:.84rem;line-height:1.45}}.staged-compare h3{{margin:18px 0 4px;font-size:1rem}}.stage-actions{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:14px;margin-top:12px;border:1px solid var(--border);border-radius:13px;background:color-mix(in srgb,var(--surface-strong) 70%,transparent)}}.stage-actions p{{margin:4px 0 0}}.stage-actions.final{{border-color:color-mix(in srgb,var(--success) 52%,var(--border));background:color-mix(in srgb,var(--success-bg) 35%,var(--surface-strong))}}
     .backup-actions{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}}.backup-actions>div,.backup-actions>form{{display:grid;align-content:start;gap:8px;padding:14px;margin:0;border:1px solid var(--border);border-radius:13px;background:var(--surface-strong)}}.backup-actions p{{margin:0;color:var(--muted);font-size:.84rem}}.backup-actions .button,.backup-actions button{{justify-self:start}}.restore-review{{margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}}
     table{{border-collapse:collapse;width:100%}}td{{padding:9px 6px;border-bottom:1px solid var(--border)}}td:first-child{{color:var(--muted);width:38%}}
-    @media(max-width:760px){{body{{padding-bottom:74px}}.grid{{grid-template-columns:1fr}}.topbar,.section-head,.stage-actions{{align-items:flex-start;flex-direction:column}}.app-nav{{position:fixed;z-index:20;left:10px;right:10px;bottom:max(8px,env(safe-area-inset-bottom));margin:0;padding:6px;background:color-mix(in srgb,var(--surface) 92%,transparent);box-shadow:0 8px 28px #0005;backdrop-filter:blur(14px)}}.app-nav a{{flex:1;text-align:center;padding:10px 5px;font-size:.78rem}}.theme-switch{{align-self:stretch;justify-content:center}}.theme-switch button{{flex:1}}td{{display:block;width:100%!important;padding:6px 2px}}td:first-child{{border-bottom:0;padding-top:11px}}.status,.card,.graphbox,.card-wide{{border-radius:15px}}.bypass{{align-items:stretch;flex-direction:column}}.bypass button{{width:100%}}.graph-scroll .response{{width:700px;max-width:none}}.measure-form,.advanced-grid,.backup-actions,.decay-grid{{grid-template-columns:1fr}}.measure-form button,.cal-slot button,.backup-actions .button,.backup-actions button{{width:100%}}.workflow{{position:sticky;z-index:12;top:6px;grid-template-columns:repeat(3,1fr);padding:6px;margin-inline:-6px;border-radius:14px;background:color-mix(in srgb,var(--surface) 94%,transparent);box-shadow:var(--shadow);backdrop-filter:blur(12px)}}.stage-workflow,.cal-slots{{grid-template-columns:1fr}}.cal-slot{{grid-template-columns:1fr}}.metric-grid,.diagnostic-grid{{grid-template-columns:1fr 1fr}}}}
+    @media(max-width:760px){{body{{padding-bottom:74px}}.grid{{grid-template-columns:1fr}}.topbar,.section-head,.stage-actions{{align-items:flex-start;flex-direction:column}}.app-nav{{position:fixed;z-index:20;left:10px;right:10px;bottom:max(8px,env(safe-area-inset-bottom));margin:0;padding:6px;background:color-mix(in srgb,var(--surface) 92%,transparent);box-shadow:0 8px 28px #0005;backdrop-filter:blur(14px)}}.app-nav a{{flex:1;text-align:center;padding:10px 5px;font-size:.78rem}}.theme-switch{{align-self:stretch;justify-content:center}}.theme-switch button{{flex:1}}td{{display:block;width:100%!important;padding:6px 2px}}td:first-child{{border-bottom:0;padding-top:11px}}.status,.card,.graphbox,.card-wide{{border-radius:15px}}.bypass{{align-items:stretch;flex-direction:column}}.bypass button{{width:100%}}.graph-scroll .response{{width:700px;max-width:none}}.measure-form,.advanced-grid,.backup-actions,.decay-grid,.measurement-output-summary{{grid-template-columns:1fr}}.measure-form button,.cal-slot button,.backup-actions .button,.backup-actions button{{width:100%}}.workflow{{position:sticky;z-index:12;top:6px;grid-template-columns:repeat(3,1fr);padding:6px;margin-inline:-6px;border-radius:14px;background:color-mix(in srgb,var(--surface) 94%,transparent);box-shadow:var(--shadow);backdrop-filter:blur(12px)}}.stage-workflow,.cal-slots{{grid-template-columns:1fr}}.cal-slot{{grid-template-columns:1fr}}.metric-grid,.diagnostic-grid{{grid-template-columns:1fr 1fr}}}}
     .topbar,.app-nav,.status,.card,.graphbox,.card-wide,.measurement,.backup-panel{{min-width:0;max-width:100%}}.flow-step{{min-width:0;overflow:hidden}}.flow-step b{{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.cal-card>summary{{margin:0;padding:0;border:0;list-style:none}}.cal-card>summary::-webkit-details-marker{{display:none}}
     @media(max-width:760px){{.next-action{{align-items:flex-start;flex-direction:column}}.app-nav a{{min-width:0}}.theme-switch{{width:100%}}}}
     @media(max-width:600px){{.workflow{{grid-template-columns:1fr 1fr;width:100%}}.topbar>*,.section-head>*,.backup-actions>*,.measure-form>*,.cal-slot>*{{min-width:0;max-width:100%}}.theme-switch{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%}}.theme-switch button{{min-width:0;padding-inline:4px}}input[type=file]{{width:100%}}button,.button{{text-align:center}}.measure-actions form,.measure-actions a{{width:100%}}.volume-actions>button[type=submit]{{width:100%}}.volume-presets{{order:3;flex-basis:100%}}.volume-presets button{{flex:1}}}}
@@ -1717,12 +1870,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/measurement/new":
                 fields = self.read_urlencoded()
-                measurement("new", fields["mode"], fields["orientation"], fields["level_dbfs"], fields["sweep_seconds"])
+                measurement(
+                    "new", fields["mode"], fields["orientation"], fields["level_dbfs"], fields["sweep_seconds"],
+                    fields.get("noise_level_dbfs", fields["level_dbfs"]),
+                    fields.get("woofer_measurement_attenuation_db", "-9"),
+                )
                 self.redirect("측정 Session 생성 완료 · 먼저 레벨 검사를 진행하세요.", "/measure")
                 return
             if parsed.path == "/measurement/configure":
                 fields = self.read_urlencoded()
-                result = measurement("configure", fields["mode"], fields["orientation"], fields["level_dbfs"], fields["sweep_seconds"])
+                result = measurement(
+                    "configure", fields["mode"], fields["orientation"], fields["level_dbfs"], fields["sweep_seconds"],
+                    fields.get("noise_level_dbfs", fields["level_dbfs"]),
+                    fields.get("woofer_measurement_attenuation_db", "-9"),
+                )
                 reason = (result.get("invalidation") or {}).get("reason", "변경 없음")
                 self.redirect(f"측정 설정 적용: {reason}. 영향을 받지 않는 값은 유지했습니다.", "/measure")
                 return
@@ -1732,7 +1893,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/measurement/position":
                 measurement("start-position")
-                self.redirect("개별 측정을 시작했습니다. 측정 중 DSP bypass / U7 입력 OFF입니다.", "/measure")
+                self.redirect("연속 캡처를 시작했습니다. 측정 중 DSP bypass / U7 입력 OFF이며, 모든 소리가 끝난 뒤 응답을 일괄 계산합니다.", "/measure")
                 return
             if parsed.path == "/measurement/restart-positions":
                 measurement("restart-positions")

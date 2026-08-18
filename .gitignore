@@ -3,6 +3,15 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/diagnostics/
+/diagnostics/*
+!/diagnostics/refine_tonal_fir.py
+!/diagnostics/run_full_option_matrix.py
+!/diagnostics/build_option_validation_sequence.py
+!/diagnostics/analyze_option_validation.py
+!/diagnostics/capture_option_validation.py
+!/diagnostics/merge_option_matrix.py
+!/diagnostics/validate_live_apply_restore.py
 !/AUDIODSP_REPRODUCTION_DOCS/
 !/AUDIODSP_REPRODUCTION_DOCS/**
 !/releases/

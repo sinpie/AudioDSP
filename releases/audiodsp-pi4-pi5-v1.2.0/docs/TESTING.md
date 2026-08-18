@@ -84,7 +84,14 @@ sudo /usr/local/bin/audiodsp-measurement.py self-test-targets
 
 6 target × 3 preset × Front/Woofer의 실제 32768탭 FFT와 bass-phase 대표
 조합을 검증한다. Offline engine test는 합성 0.60초 감쇠의 Schroeder T20,
-우퍼 측정/reference -12 dB 비율, 개별 SNR, 잔향 cut-only 동작도 확인한다.
+조절 가능한 Woofer 측정/reference 비율, 적응형 -3 dB 통과대역 SNR, 정상 0.4초·cold-start 앞부분 절단·1.1초 USB 지연 sweep timing 복구, 잔향 cut-only,
+음향+FIR 총지연 정렬과 중단 worker 복구도 확인한다. 또한 정상 2000-sample direct peak는 허용하고, 518895-sample ESS artifact와 FFT 끝에 감긴 음수 지연 peak는 거부하는 0~250 ms bulk-delay gate를 검사한다.
+
+실측 session의 UI SISO 값 전체를 확인할 때는 `diagnostics/run_full_option_matrix.py`로 기준값에서 한 축씩 바꾼 67개 32768탭 Front/Woofer FIR 쌍을 생성한다. `diagnostics/build_option_validation_sequence.py`는 같은 FIR을 정확히 offline convolution한 4채널 저음량 시퀀스와 감쇄한 무필터 전/후 기준을 만들고, `diagnostics/capture_option_validation.py`는 production DSP-bypass/U7-input-off 경로에서 상태를 보존하며 UMIK로 녹음한다. `diagnostics/analyze_option_validation.py`는 모든 L/R 합산 sweep의 SNR·peak·target-fit·생활소음 transient와 Woofer/Bass/Treble 단조성을 분석한다. 이 검사는 조합 폭발을 피하기 위한 one-factor-at-a-time 기능 검증이며 모든 값의 Cartesian product를 의미하지 않는다.
+
+엔진 변경이 특정 옵션 축에만 영향을 줄 때 `run_full_option_matrix.py --variant-id ...`로 해당 값을 선택 재생성할 수 있다. `merge_option_matrix.py`는 새 엔진으로 생성한 baseline FIR SHA가 기존과 동일한지 먼저 증명하고, 선택 결과만 덮어쓴 뒤 67개 모든 FIR SHA를 다시 검증해 재사용/재생성 provenance를 manifest에 남긴다.
+
+Pi 2의 장시간 검증 녹음은 `capture_option_validation.py --record-via-tmpfs`로 `/dev/shm`에 먼저 기록해 SD 쓰기 stall을 피한다. 사용 전 예상 녹음 크기와 32 MiB 여유를 검사하며, 완료 뒤 지정 경로로 복사하고 임시파일을 회수한다. Production engine은 ALSA overrun을 fatal error로 처리한다.
 
 ## 4. MIMO 무음 시험
 
@@ -100,7 +107,7 @@ python3 /tmp/test_mimo_runtime.py \
   --camilladsp /usr/local/bin/camilladsp
 ```
 
-첫 명령은 Stereo/2.1/2.2 각각 finite, 인과성, 최악 상관입력 row sum ≤1, 타깃 MAE·좌석편차 비퇴행, 네 WAV×32768탭을 검사한다. 두 번째는 격리된 임시 config에서 8 Conv와 2→8→4 mixer를 실제 CamillaDSP `--check`로 검사하고 Pi2 enable 거부를 확인한다. 둘 다 오디오 장치를 열거나 소리를 내지 않는다.
+첫 명령은 Stereo/2.1/2.2 각각 상대 bulk-delay 복원, 기존 SISO 저역 기준 레벨 고정, finite, 인과성, 최악 상관입력 row sum ≤1, 타깃 MAE·좌석편차·modeled late/early 비퇴행, 네 WAV×32768탭을 검사한다. 두 번째는 격리된 임시 config에서 8 Conv와 2→8→4 mixer를 실제 CamillaDSP `--check`로 검사하고 Pi2 enable 거부와 MIMO 백업 임시파일 회수를 확인한다. 둘 다 오디오 장치를 열거나 소리를 내지 않는다.
 
 ## 5. 실제 Pi 무중단 배포 확인
 

@@ -41,7 +41,9 @@ Pi 2는 onboard Wi-Fi가 없으므로 USB Wi-Fi는 별도 driver/NetworkManager 
 
 - 현재 운용 Pi 2에서 4채널 음악 출력 정상
 - CamillaDSP 대략 CPU 36%; Web 약 0.7~1.1% 관측
-- FFTW3f 32768-tap build: magnitude 약 53초, bass phase 약 60초 수준 관측
+- FFTW3f 32768-tap 합성 회귀: magnitude 51.326초, bass phase 76.067초, L/R 합산-copy 33.656초 관측
+- 저장된 실측 WAV 재응답 계산: Front L 약 64초, Woofer 약 75초 관측; UI 보수 ETA는 채널당 70초
+- 6 target × 3 preset 전수검사 약 5분, 세 MIMO 토폴로지 수치검사 약 4분 관측
 - 4096 state/profile matrix와 measurement engine 시험 통과 이력
 
 수치는 현재 FIR/topology에서의 관측값이며 릴리스 보증 상한은 아니다.
@@ -52,7 +54,7 @@ Pi 2는 onboard Wi-Fi가 없으므로 USB Wi-Fi는 별도 driver/NetworkManager 
 - MIMO 측정·설계·manifest 코드는 백업 호환성과 Pi 4/5 이전을 위해 설치되지만 Web과 manager가 실행을 명시적으로 거부한다.
 - Pi 2의 정식 운용 경로는 Front/Rear를 공유하는 2 convolution 또는 독립 Front/Rear의 4 convolution SISO다.
 - Pi 4/5에서 만든 MIMO bank를 포함한 schema 2 백업은 보관할 수 있지만, Pi 2에서 복원된 MIMO 설정은 `configured but inactive`로 표시된다.
-- 룸 측정과 일반 32768-tap SISO 설계는 가능하다. 합성 시험에서 약 49~56초가 걸렸으므로 작업 중 음악 재생과 Web 부하를 최소화하고, 결과 적용 전 반드시 별도 검증 위치를 재측정한다.
+- 룸 측정과 일반 32768-tap SISO 설계는 가능하다. magnitude 한 쌍은 약 51초, bass phase 한 쌍은 약 76초가 관측됐으므로 작업 중 음악 재생과 Web 부하를 최소화하고, 결과 적용 전 반드시 별도 검증 위치를 재측정한다.
 
 ## 기존 운용 장치
 

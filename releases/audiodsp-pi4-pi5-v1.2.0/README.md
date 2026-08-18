@@ -45,8 +45,11 @@ One T5S with two RCA inputs remains one physical control source; dual-sub mode
 requires two independently placed and wired subs. Pi 2 explicitly rejects MIMO
 activation while retaining all SISO functions.
 
-Woofer measurement and combined-validation sweeps are attenuated by 12 dB with
-the same reference scaling. Every sweep has an SNR gate. Octave-band
+White-noise and sweep outputs have independent sliders with a night-safe
+-42 dBFS default. Separate Woofer measurement attenuation defaults to -9 dB
+and uses the same reference scaling; combined mode treats it as the final
+Woofer trim. Every sweep has a frequency-dependent SNR/confidence gate, and
+Woofer quality uses its detected sustained -3 dB acoustic passband. Octave-band
 noise-compensated Schroeder EDT/T20 reports decay; reliable long-decay bass
 resonances can receive up to 3 dB additional cut, but late reverberation is
 never inverted. The result page verifies the actual truncated FIR FFT,
@@ -56,6 +59,12 @@ Every SISO or MIMO result also persists `Room_Tuning_Report.json` and
 MIMO-limited, placement/acoustic-treatment, not-measured and not-certified
 items instead of presenting deep nulls, late reverberation, distortion or
 neighbor noise as solved.
+
+Bass-phase alignment includes both measured acoustic arrival and generated FIR
+delay while keeping L/R phase common. MIMO restores actuator-relative arrival
+phase, anchors 70–130 Hz level to the existing SISO result, regularizes adjacent
+frequency bins and blocks apply if modeled low-bass late/early energy worsens by
+more than 0.5 dB. A non-improving value is never labeled decay improvement.
 
 Completed measurement steps are navigation controls only. Data is kept until a
 changed setting is explicitly applied or a level test, position restart, or

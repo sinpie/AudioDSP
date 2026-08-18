@@ -14,9 +14,9 @@
 
 | 토폴로지 | Left target MAE dB | Right target MAE dB | Left 좌석편차 dB | Right 좌석편차 dB | 최종 최대 row sum |
 |---|---:|---:|---:|---:|---:|
-| MIMO Stereo | 6.431 → 3.622 | 5.032 → 3.457 | 0.731 → 0.672 | 0.691 → 0.621 | 0.999 |
-| MIMO 2.1 | 6.431 → 3.138 | 5.032 → 2.973 | 0.731 → 0.670 | 0.691 → 0.619 | 0.999 |
-| MIMO 2.2 | 6.431 → 2.829 | 5.032 → 2.608 | 0.731 → 0.661 | 0.691 → 0.610 | 0.999 |
+| MIMO Stereo | 5.520 → 3.626 | 4.195 → 2.936 | 0.731 → 0.721 | 0.691 → 0.675 | 0.999 |
+| MIMO 2.1 | 5.520 → 3.676 | 4.195 → 2.905 | 0.731 → 0.720 | 0.691 → 0.675 | 0.999 |
+| MIMO 2.2 | 5.520 → 3.832 | 4.195 → 3.018 | 0.731 → 0.715 | 0.691 → 0.673 | 0.999 |
 
 공통 검증:
 
@@ -26,8 +26,11 @@
 - 공통 인과 지연 검사: PASS
 - 최악 상관입력 physical-output headroom: PASS
 - 예측 target MAE와 좌석 편차 비퇴행: PASS
+- 제어원별 bulk arrival phase 복원: PASS
+- 70~130 Hz 기존 SISO 저역 레벨 anchor: PASS
+- modeled late/early 0.5 dB 비악화: PASS
 
-Modal late/early energy는 최적화의 보장 항목이 아니다. 특정 토폴로지/채널에서 0.5 dB보다 나빠지면 결과에 경고하고 decay 개선으로 판정하지 않는다.
+Modal late/early energy는 모든 토폴로지에서 0.26~0.41 dB 나빠졌으므로 decay 개선으로 판정하지 않는다. 다만 0.5 dB보다 악화되면 전체 결과를 실패시키는 core guard 안에는 들어왔다. 이 수치는 합성 선형 모델의 안전 비퇴행 판정이지 실제 방의 잔향 개선 인증이 아니다.
 
 ### 실제 CamillaDSP parser·관리자 — PASS
 
@@ -46,6 +49,7 @@ Modal late/early energy는 최적화의 보장 항목이 아니다. 특정 토�
 - 네 MIMO WAV와 `Speaker_MIMO.json` ZIP 포함
 - byte/SHA-256 inventory 검증
 - 복원 staging에서 MIMO bank 재검증
+- 적용/취소 후 restore staging state와 추출 디렉터리 회수
 - 정식 system 상태에는 적용하지 않음
 
 ### 기존 기능 회귀 — PASS
@@ -69,4 +73,4 @@ Modal late/early energy는 최적화의 보장 항목이 아니다. 특정 토�
 
 ## 종료 시 라이브 상태 확인
 
-2026-08-18 종료 점검은 읽기 전용으로만 수행했다. 연결된 production Pi 2의 CamillaDSP PID는 2036이었고 `camilladsp`, `audiodsp-web`, `audiodsp-profile-monitor`는 모두 active였다. 최근 30분 journal의 XRUN/underrun/overrun 일치는 0회였으며 Speaker FIR SHA-256은 기존 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99` 그대로였다. 소리 재생, 서비스 재시작, 프로필·설정 변경은 하지 않았다.
+2026-08-18 최종 무음 회귀 직후 읽기 전용 점검에서 production Pi 2의 CamillaDSP PID는 12593이었고 `camilladsp`, `audiodsp-web`, `audiodsp-profile-monitor`는 모두 active였다. 최근 30분 journal의 XRUN/underrun/overrun/panic/error 일치는 0회였으며 Speaker FIR SHA-256은 기존 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99` 그대로였다. 온도는 60.5°C, 사용/가용 메모리는 209/710 MB였다. 소리 재생, CamillaDSP 재시작, 프로필·설정 변경은 하지 않았다.

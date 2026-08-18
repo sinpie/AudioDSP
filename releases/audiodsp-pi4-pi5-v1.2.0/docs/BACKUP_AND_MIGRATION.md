@@ -2,7 +2,7 @@
 
 ## Backup schema 2
 
-브라우저 전체 백업은 `AudioDSP_backup_YYYYMMDD-HHMMSS.zip`이다.
+브라우저 전체 백업은 `AudioDSP_backup_YYYYMMDD-HHMMSS-NNNNNNNNN.zip`이다. 마지막 9자리는 연속 작업에서도 이름이 충돌하지 않게 하는 나노초 부분이다.
 
 필수:
 
@@ -56,7 +56,7 @@ Manifest 예:
 7. UI에 요약만 보여주고 현재 장치는 바꾸지 않는다.
 8. 사용자가 적용하면 현재 상태를 `/var/lib/audiodsp/system-backups`에 자동 ZIP으로 먼저 저장한다.
 9. calibration/preferences/FIR/settings를 적용한다. 중간 실패 시 이전 calibration/preferences와 관리자 snapshot 복구 경로를 사용한다.
-10. staging state를 제거한다.
+10. staging state와 관리 루트 안의 추출 디렉터리를 함께 제거한다. 새 검토본은 이전 검토본을 원자적으로 대체하고, 검증 실패한 새 ZIP은 기존 유효 검토본을 유지한 채 자체 임시파일만 회수한다.
 
 측정/계산/cancel이 진행 중이면 복원을 거부한다.
 

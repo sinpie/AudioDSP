@@ -25,6 +25,7 @@
 - MIMO는 Pi 4/5 전용 기능이다. 입력 L/R 각각을 Front L, Front R, Rear L, Rear R로 보내는 8 convolution과 2→8→4 matrix를 사용한다.
 - 한 T5S의 stereo 입력은 같은 물리 음원을 구동하므로 `MIMO 2.1`에서는 Rear L/R에 각각 0.5를 배분한다. 독립 배치·배선된 서브우퍼 두 대만 `MIMO 2.2`의 네 독립 actuator로 취급한다.
 - MIMO가 활성화되면 effective chunksize 하한은 1024다. 512를 저장해도 실행 config는 1024로 올려 XRUN 위험을 줄인다.
+- UI의 보수적 오프라인 ETA 기준은 응답 채널당 20초, magnitude FIR 20초, bass-phase FIR 40초, MIMO bank 240초다. 이는 실제 Pi4/5 실측 보증값이 아니라 진행 표시용 기준이다.
 - 합성·parser 검증은 통과했지만 실제 방 성능과 Pi 4/5 지속 부하는 아직 실기 인증 전이다. 10분 이상의 CPU/XRUN/온도/USB 검사와 사용하지 않은 위치의 전후 재측정이 필수다.
 - Pi 5는 설계상 호환 대상이며, 실제 U7 장시간 시험 전까지 하드웨어 검증 완료로 표시하지 않는다.
 

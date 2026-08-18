@@ -17,6 +17,7 @@ Release: 1.2.0 · 2026-08-18
 - [x] Versioned full ZIP backup and staged restore with SHA-256 inventory.
 - [x] Reject future schema without mutation; normalize supported older schema.
 - [x] Automatic pre-restore rollback ZIP and browser access to the latest copy.
+- [x] Unique rollback names and validation/replacement/discard cleanup of extracted staging directories.
 - [x] Status-screen U7 output slider, +/- steps, presets and no-JS form fallback.
 - [x] Actual hardware volume and reboot-persistent saved volume shown separately.
 
@@ -35,6 +36,7 @@ Release: 1.2.0 · 2026-08-18
 
 - [x] Independent UMIK 0° and 90° calibration upload/validation.
 - [x] Five-second silence plus five-second low-level white-noise precheck.
+- [x] Independent white-noise/sweep sliders, -42 dBFS defaults, high-output warning and pre-sweep confirmation.
 - [x] Background/signal/SNR/peak/clipping result and actionable NOT OK guidance.
 - [x] L/R or L/R/woofer, three listening positions, progress and ETA.
 - [x] Measurement bypasses DSP and disables U7 Mic and Line capture.
@@ -44,6 +46,7 @@ Release: 1.2.0 · 2026-08-18
 - [x] Soft boost, hard cut and transfer gain limits.
 - [x] Magnitude-only or bass excess-phase correction with causal delay limit.
 - [x] L/R/woofer alignment and summed-bass cancellation diagnostics.
+- [x] Front/Woofer acoustic-plus-FIR total-delay alignment and common-L/R phase magnitude-preservation guard.
 - [x] Six target curves, bass/treble preference, correction band controls.
 - [x] Primus-like and Strong woofer-control modes.
 - [x] Spatial uncertainty band, before/after/target graph, diagnostics and manifest.
@@ -51,6 +54,8 @@ Release: 1.2.0 · 2026-08-18
 - [x] Pi4/5 MIMO Stereo, 2.1 and 2.2 independent-actuator measurement modes.
 - [x] Robust weighted pressure matching with spatial weights, Tikhonov/prior,
   usable-band/support penalties and per-frequency physical-output headroom.
+- [x] MIMO actuator bulk-arrival restoration, 70–130 Hz SISO level anchor,
+  adjacent-bin continuity, safe/base solution blending and modal-tail non-regression gate.
 - [x] Four stereo float32 WAVs encode all eight 2-input x 4-output FIR paths.
 - [x] Common causal delay, 20–80/120/150 Hz selection and SISO transition band.
 - [x] One stereo-fed T5S is one `sub_pair`; dual-sub requires two physical subs.
@@ -74,6 +79,7 @@ Release: 1.2.0 · 2026-08-18
 - [x] Pi 4/5 ARM64 release uses the same application with default chunksize 1024.
 - [x] Silent synthetic MIMO tests pass all three topologies; real CamillaDSP parser
   accepts the 2→8, eight-Conv, 8→4 pipeline; Pi2 activation block verified.
+- [x] Six targets × three woofer presets and representative bass-phase actual-FIR matrix PASS.
 - [x] Ethernet uses DHCP only; no collision-prone emergency static address.
 
 ## Algorithm references

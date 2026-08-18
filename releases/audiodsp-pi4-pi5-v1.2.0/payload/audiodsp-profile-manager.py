@@ -668,13 +668,13 @@ pipeline:
 
 def service_active() -> bool:
     result = subprocess.run(
-        ["systemctl", "is-active", "--quiet", "camilladsp.service"], check=False
+        ["systemctl", "is-active", "--quiet", "camilladsp.service"], check=False, timeout=3
     )
     return result.returncode == 0
 
 
 def restart_camilladsp() -> None:
-    result = subprocess.run(["systemctl", "restart", "camilladsp.service"], check=False)
+    result = subprocess.run(["systemctl", "restart", "camilladsp.service"], check=False, timeout=20)
     if result.returncode != 0:
         raise ProfileError("systemctl restart camilladsp failed.")
     stable_since: float | None = None
@@ -685,6 +685,7 @@ def restart_camilladsp() -> None:
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=3,
         ).returncode == 0
         now = time.monotonic()
         if active and running:
@@ -710,6 +711,7 @@ def check_config(config: bytes) -> None:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            timeout=20,
         )
         if checked.returncode != 0:
             raise ProfileError(f"CamillaDSP rejected the generated config: {checked.stdout.strip()}")
@@ -977,10 +979,12 @@ def upload(profile: str, band: str, source: Path, original_name: str) -> dict[st
     return applied
 
 
-def preview_pair(profile: str, front_source: Path, rear_source: Path | None) -> dict[str, Any]:
+def preview_pair(profile: str, front_source: Path, rear_source: Path | None, woofer_trim_db: int = 0) -> dict[str, Any]:
     """Temporarily audition generated FIRs without modifying settings or profile WAVs."""
     if profile not in PROFILE_FILES:
         raise ProfileError("Invalid preview profile.")
+    if woofer_trim_db not in ALLOWED_WOOFER_TRIMS:
+        raise ProfileError("Invalid preview woofer trim.")
     front_meta = validate_wav(front_source)
     rear_meta = validate_wav(rear_source) if rear_source is not None else None
     settings = load_settings()
@@ -995,8 +999,9 @@ def preview_pair(profile: str, front_source: Path, rear_source: Path | None) -> 
         "effective_rear_mode": mode,
         "bypass": False,
         "convolution_channels": 4 if rear_source is not None else 2,
-        # Generated Rear FIRs already contain the chosen trim.
-        "woofer_trim_db": 0,
+        # Generated Rear FIRs already contain trim; copy-front previews apply it
+        # in the runtime mixer without altering saved profile settings.
+        "woofer_trim_db": 0 if rear_source is not None else woofer_trim_db,
         "mimo_paths": None,
         "mimo_manifest_path": None,
     }
@@ -1012,6 +1017,7 @@ def preview_pair(profile: str, front_source: Path, rear_source: Path | None) -> 
         "started_unix": time.time(),
         "front": front_meta,
         "rear": rear_meta,
+        "woofer_trim_db": resolved["woofer_trim_db"],
         "note": "temporary audition; managed profile WAVs and settings are unchanged",
     }
     try:
@@ -1379,6 +1385,7 @@ def main() -> int:
     preview_parser.add_argument("profile", choices=PROFILE_FILES)
     preview_parser.add_argument("front_source", type=Path)
     preview_parser.add_argument("rear_source", type=Path, nargs="?")
+    preview_parser.add_argument("--woofer-trim", type=int, choices=ALLOWED_WOOFER_TRIMS, default=0)
     install_mimo_parser = subparsers.add_parser("install-mimo")
     install_mimo_parser.add_argument("profile", choices=PROFILE_FILES)
     install_mimo_parser.add_argument("manifest", type=Path)
@@ -1420,7 +1427,7 @@ def main() -> int:
         elif args.command == "install-pair":
             result = install_pair(args.profile, args.front_source, args.rear_source, args.woofer_trim)
         elif args.command == "preview-pair":
-            result = preview_pair(args.profile, args.front_source, args.rear_source)
+            result = preview_pair(args.profile, args.front_source, args.rear_source, args.woofer_trim)
         elif args.command == "install-mimo":
             result = install_mimo(args.profile, args.manifest)
         elif args.command == "preview-mimo":

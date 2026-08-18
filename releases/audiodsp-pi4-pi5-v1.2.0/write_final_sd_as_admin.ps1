@@ -260,6 +260,10 @@ function Assert-FinalBundle {
         $webText -notmatch 'output-volume-control' -or
         $webText -notmatch 'non_destructive_step_navigation' -or
         $webText -notmatch 'room_tuning_audit' -or
+        $webText -notmatch 'output-level-warning' -or
+        $webText -notmatch '−42부터 시작' -or
+        $webText -notmatch '실제 측정음을 재생합니다' -or
+        $webText -notmatch '저역 late/early' -or
         $webText -notmatch 'live_u7_status_poll' -or
         $webText -notmatch "fetch\('/api/status'" -or
         $webText -notmatch 'active-profile' -or
@@ -279,6 +283,16 @@ function Assert-FinalBundle {
         'WOOFER_MEASUREMENT_ATTENUATION_DB',
         'room_decay_metrics',
         'finalize_graph_with_fir',
+        'DEFAULT_NOISE_LEVEL_DBFS = -42',
+        'DEFAULT_SWEEP_LEVEL_DBFS = -42',
+        'recover_interrupted_worker',
+        'offline_estimates_seconds',
+        'fir_energy_delay',
+        'MAX_PLAUSIBLE_BULK_DELAY_SAMPLES',
+        'time_alignment_safe',
+        'automatic_room_correction_db',
+        'preference_correction_db',
+        '--fatal-errors',
         'audiodsp_announce',
         'invalidate_from_step',
         'install-pair',
@@ -290,7 +304,7 @@ function Assert-FinalBundle {
     }
 
     $mimoText = Get-Content -LiteralPath $mimo -Raw
-    foreach ($requiredText in @('weighted pressure matching', 'MIMO_manifest.json', 'correlated_input_headroom', 'mimo_one_sub')) {
+    foreach ($requiredText in @('weighted pressure matching', 'MIMO_manifest.json', 'correlated_input_headroom', 'mimo_one_sub', 'bulk_delay_samples', 'spectral_continuity', 'solution_blend', 'target_level_normalization', 'predicted_modal_tail_non_regression')) {
         if ($mimoText -notmatch [regex]::Escape($requiredText)) {
             throw "MIMO engine validation is missing: $requiredText"
         }

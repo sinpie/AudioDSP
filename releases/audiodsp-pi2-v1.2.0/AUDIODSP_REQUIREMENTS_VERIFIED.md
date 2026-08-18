@@ -17,6 +17,7 @@ Release: 1.2.0 · 2026-08-18
 - [x] Versioned full ZIP backup and staged restore with SHA-256 inventory.
 - [x] Reject future schema without mutation; normalize supported older schema.
 - [x] Automatic pre-restore rollback ZIP and browser access to the latest copy.
+- [x] Unique rollback names and validation/replacement/discard cleanup of extracted staging directories.
 - [x] Status-screen U7 output slider, +/- steps, presets and no-JS form fallback.
 - [x] Actual hardware volume and reboot-persistent saved volume shown separately.
 
@@ -35,6 +36,7 @@ Release: 1.2.0 · 2026-08-18
 
 - [x] Independent UMIK 0° and 90° calibration upload/validation.
 - [x] Five-second silence plus five-second low-level white-noise precheck.
+- [x] Independent white-noise/sweep sliders, -42 dBFS defaults, high-output warning and pre-sweep confirmation.
 - [x] Background/signal/SNR/peak/clipping result and actionable NOT OK guidance.
 - [x] L/R or L/R/woofer, three listening positions, progress and ETA.
 - [x] Measurement bypasses DSP and disables U7 Mic and Line capture.
@@ -44,6 +46,7 @@ Release: 1.2.0 · 2026-08-18
 - [x] Soft boost, hard cut and transfer gain limits.
 - [x] Magnitude-only or bass excess-phase correction with causal delay limit.
 - [x] L/R/woofer alignment and summed-bass cancellation diagnostics.
+- [x] Front/Woofer acoustic-plus-FIR total-delay alignment and common-L/R phase magnitude-preservation guard.
 - [x] Six target curves, bass/treble preference, correction band controls.
 - [x] Primus-like and Strong woofer-control modes.
 - [x] Spatial uncertainty band, before/after/target graph, diagnostics and manifest.
@@ -52,6 +55,8 @@ Release: 1.2.0 · 2026-08-18
   placement/treatment, not-measured and not-certified factors.
 - [x] MIMO bank/backup formats share the Pi4/5 code, while Pi2 UI, engine and
   runtime reject MIMO measurement/activation and retain SISO processing.
+- [x] Common MIMO math restores actuator bulk arrival, anchors SISO bass level,
+  regularizes adjacent bins and rejects modeled modal-tail regression before Pi4/5 deployment.
 
 ## Automated and hardware verification
 
@@ -67,6 +72,7 @@ Release: 1.2.0 · 2026-08-18
 - [x] Pi 2 bundle preflight validates image, binary, FIR, scripts and hashes.
 - [x] Pi 4/5 ARM64 release uses the same application with default chunksize 1024.
 - [x] Silent MIMO math/runtime fixtures pass, and Pi2 activation blocking is verified.
+- [x] Six targets × three woofer presets and representative bass-phase actual-FIR matrix PASS.
 - [x] Ethernet uses DHCP only; no collision-prone emergency static address.
 
 ## Algorithm references

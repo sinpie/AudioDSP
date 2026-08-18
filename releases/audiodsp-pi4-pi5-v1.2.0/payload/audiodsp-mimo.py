@@ -94,7 +94,11 @@ def interpolate_log(frequencies: list[float], values: list[float], frequency: fl
 
 def response_value(response: dict[str, Any], frequency: float, reference_db: float) -> complex:
     magnitude_db = interpolate_log(response["frequencies"], response["db"], frequency) - reference_db
+    # Measurement stores excess phase after removing each path's bulk arrival
+    # delay. A multichannel inverse must restore that delay or it loses the
+    # relative phase between independently placed speakers/subwoofers.
     phase = interpolate_log(response["frequencies"], response["phase_rad"], frequency)
+    phase -= 2.0 * math.pi * frequency * float(response.get("bulk_delay_samples", 0.0)) / RATE
     return 10.0 ** (magnitude_db / 20.0) * cmath.exp(1j * phase)
 
 
@@ -280,8 +284,8 @@ def causalize(paths: list[list[float]], target_peak: int = 1024) -> tuple[list[l
     }
 
 
-def modal_tail_ratio(engine, spectrum: list[complex]) -> float:
-    impulse = engine.FFTBackend().irfft(spectrum, FFT_LENGTH)
+def modal_tail_ratio(fft, spectrum: list[complex]) -> float:
+    impulse = fft.irfft(spectrum, FFT_LENGTH)
     peak = max(range(len(impulse)), key=lambda index: abs(impulse[index]))
     aligned = impulse[peak:] + impulse[:peak]
     early_end = round(0.080 * RATE)
@@ -366,9 +370,10 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     usable_lows = source_usable_lows(engine, positions, sources)
     diversity = pairwise_diversity(positions, sources, reference_db)
 
+    base_phase_mode = "magnitude" if phase_mode == "bass" else phase_mode
     common_arguments = dict(
         target_name=target_name, preset=preset, woofer=False, woofer_trim_db=0,
-        phase_mode=phase_mode, phase_cutoff=phase_cutoff, spatial_mode=spatial_mode,
+        phase_mode=base_phase_mode, phase_cutoff=phase_cutoff, spatial_mode=spatial_mode,
         bass_tilt_db=bass_tilt, treble_tilt_db=treble_tilt,
         correction_low_hz=int(options.get("correction_low_hz", 20)),
         correction_high_hz=int(options.get("correction_high_hz", 20_000)),
@@ -377,6 +382,7 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     fft = engine.FFTBackend()
     base_impulses = []
     base_graphs = []
+    base_averages = []
     for source in ("front_left", "front_right"):
         average = engine.load_average_response(Path(state["session_dir"]), source, spatial_mode)
         impulse, graph = engine.design_channel(
@@ -387,7 +393,45 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         )
         base_impulses.append(impulse)
         base_graphs.append(graph)
+        base_averages.append(average)
+    if phase_mode == "bass":
+        left, right, phase_details = engine.apply_common_lr_low_frequency_phase(
+            base_impulses[0], base_impulses[1], base_averages[0]["frequencies"],
+            base_averages[0]["average_db"], base_averages[1]["average_db"],
+            base_averages[0]["center_phase_rad"], base_averages[1]["center_phase_rad"],
+            phase_cutoff, fft,
+        )
+        base_impulses = [left, right]
+        base_graphs[0]["phase"] = {**phase_details, "channel": "left"}
+        base_graphs[1]["phase"] = {**phase_details, "channel": "right"}
+        base_graphs[0] = engine.finalize_graph_with_fir(base_graphs[0], left, fft)
+        base_graphs[1] = engine.finalize_graph_with_fir(base_graphs[1], right, fft)
     base_spectra = [fft.rfft(impulse, FFT_LENGTH) for impulse in base_impulses]
+
+    # The room transfer functions are normalized to their measured 70-130 Hz
+    # level. Anchor the selected target to the existing SISO output in the same
+    # band. MIMO then improves target shape and seat consistency without an
+    # arbitrary broadband bass level jump.
+    reference_frequencies = [
+        float(value) for value in positions[0]["front_left"]["frequencies"]
+        if 70.0 <= float(value) <= 130.0
+    ]
+    target_reference_db = statistics.median(
+        target_level(engine, target_name, preset, frequency, bass_tilt, treble_tilt)
+        for frequency in reference_frequencies
+    )
+    target_offsets_db = []
+    baseline_reference_db = []
+    for channel, source in enumerate(("front_left", "front_right")):
+        levels = []
+        for frequency in reference_frequencies:
+            bin_index = min(FFT_LENGTH // 2, round(frequency * FFT_LENGTH / RATE))
+            for position in positions:
+                pressure = response_value(position[source], frequency, reference_db) * base_spectra[channel][bin_index]
+                levels.append(db(abs(pressure)))
+        baseline = statistics.median(levels)
+        baseline_reference_db.append(baseline)
+        target_offsets_db.append(baseline - target_reference_db)
 
     actuator_count = len(sources)
     path_spectra = [[0j] * (FFT_LENGTH // 2 + 1) for _ in range(actuator_count * 2)]
@@ -402,6 +446,9 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             control_weights.append(support_linear)
     strength_regularization = {"safe": 0.080, "balanced": 0.030, "maximum": 0.012}[strength]
     prior = {"safe": 0.080, "balanced": 0.035, "maximum": 0.015}[strength]
+    spectral_continuity = {"safe": 0.120, "balanced": 0.060, "maximum": 0.025}[strength]
+    solution_blend = {"safe": 0.25, "balanced": 0.40, "maximum": 0.65}[strength]
+    previous_solutions: list[list[complex] | None] = [None, None]
 
     for bin_index in range(FFT_LENGTH // 2 + 1):
         frequency = bin_index * RATE / FFT_LENGTH
@@ -414,10 +461,10 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             for channel in range(2):
                 for actuator in range(actuator_count):
                     path_spectra[actuator * 2 + channel][bin_index] = base_vectors[channel][actuator]
+                previous_solutions[channel] = list(base_vectors[channel])
             continue
         blend = raised_cosine(frequency, 15.0, 25.0, True) * raised_cosine(frequency, float(high_hz), float(high_hz + 30), False)
         h = [[response_value(position[source], max(20.0, frequency), reference_db) for source in sources] for position in positions]
-        target_amp = 10.0 ** (target_level(engine, target_name, preset, max(20.0, frequency), bass_tilt, treble_tilt) / 20.0)
         for channel in range(2):
             gram = [[0j for _ in range(actuator_count)] for _ in range(actuator_count)]
             rhs = [0j] * actuator_count
@@ -429,7 +476,10 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                 for index, row in enumerate(h)
             )
             desired_phase = cmath.phase(baseline_pressure) if abs(baseline_pressure) > 1.0e-12 else 0.0
-            desired = target_amp * cmath.exp(1j * desired_phase)
+            normalized_target_amp = 10.0 ** ((target_level(
+                engine, target_name, preset, max(20.0, frequency), bass_tilt, treble_tilt,
+            ) + target_offsets_db[channel]) / 20.0)
+            desired = normalized_target_amp * cmath.exp(1j * desired_phase)
             for position_index, row in enumerate(h):
                 weight = position_weights[position_index]
                 for a in range(actuator_count):
@@ -437,6 +487,8 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                     for b in range(actuator_count):
                         gram[a][b] += weight * row[a].conjugate() * row[b]
             energy_scale = max(sum(abs(value) ** 2 for value in row) for row in h)
+            continuity = spectral_continuity * max(energy_scale, 1.0e-6)
+            previous = previous_solutions[channel] or base_vectors[channel]
             for actuator in range(actuator_count):
                 usable_penalty = 1.0
                 natural_low = usable_lows[sources[actuator]]
@@ -444,9 +496,14 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                     usable_penalty += 30.0 * (1.0 - max(0.0, frequency / max(natural_low, 1.0))) ** 2
                 primary_weight = 1.0 if actuator == channel else control_weights[actuator]
                 regularization = strength_regularization * max(energy_scale, 1.0e-6) * primary_weight ** 2 * usable_penalty
-                gram[actuator][actuator] += regularization + prior
-                rhs[actuator] += prior * base_vectors[channel][actuator]
+                gram[actuator][actuator] += regularization + prior + continuity
+                rhs[actuator] += prior * base_vectors[channel][actuator] + continuity * previous[actuator]
             solution, condition = solve_complex(gram, rhs)
+            solution = [
+                base + solution_blend * (candidate - base)
+                for base, candidate in zip(base_vectors[channel], solution)
+            ]
+            previous_solutions[channel] = list(solution)
             condition_values.append(condition)
             for actuator in range(actuator_count):
                 path_spectra[actuator * 2 + channel][bin_index] = base_vectors[channel][actuator] * (1.0 - blend) + solution[actuator] * blend
@@ -507,7 +564,7 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         before_tail_spectra = [[0j] * (FFT_LENGTH // 2 + 1) for _ in positions]
         after_tail_spectra = [[0j] * (FFT_LENGTH // 2 + 1) for _ in positions]
         for frequency in graph_frequencies:
-            target_db_value = target_level(engine, target_name, preset, frequency, bass_tilt, treble_tilt)
+            target_db_value = target_level(engine, target_name, preset, frequency, bass_tilt, treble_tilt) + target_offsets_db[channel]
             target_curve_values.append(target_db_value)
             bin_index = min(FFT_LENGTH // 2, round(frequency * FFT_LENGTH / RATE))
             before_values, after_values = [], []
@@ -548,8 +605,8 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                         h_physical.append(response_value(position[source], frequency, reference_db))
                 before_tail_spectra[position_index][bin_index] = h_physical[channel] * base_spectra[channel][bin_index]
                 after_tail_spectra[position_index][bin_index] = sum(h_physical[output] * actual_spectra[output * 2 + channel][bin_index] for output in range(4))
-        tail_before_values[channel_name] = [modal_tail_ratio(engine, spectrum) for spectrum in before_tail_spectra]
-        tail_after_values[channel_name] = [modal_tail_ratio(engine, spectrum) for spectrum in after_tail_spectra]
+        tail_before_values[channel_name] = [modal_tail_ratio(fft, spectrum) for spectrum in before_tail_spectra]
+        tail_after_values[channel_name] = [modal_tail_ratio(fft, spectrum) for spectrum in after_tail_spectra]
         prediction[channel_name] = {
             "before_target_mae_db": round(statistics.mean(before_errors), 3),
             "after_target_mae_db": round(statistics.mean(after_errors), 3),
@@ -574,6 +631,10 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     finite_pass = all(math.isfinite(value) for path in output_paths for value in path)
     headroom_pass = maximum_row_sum_after <= 1.0001
     causality_pass = causality["target_peak_sample"] <= 2048 and causality["pre_peak_energy_percent"] <= 80.0
+    modal_tail_pass = all(
+        prediction[channel]["after_modal_tail_db"] <= prediction[channel]["before_modal_tail_db"] + 0.5
+        for channel in ("left", "right")
+    )
     warnings = []
     if diversity["independence_warning"]:
         warnings.append("일부 제어원의 공간 응답이 거의 같아 독립 MIMO 자유도가 낮습니다. 우퍼 위치/배선을 확인하세요.")
@@ -602,9 +663,23 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "frequency_range_hz": [20, high_hz],
             "transition_end_hz": high_hz + 30,
             "strength": strength,
-            "regularization": "frequency-dependent Tikhonov plus primary-path prior and measured usable-band penalty",
+            "solution_blend": solution_blend,
+            "regularization": "frequency-dependent Tikhonov, adjacent-bin spectral continuity, primary-path prior and measured usable-band penalty",
             "support_penalty_db": support_penalty_db,
             "woofer_trim_constraint_db": woofer_trim,
+            "target_level_normalization": {
+                "reference_band_hz": [70, 130],
+                "target_reference_db": round(target_reference_db, 3),
+                "baseline_reference_db": {
+                    "left": round(baseline_reference_db[0], 3),
+                    "right": round(baseline_reference_db[1], 3),
+                },
+                "target_offset_db": {
+                    "left": round(target_offsets_db[0], 3),
+                    "right": round(target_offsets_db[1], 3),
+                },
+                "policy": "preserve existing SISO bass anchor; optimize target shape and spatial consistency",
+            },
             "usable_low_hz": {key: round(value, 2) for key, value in usable_lows.items()},
             "condition_surrogate": {"median": round(statistics.median(condition_values), 3), "p95": round(percentile(condition_values, 0.95), 3), "maximum": round(max(condition_values), 3)},
             "actuator_diversity": diversity,
@@ -616,16 +691,16 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         "diagnostics": {"warnings": warnings},
         "room_tuning_audit": temporal_and_room_audit(positions, sources, high_hz),
         "self_validation": {
-            "overall_pass": finite_pass and headroom_pass and causality_pass and improvement_pass,
-            "core_checks": {"finite": finite_pass, "correlated_input_headroom": headroom_pass, "common_causality": causality_pass, "predicted_target_and_spatial_non_regression": improvement_pass},
+            "overall_pass": finite_pass and headroom_pass and causality_pass and improvement_pass and modal_tail_pass,
+            "core_checks": {"finite": finite_pass, "correlated_input_headroom": headroom_pass, "common_causality": causality_pass, "predicted_target_and_spatial_non_regression": improvement_pass, "predicted_modal_tail_non_regression": modal_tail_pass},
         },
         "graphs": graphs,
         "algorithm": {
             "family": "robust multichannel weighted pressure matching",
             "not_product_clone": "independent AudioDSP implementation; not Dirac ART",
             "spatial": "three-position weighted complex pressure error",
-            "stability": "Tikhonov control effort, primary prior, usable-band penalty, global worst-case row-sum headroom",
-            "phase": "complex low-frequency optimization with one common causal delay",
+            "stability": "Tikhonov control effort, adjacent-frequency continuity, primary prior, usable-band penalty, global worst-case row-sum headroom",
+            "phase": "bulk-arrival-restored complex low-frequency optimization, common L/R base phase and one common causal delay",
         },
     }
     manifest_path = output_dir / "MIMO_manifest.json"
@@ -676,6 +751,14 @@ def self_test(engine_path: Path) -> dict[str, Any]:
     os.environ["AUDIODSP_PLATFORM_CLASS"] = "test"
     frequencies = [20.0 * (1000.0 ** (index / 511.0)) for index in range(512)]
     results = []
+    probe = synthetic_response(frequencies, 1, 1)
+    probe_frequency = 80.0
+    expected_phase = interpolate_log(probe["frequencies"], probe["phase_rad"], probe_frequency)
+    expected_phase -= 2.0 * math.pi * probe_frequency * probe["bulk_delay_samples"] / RATE
+    actual_phase = cmath.phase(response_value(probe, probe_frequency, 0.0))
+    wrapped_error = abs(cmath.phase(cmath.exp(1j * (actual_phase - expected_phase))))
+    if wrapped_error > 1.0e-6:
+        raise MimoError("MIMO 전달함수에서 경로 bulk delay가 복원되지 않았습니다.")
     with tempfile.TemporaryDirectory(prefix="audiodsp-mimo-test-") as temporary_name:
         root = Path(temporary_name)
         for mode in MIMO_MODES:
@@ -697,8 +780,15 @@ def self_test(engine_path: Path) -> dict[str, Any]:
                 raise MimoError(f"합성 MIMO 검증 실패: {mode}: {json.dumps({'checks': result['self_validation'], 'prediction': result['mimo']['prediction'], 'headroom': result['mimo']['headroom'], 'causality': result['mimo']['causality']}, ensure_ascii=False)}")
             if len(result["mimo_files"]) != 4 or any(item["frames"] != TAPS for item in result["mimo_files"]):
                 raise MimoError(f"MIMO 파일 형식 실패: {mode}")
-            results.append({"mode": mode, "pass": True, "prediction": result["mimo"]["prediction"], "headroom": result["mimo"]["headroom"]})
-    return {"result": "PASS", "topologies": results, "paths": PATHS, "taps": TAPS, "rate": RATE}
+            results.append({
+                "mode": mode,
+                "pass": True,
+                "prediction": result["mimo"]["prediction"],
+                "headroom": result["mimo"]["headroom"],
+                "causality": result["mimo"]["causality"],
+                "target_level_normalization": result["mimo"]["target_level_normalization"],
+            })
+    return {"result": "PASS", "bulk_delay_restored": True, "topologies": results, "paths": PATHS, "taps": TAPS, "rate": RATE}
 
 
 def main() -> int:

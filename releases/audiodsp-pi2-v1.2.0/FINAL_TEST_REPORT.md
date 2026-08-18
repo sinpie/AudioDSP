@@ -4,9 +4,17 @@ Date: 2026-08-18 · hardware: Raspberry Pi 2 Model B Rev 1.1
 
 ## Result
 
-PASS. Production CamillaDSP was not restarted by the UI deployment or tests;
-its PID remained 28488 and the active Speaker FIR remained SHA-256
+PASS. Production CamillaDSP was not restarted by the candidate tests or final
+Web/engine deployment. The later user-authorized quiet paired acoustic A/B test
+intentionally stopped and restored it once; its final PID is 30454 and the active Speaker FIR remained SHA-256
 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`.
+
+The later complete fixed-microphone end-to-end run also passed: exactly one
+L+Woofer, one R+Woofer and one Woofer-only generation sweep; all 67 option
+variants and 134 FIR WAVs; 136/136 usable acoustic validation captures; two
+successful low-SNR retries; and generated-FIR preview/apply/restore.  See
+`docs/FULL_OPTION_E2E_REPORT_20260818.md`.  After the transaction test, the
+original managed FIR and the user's RefinedTone preview were restored.
 
 ## Profile and Web matrix
 
@@ -17,7 +25,7 @@ its PID remained 28488 and the active Speaker FIR remained SHA-256
   chunksizes, malformed requests, rollback and 33 concurrent writes.
 - Four staged WAV applies, A/B recovery and generated-pair backup.
 - Browser WAV/ZIP downloads, versioned full backup/restore, future-schema
-  rejection, automatic rollback and latest rollback download.
+  rejection, automatic rollback, latest rollback download and extracted-staging cleanup.
 - Live selector polling, highlighted card, six targets, measurement/health API.
 - U7 volume: five API writes, one form write, six invalid-request cases,
   physical-knob divergence, raw/dB mapping, persistence and concurrent write.
@@ -25,20 +33,52 @@ its PID remained 28488 and the active Speaker FIR remained SHA-256
 ## Measurement engine on ARMv7
 
 - FFTW3f 65536-point round-trip error: 2.5625e-7.
-- Magnitude build: 52.966 s; bass-excess-phase build: 60.344 s.
+- Magnitude build: 51.326 s; bass-excess-phase build: 76.067 s; combined L/R
+  single-convolution-copy build: 33.656 s.
 - Every output: 48 kHz, stereo float32, exactly 32768 taps.
 - Dependency invalidation, same-setting preservation, correction preferences,
-  variable smoothing, natural-rolloff guard and offline level check passed.
+  variable smoothing, natural-rolloff guard, adaptive Woofer passband SNR,
+  interrupted-worker recovery and offline level check passed.
 - Strong woofer mode produced -9.0 dB maximum Rear transfer in the synthetic
-  test; phase build produced -5.91 dB after the synthetic alignment case.
+  test; phase build produced -5.91 dB after acoustic-plus-FIR total-delay alignment.
+- Six targets × three presets and one representative bass-phase actual-FIR
+  matrix passed; bass-phase implementation MAE/P95 was 0.0123/0.0548 dB.
+- Dynamic sweep timing recovered nominal 400 ms, a cold-start capture with the
+  nominal arm interval removed, and 1100 ms delayed capture. Adaptive Woofer
+  passband SNR remained higher than full-band SNR in the regression fixture.
+
+## Quiet applied-FIR acoustic A/B
+
+- Four 14-second sweeps at -15 dBFS: raw/FIR for L+Woofer and R+Woofer. This is
+  15 dB below the previous 0 dBFS sweep. U7 Mic/Line capture was disabled during
+  playback and restored afterward.
+- Low-noise-window raw/FIR SNR estimates were 28.29/20.92 and 7.15/7.68 dB
+  (L/R). The production gate, which conservatively retains the noisier valid
+  pre/post segment, reported raw 27.22/14.94 dB and FIR -2.12/4.59 dB. It rejects
+  both filtered captures because the approved FIR attenuates roughly 9-12 dB
+  through much of the midband and 20-26 dB around 60-100 Hz; fine residuals are
+  exploratory supporting evidence, not a certification.
+- Measured applied transfer tracked the FIR from 120 Hz to 10 kHz with MAE
+  0.46/0.36 dB (120-500 Hz) and 0.45/0.38 dB (500 Hz-10 kHz). Low-bass tracking
+  was less certain: 5.02/1.90 dB MAE for L/R at 30-120 Hz.
+- Harman-aligned raw bass peak excess fell from 15.12 to 4.98 dB on L and from
+  13.24 to 6.06 dB on R in the measured curves. The theoretical high-confidence
+  prediction is a 14.60/10.44 dB L/R peak reduction.
+- The strong-control FIR overshoots the Harman bass level after independent
+  500-2000 Hz alignment: predicted 30-120 Hz median residual changes from
+  +6.41 to -7.24 dB on L and +8.53 to -4.59 dB on R. It is effective boom
+  suppression, not the closest neutral-Harman fit.
+- Artifacts: `analysis_summary.json`, `frequency_comparison.csv`, and
+  `comparison.svg` under `applied_validation_20260818_122253`.
 
 ## Live hardware and UI
 
 - `camilladsp`, `audiodsp-web`, and `audiodsp-profile-monitor`: active.
 - Xonar U7 and UMIK-1: detected; Ethernet: DHCP.
 - Live `GET`/`PUT /api/volume`: -10 dB, raw 117, eight uniform channels;
-  CamillaDSP PID 28488 and active FIR SHA remained unchanged.
-- Live full backup: schema 1, 488669 bytes, eight ZIP members, all SHA verified.
+  CamillaDSP PID 12593 and active FIR SHA remained unchanged.
+- Live full backup after deployment: schema 2, 488735 bytes, unique nanosecond
+  filename; restore-staging residue count zero.
 - PC 1440×1000 and compact/mobile layout visually inspected in dark theme.
 - Measurement NOT OK remains on step 2, calibration is collapsible, workflow
   steps are clickable without mutation, and mobile navigation is fixed at the
@@ -57,24 +97,27 @@ its PID remained 28488 and the active Speaker FIR remained SHA-256
   dual-sub 4-actuator. Every bank contained four stereo float32 WAV files with
   exactly 32768 taps and eight finite convolution paths.
 - Robust complex solver, per-output correlated-input headroom projection,
-  causality, manifest SHA-256 and actual CamillaDSP `--check`: PASS.
+  restored relative bulk arrival, SISO bass-level anchor, spectral continuity,
+  causality, modal-tail guard, manifest SHA-256 and actual CamillaDSP `--check`: PASS.
 - Isolated manager test installed/enabled/disabled MIMO, returned to SISO and
   rejected MIMO on Pi 2 without touching production state.
-- Backup schema 2 MIMO inventory and restore staging validation: PASS. The live
-  production Pi 2 remained on its already-installed schema 1 code during this
-  candidate-only test.
+- Backup schema 2 MIMO inventory, restore staging validation and extraction
+  cleanup: PASS. The common engine/Web code was then deployed to Pi2 while
+  real-time MIMO activation remained blocked.
 - SISO and MIMO builds now persist JSON and Markdown room-tuning audits that
   separate FIR/MIMO-correctable findings from placement/treatment limits,
   unmeasured items and required runtime/post-measurement validation.
 - See `MIMO_VALIDATION_REPORT.md` for metrics and the remaining sound-producing
-  Pi 4/5 acceptance tests. No actual sweep or live deployment was performed.
+  Pi 4/5 MIMO acceptance tests. The acoustic sweep above validates SISO only.
 
 ## Final read-only live check
 
-At closeout on 2026-08-18, the connected production Pi 2 reported CamillaDSP
-PID 2036; `camilladsp`, `audiodsp-web` and `audiodsp-profile-monitor` were all
-active, the last 30 minutes contained zero XRUN/underrun/overrun matches, and
+At closeout on 2026-08-18, after the user-authorized paired sweep, the connected
+production Pi 2 reported CamillaDSP PID 30454; `camilladsp`, `audiodsp-web` and `audiodsp-profile-monitor` were all
+active, CamillaDSP restart count was zero, the last 30 minutes contained zero
+XRUN/underrun/overrun/panic/error matches, and
 the active Speaker FIR SHA-256 was still
 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`.
-This was a read-only check; no audio was generated and no service, profile or
-configuration was changed.
+The paired test stopped and restored CamillaDSP once by design; it did not
+change the profile, FIR, volume or persistent audio configuration. Pre-deployment code is recoverable from
+`/var/lib/audiodsp/code-backups/20260818T030943Z`.

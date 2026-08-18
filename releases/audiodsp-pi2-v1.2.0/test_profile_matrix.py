@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -565,6 +566,16 @@ def main() -> int:
         manager.CAMILLADSP = real_camilla
         manager.apply_settings(manager.load_settings(), restart=False)
 
+        # A combined L+Woofer / R+Woofer result has no separate Rear WAV. Its
+        # measured balance must therefore be applied by the temporary runtime
+        # mixer while retaining a two-channel convolution topology.
+        combined_preview = manager.preview_pair("speaker", sources["speaker_front"], None, -9)
+        require(combined_preview["convolution_channels"] == 2, "combined preview did not use one stereo convolution")
+        require(combined_preview["woofer_trim_db"] == -9, "combined preview lost measured woofer trim")
+        require(b"gain: -9" in manager.CONFIG_PATH.read_bytes(), "combined preview mixer trim missing from CamillaDSP config")
+        manager.restore_profile(restart=False)
+        report["combined_preview"] = {"convolution_channels": 2, "woofer_trim_db": -9}
+
         # HID reports: short, unpressed, both known states, extra mask bits, unknown state.
         monitor = load_module("gsonic_u7_monitor_matrix", args.monitor)
         hid_cases = 0
@@ -636,6 +647,15 @@ def main() -> int:
             stderr=subprocess.STDOUT,
             text=True,
         )
+        previous_signal_handlers = {
+            signum: signal.getsignal(signum) for signum in (signal.SIGHUP, signal.SIGTERM)
+        }
+
+        def interrupted_test(_signum, _frame):
+            raise KeyboardInterrupt("profile matrix interrupted")
+
+        for signum in previous_signal_handlers:
+            signal.signal(signum, interrupted_test)
         base = f"http://127.0.0.1:{port}"
         try:
             for _ in range(50):
@@ -654,8 +674,11 @@ def main() -> int:
                 require(marker.encode("utf-8") in status_page, f"Status-page marker missing: {marker}")
             require(b"measurement card-wide" not in status_page and b"Front WAV" not in status_page, "status page contains another screen")
             measure_page, _ = get_bytes(base + "/measure")
-            for marker in (b"32768", b"UMIK-1", b"target-graph", b"job-progress", b"workflow", b"cal-card", "90° · 천장 방향".encode("utf-8"), "0° · 마이크 정면".encode("utf-8")):
+            for marker in (b"32768", b"UMIK-1", b"target-graph", b"job-progress", b"workflow", b"cal-card", b'name="noise_level_dbfs"', b'name="level_dbfs" type="range"', b'name="woofer_measurement_attenuation_db"', b'value="-42"', b"output-level-warning", "−42부터 시작".encode("utf-8"), "안전 시작 범위".encode("utf-8"), "L+Woofer / R+Woofer".encode("utf-8"), "Front L / Front R / Woofer".encode("utf-8"), "90° · 천장 방향".encode("utf-8"), "0° · 마이크 정면".encode("utf-8")):
                 require(marker in measure_page, f"Measurement-page marker missing: {marker!r}")
+            web_source = args.web.read_text(encoding="utf-8")
+            for marker in ("실제 측정음을 재생합니다", "저역 late/early", "기존 SISO 저역 레벨", "0.5 dB 넘게 악화"):
+                require(marker in web_source, f"Measurement/MIMO safety UI source marker missing: {marker}")
             require(b'<a class="flow-step current" href="#measurement-step-1"' in measure_page, "current measurement step is not a non-destructive link")
             require(b"/measurement/rewind" not in measure_page, "step navigation unexpectedly discards data")
             require(b"current FIR" not in measure_page and b"data-profile=" not in measure_page, "measurement page contains another screen")
@@ -694,6 +717,22 @@ def main() -> int:
             restore_front_before = manager.PROFILE_FILES["speaker"]["front"].read_bytes()
             post_backup(base + "/backup/stage", backup_payload)
             require(manager.load_settings() == restore_settings_before and manager.PROFILE_FILES["speaker"]["front"].read_bytes() == restore_front_before, "staging a backup mutated live state")
+            valid_staging_directories = set((state / "restore-staging").iterdir())
+            invalid_memory = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(backup_payload)) as source_archive:
+                invalid_entries = {name: source_archive.read(name) for name in source_archive.namelist()}
+            invalid_entries["profile-settings.json"] = b'{"requested_profile":"speaker","chunksize":123}\n'
+            invalid_manifest = json.loads(invalid_entries["manifest.json"])
+            invalid_manifest["files"]["profile-settings.json"] = {
+                "bytes": len(invalid_entries["profile-settings.json"]),
+                "sha256": hashlib.sha256(invalid_entries["profile-settings.json"]).hexdigest(),
+            }
+            invalid_entries["manifest.json"] = json.dumps(invalid_manifest).encode()
+            with zipfile.ZipFile(invalid_memory, "w") as invalid_archive:
+                for name, data in invalid_entries.items():
+                    invalid_archive.writestr(name, data)
+            post_backup(base + "/backup/stage", invalid_memory.getvalue(), "invalid-settings.zip", expected=400)
+            require(set((state / "restore-staging").iterdir()) == valid_staging_directories, "failed restore validation leaked files or removed the prior valid staging")
             restore_page, _ = get_bytes(base + "/settings")
             require("검증 완료 · 전체 복원".encode("utf-8") in restore_page and "현재 설정은 아직 바뀌지 않았습니다".encode("utf-8") in restore_page, "restore review UI missing")
             post_form(base + "/chunksize", {"chunksize": "512"})
@@ -702,6 +741,7 @@ def main() -> int:
             require(manager.load_settings() == restore_settings_before, "full restore did not restore settings")
             require(manager.PROFILE_FILES["speaker"]["front"].read_bytes() == restore_front_before, "full restore did not restore FIR")
             require(list((state / "system-backups").glob("AudioDSP_backup_*.zip")), "full restore did not create automatic rollback ZIP")
+            require(not list((state / "restore-staging").glob("*")), "full restore left extracted staging files")
             latest_payload, latest_headers = get_bytes(base + "/api/backup/latest")
             require(latest_headers.get("Content-Type") == "application/zip", "latest rollback backup is not downloadable")
             with zipfile.ZipFile(io.BytesIO(latest_payload)) as latest_archive:
@@ -720,8 +760,14 @@ def main() -> int:
             post_backup(base + "/backup/stage", future_memory.getvalue(), "future.zip", expected=400)
             require(manager.load_settings() == restore_settings_before, "future-schema rejection changed settings")
             post_backup(base + "/backup/stage", backup_payload)
+            first_staging = set((state / "restore-staging").iterdir())
+            require(len(first_staging) == 1, "restore staging directory count mismatch")
+            post_backup(base + "/backup/stage", backup_payload)
+            second_staging = set((state / "restore-staging").iterdir())
+            require(len(second_staging) == 1 and first_staging.isdisjoint(second_staging), "replacement restore staging was not unique or did not clean the previous directory")
             post_form(base + "/backup/discard", {})
             require(not (state / "restore-staging.json").exists(), "restore discard left active staging state")
+            require(not list((state / "restore-staging").glob("*")), "restore discard left extracted staging files")
 
             # A generated result downloads through the browser as an attachment and remains
             # non-mutating until the separate apply route is submitted.
@@ -1026,6 +1072,8 @@ def main() -> int:
                 server.kill()
                 server.wait(timeout=5)
             web_log.close()
+            for signum, previous in previous_signal_handlers.items():
+                signal.signal(signum, previous)
 
     report["result"] = "PASS"
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))

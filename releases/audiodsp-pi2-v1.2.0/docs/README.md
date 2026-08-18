@@ -38,7 +38,9 @@
 - Factory/Speaker FIR SHA-256: `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`
 - 출력 볼륨: U7 `PCM,0`, 웹/API 범위 -60~0 dB, 초기 저장값 -10 dB
 - Pi 2 초기 chunksize 2048; Pi 4/5 초기 chunksize 1024
+- 백색소음/sweep 기본 -42 dBFS, Woofer 분리 측정 감쇄 기본 -9 dB; 적응형 통과대역 SNR과 중단 worker 복구
 - Pi2는 MIMO 측정/적용 선택을 차단하고 SISO 2/4 convolution만 실행한다. 같은 SD/application 형식으로 Pi4/5 이전 시 MIMO bank를 복원할 수 있다.
+- 공통 MIMO 계산은 상대 도달 phase·SISO 저역 레벨 anchor·modal late/early 비악화를 검증하며 Pi4/5 이전 전 무음 fixture로 시험한다.
 - 네트워크는 DHCP만 사용하며 고정·비상 주소를 만들지 않는다.
 
 ## 가장 빠른 재현 검사

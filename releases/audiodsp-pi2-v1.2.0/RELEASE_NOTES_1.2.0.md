@@ -2,6 +2,15 @@
 
 ## 2026-08-18 maintenance revision
 
+- Restored independent White/Sweep -42 dBFS safe defaults, live high-output
+  warning and explicit pre-sweep confirmation; Woofer SNR now follows the
+  detected sustained -3 dB acoustic passband.
+- Corrected SISO acoustic-plus-FIR crossover delay and common-L/R phase safety;
+  cached FFTW plans and recovered interrupted workers without mutating sessions.
+- Updated common MIMO math with actuator-relative bulk phase, SISO bass anchor,
+  spectral continuity/base blending and modal-tail gate; Pi2 remains blocked.
+- Made rollback/staging names unique and removed extracted restore files on
+  validation failure, replacement, discard and successful apply.
 - Added common MIMO bank/report/backup compatibility for migration to Pi4/5,
   while explicitly blocking MIMO measurement and eight-path runtime on Pi2.
 - Added persistent SISO room-tuning JSON/Markdown reports that separate FIR

@@ -71,8 +71,10 @@ flowchart LR
 - 측정 재생은 검증된 `audiodsp_announce` 4채널 공유 ALSA 경로를 쓰되 CamillaDSP는 중지되어 FIR을 완전히 bypass한다.
 - JSON과 config는 임시 파일 작성 후 `os.replace`로 원자 교체한다.
 - Web은 thread-per-request지만 모든 변경은 관리자 CLI의 프로세스 lock을 통과한다.
+- Profile WAV staging은 thread lock, 전체 백업 복원은 별도 re-entrant lock으로 직렬화한다. 복원 검토 디렉터리는 관리 루트 경계를 resolve하고 symbolic link를 따라가지 않은 뒤 적용·교체·취소·검증 실패 시 회수한다.
 - status는 관련 파일 mtime/size signature로 cache한다.
 - U7 볼륨은 2.5초 cache하며 UI는 화면이 보일 때 약 3초마다 조회한다.
+- 측정 worker는 state lock 안에서 launch/PID 기록을 직렬화하고 PID와 `/proc` command line을 함께 검증한다. 사라진 worker는 디스크 session을 조회만으로 바꾸지 않은 채 API 응답에서 중단 오류로 복구한다.
 
 ## 볼륨 제어
 

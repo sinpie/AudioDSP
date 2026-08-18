@@ -2,7 +2,7 @@
 
 ## 결론
 
-AudioDSP의 MIMO는 Dirac ART의 복제품이 아니다. 공개 연구의 robust multichannel weighted pressure matching을 독립 구현한 48 kHz, 2입력×4출력, 32768탭 feed-forward FIR bank다. 측정한 세 위치에서 저역의 타깃 오차와 위치 편차를 함께 줄이고, 각 물리 출력의 최악 상관입력 headroom과 짧은 공통 인과 지연을 제한한다.
+AudioDSP의 MIMO는 Dirac ART의 복제품이 아니다. 공개 연구의 robust multichannel weighted pressure matching을 독립 구현한 48 kHz, 2입력×4출력, 32768탭 feed-forward FIR bank다. 측정한 세 위치에서 저역의 타깃 오차와 위치 편차를 함께 줄이고, 각 물리 출력의 최악 상관입력 headroom, 공통 인과 지연과 modeled late/early 비악화를 제한한다.
 
 서브우퍼 두 대는 필수가 아니다.
 
@@ -55,11 +55,14 @@ AudioDSP의 MIMO는 Dirac ART의 복제품이 아니다. 공개 연구의 robust
 
 추가 안전 처리:
 
+- SISO 응답 추정에서 제거했던 제어원별 bulk arrival phase를 MIMO 행렬에 다시 넣어 실제 상대 도달시간을 보존한다. 이를 빼면 actuator 간 합산 phase가 잘못된다.
+- 각 측정 응답을 70~130 Hz에서 정규화한 뒤, 선택 타깃은 기존 SISO L/R의 같은 대역 레벨에 다시 anchor한다. 따라서 MIMO는 임의의 절대 저역 증감을 만들지 않고 shape와 좌석 일관성을 최적화한다.
+- 인접 FFT bin 해에 spectral-continuity penalty를 넣고, 강도별로 안전한 SISO base 해와 최적화 해를 `safe 0.25 / balanced 0.40 / maximum 0.65` 비율로 혼합한다.
 - MIMO 범위는 20–80/120/150 Hz 중 선택하며 끝에서 30 Hz raised-cosine으로 기존 SISO FIR에 전이한다.
 - 영위상 역필터를 요구하지 않고 기존 SISO 응답의 가중 도착 phase를 목표 phase로 유지한다.
 - 모든 경로에 하나의 공통 인과 지연을 적용하고 32768탭으로 절단·후단 taper한다.
 - 주파수별 각 물리 출력의 `|L path| + |R path|`를 0.999 이하로 투영한다. 변환·절단 후 다시 최악 상관입력 row sum을 검사하고 필요한 최소 global scale만 적용한다.
-- NaN/Inf, 정확한 tap/rate/format, manifest SHA-256, 인과성, headroom, 예측 타깃 오차와 공간 편차 비퇴행을 통과해야 Preview/Apply가 열린다.
+- NaN/Inf, 정확한 tap/rate/format, manifest SHA-256, 인과성, headroom, 예측 타깃 오차와 공간 편차 비퇴행을 통과해야 Preview/Apply가 열린다. 저역 late/early energy가 어느 입력 채널에서든 0.5 dB보다 악화되면 전체 셀프검증을 실패시킨다. 한계 이내라도 수치가 좋아지지 않으면 잔향 개선으로 표시하지 않는다.
 - 출력은 `MIMO_Front_Left_LR_32768.wav` 등 네 stereo float32 WAV다. 각 WAV의 채널 0/1은 입력 L/R에서 해당 물리 출력으로 가는 두 전달 경로다.
 
 ## 측정 절차
@@ -67,7 +70,7 @@ AudioDSP의 MIMO는 Dirac ART의 복제품이 아니다. 공개 연구의 robust
 MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재생한다. 현재 구현은 중앙과 그 주변의 작은 청취영역 세 위치를 사용한다. UMIK-1은 실제 룸 측정 시 90° calibration과 천장 방향을 사용한다.
 
 1. U7/UMIK 연결과 90° calibration을 확인한다.
-2. 5초 무음과 5초 백색소음 검사를 사용자가 직접 시작한다. SNR 15 dB 이상을 권장하고, 6 dB 미만 또는 clipping은 적용을 차단한다.
+2. 5초 무음과 5초 백색소음 검사를 사용자가 직접 시작한다. 기본은 -42 dBFS이고 slider로 조절한다. SNR 15 dB 이상을 권장하고, 6 dB 미만 또는 clipping은 적용을 차단한다.
 3. 위치 1–3에서 각 제어원을 독립 sweep한다. 측정 재생 동안 기존 DSP는 direct bypass이고 U7 input monitor는 mute다.
 4. 타깃, T5S 저역 억제, 보정 범위, boost/cut, MIMO 상한·강도·지원 penalty를 고른다.
 5. 계산 결과의 예측 그래프, headroom, 제어원 coherence, 전체 분류표와 보고서를 검토한다.
@@ -104,6 +107,8 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 
 - Pi 2: 기존 SISO 2/4 convolution만 지원한다. MIMO 모드는 UI에서 비활성이고 API/CLI도 활성화를 거부한다. 측정·오프라인 계산 코드는 공통이지만 실시간 8경로를 적용하지 않는다.
 - Pi 4/Pi 5: MIMO 8 convolution을 허용한다. 활성화 시 effective chunksize는 최소 1024다. 적용 후 실제 CPU load, XRUN, USB 안정성을 확인해야 하며 Pi 5도 실기 장시간 검증 전에는 무조건적인 성능 보장을 하지 않는다.
+
+Pi 5 메모리는 이 AudioDSP 전용이면 2 GB를 권장한다. 8경로 32768탭 float32 원본 계수는 합계 1 MiB이고 partition FFT/history/work buffer도 수십 MiB 규모라 실시간 DSP에 충분하다. 오프라인 MIMO 생성 코드도 920 MiB인 Pi 2 무음 fixture에서 실행된다. 4 GB는 다른 서버를 함께 운영하거나 큰 page cache를 원하는 경우의 선택 여유일 뿐이며, 8 GB 이상을 포함해 RAM 증설 자체는 이 DSP의 음질·latency를 개선하지 않는다. 실제 병목은 CPU와 USB/XRUN 안정성이므로 Pi 5 2 GB 실기 장시간 검증으로 확정한다.
 
 ## 의도적으로 하지 않는 것
 

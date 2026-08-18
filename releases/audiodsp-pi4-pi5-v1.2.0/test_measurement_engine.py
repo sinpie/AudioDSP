@@ -154,7 +154,13 @@ def main() -> int:
         engine = load_module("gsonic_measurement_test", args.engine)
 
         fft_test = engine.self_test()
+        engine_source = args.engine.read_text(encoding="utf-8")
+        require(engine_source.count('ARECORD, "-q", "--fatal-errors"') == 3, "UMIK captures do not fail closed on ALSA overrun")
+        require(engine.DEFAULT_SWEEP_LEVEL_DBFS == -42 and engine.DEFAULT_NOISE_LEVEL_DBFS == -42, "night-safe default output is not -42 dBFS")
         require(fft_test["taps"] == 32_768 and fft_test["result"] == "PASS", "engine self-test failed")
+        estimates = engine.platform_capabilities().get("offline_estimates_seconds", {})
+        require(all(isinstance(estimates.get(key), int) and estimates[key] > 0 for key in ("response_per_channel", "fir_magnitude", "fir_bass_phase")), "platform-specific offline ETA metadata is incomplete")
+        require(estimates.get("mimo_2x4") is None or estimates["mimo_2x4"] > 0, "MIMO ETA metadata is invalid")
         catalog = engine.target_catalog()
         require(set(("flat", "harman", "rtings", "acoustix", "toole", "bk")) == set(catalog["targets"]), "target catalog mismatch")
         require(engine.parse_calibration(calibration / "7200660_90deg.txt")["serial"] == "7200660", "calibration serial mismatch")
@@ -180,7 +186,11 @@ def main() -> int:
         low = [background[index] + 0.003 * math.sin(2 * math.pi * index / 37.0) for index in range(count)]
         clipped = list(good)
         clipped[count // 2] = 0.99
+        transient_background = list(background)
+        for index in range(engine.RATE // 2, engine.RATE // 2 + engine.RATE // 100):
+            transient_background[index] += 0.5 * math.sin(2 * math.pi * index / 19.0)
         require(engine.evaluate_level_samples(background, good, 24)["ok"], "valid level was rejected")
+        require(engine.evaluate_level_samples(transient_background, good, 24)["ok"], "one switching transient contaminated robust background RMS")
         require(not engine.evaluate_level_samples(background, low, 24)["ok"], "low-SNR level was accepted")
         require(not engine.evaluate_level_samples(background, clipped, 24)["ok"], "clipping level was accepted")
         desired_rt60 = 0.60
@@ -197,6 +207,55 @@ def main() -> int:
         woofer_peak = max(abs(value) for value in woofer_reference)
         expected_scale = 10.0 ** (engine.WOOFER_MEASUREMENT_ATTENUATION_DB / 20.0)
         require(abs(woofer_peak / front_peak - expected_scale) < 1e-5, "woofer sweep/reference attenuation mismatch")
+        adjustable_reference = engine.write_sweep(root / "woofer-adjustable.wav", "woofer", -30, 2, woofer_attenuation_db=-6)
+        require(abs(max(map(abs, adjustable_reference)) / (10.0 ** (-30 / 20.0)) - 10.0 ** (-6 / 20.0)) < 1e-4, "adjustable woofer attenuation mismatch")
+        combined_reference = engine.write_sweep(root / "combined-left.wav", "left_woofer", -30, 2, woofer_attenuation_db=-9)
+        require(abs(max(map(abs, combined_reference)) / (10.0 ** (-30 / 20.0)) - 1.0) < 1e-4, "combined L+Woofer reference must preserve input level")
+        require(engine.SOURCES["lr"] == ("left_woofer", "right_woofer"), "L/R shared-filter mode is not explicit L+Woofer / R+Woofer")
+
+        # A subwoofer is silent during the high-frequency majority of a full
+        # sweep. Its quality gate must inspect only the exponential-sweep time
+        # segment corresponding to 15-300 Hz, while combined Front+Woofer uses
+        # the complete 15 Hz-22 kHz segment.
+        capture_lead = round(0.4 * engine.RATE)
+        synthetic_capture = [0.0008 * math.sin(2.0 * math.pi * index / 83.0) for index in range(capture_lead + len(woofer_reference))]
+        active_indices = [index for index, value in enumerate(woofer_reference) if abs(value) > 1.0e-12]
+        low_fraction = math.log(300.0 / 15.0) / math.log(22_000.0 / 15.0)
+        low_end = active_indices[0] + round((active_indices[-1] + 1 - active_indices[0]) * low_fraction)
+        for index in range(active_indices[0], min(low_end, len(woofer_reference))):
+            synthetic_capture[capture_lead + index] += 8.0 * woofer_reference[index]
+        full_quality = engine.sweep_capture_quality(synthetic_capture, woofer_reference, "left_woofer")
+        woofer_quality = engine.sweep_capture_quality(synthetic_capture, woofer_reference, "woofer")
+        require(woofer_quality["analysis_band_hz"][1] <= 500.0, "woofer quality gate is not passband limited")
+        require(woofer_quality["subwoofer_passband"] is not None, "woofer adaptive -3 dB passband metadata is missing")
+        require(full_quality["analysis_band_hz"] == [15.0, 22_000.0], "combined quality gate lost full-band analysis")
+        require(woofer_quality["snr_db"] > full_quality["snr_db"] + 2.5, "subwoofer-only SNR still averages its silent high-frequency interval")
+
+        plausible_delay, plausible_details = engine.assess_bulk_delay(2_000, 1_048_576)
+        late_delay, late_details = engine.assess_bulk_delay(518_895, 1_048_576)
+        wrapped_delay, wrapped_details = engine.assess_bulk_delay(1_048_576 - 500, 1_048_576)
+        require(plausible_delay == 2_000 and plausible_details["reliable"], "plausible bulk delay was rejected")
+        require(late_delay == 0 and not late_details["reliable"], "late ESS artifact was accepted as acoustic delay")
+        require(wrapped_delay == 0 and not wrapped_details["reliable"], "negative wrapped peak was accepted as acoustic delay")
+
+        # ALSA/USB cold-start latency can consume the nominal 400 ms capture
+        # arm interval or add more than it.  Quality and later deconvolution
+        # must locate the recorded sweep instead of assuming fixed timing.
+        timing_noise = lambda count: [0.0004 * math.sin(2.0 * math.pi * index / 97.0) for index in range(count)]
+        standard_timing = timing_noise(capture_lead + len(front_reference))
+        for index, value in enumerate(front_reference):
+            standard_timing[capture_lead + index] += 8.0 * value
+        standard_quality = engine.sweep_capture_quality(standard_timing, front_reference, "left_woofer")
+        truncated_quality = engine.sweep_capture_quality(standard_timing[capture_lead:], front_reference, "left_woofer")
+        extra_delay = round(1.10 * engine.RATE)
+        delayed_timing = timing_noise(extra_delay + len(front_reference))
+        for index, value in enumerate(front_reference):
+            delayed_timing[extra_delay + index] += 8.0 * value
+        delayed_quality = engine.sweep_capture_quality(delayed_timing, front_reference, "left_woofer")
+        require(standard_quality["usable"] and truncated_quality["usable"] and delayed_quality["usable"], "dynamic sweep timing rejected a valid capture")
+        require(abs(standard_quality["capture_delay_ms"] - 400.0) <= 60.0, "normal capture arm delay was not recovered")
+        require(abs(truncated_quality["capture_delay_ms"]) <= 60.0, "truncated cold-start capture timing was not recovered")
+        require(abs(delayed_quality["capture_delay_ms"] - 1100.0) <= 60.0, "long USB capture startup delay was not recovered")
 
         frequencies = [round(20.0 * (1000.0 ** (index / 511.0)), 6) for index in range(512)]
         measurements_index = []
@@ -220,6 +279,8 @@ def main() -> int:
             "positions_total": 3,
             "orientation": "90",
             "level_dbfs": -42,
+            "noise_level_dbfs": -36,
+            "woofer_measurement_attenuation_db": -9,
             "sweep_seconds": 8,
             "measurements": measurements_index,
             "validation": None,
@@ -231,6 +292,14 @@ def main() -> int:
         engine.build_worker("harman", "strong", -9, "magnitude", 200)
         magnitude_state = engine.load_current()
         magnitude = validate_result(engine, magnitude_state, phase=False)
+        level_control = magnitude_state["result"]["woofer_level_control"]
+        require(level_control["measurement_attenuation_compensated"], "woofer measurement attenuation was treated as playback level")
+        require(level_control["automatic_boost_allowed"] is False, "woofer automatic boost was enabled")
+        require(level_control["automatic_target_cut_median_db_40_120"] < 0.0, "loud synthetic woofer was not automatically cut against Front reference")
+        woofer_graph = magnitude_state["result"]["graphs"]["woofer"]
+        require(woofer_graph["level_reference"] == "shared Front L/R 500-2000 Hz", "woofer used a self-normalized level reference")
+        require(woofer_graph["positive_woofer_gain_allowed"] is False, "woofer graph allows positive gain")
+        require(max(woofer_graph["correction_db"]) <= 1e-6, "woofer FIR contains positive correction")
         magnitude_seconds = round(time.monotonic() - started, 3)
 
         started = time.monotonic()
@@ -240,33 +309,95 @@ def main() -> int:
         require(phase_state["result"]["spatial_mode"] == "center", "spatial weighting metadata missing")
         require(phase_state["result"]["preference"] == {"bass_db_at_20_hz": 2, "treble_db_at_20_khz": -2}, "preference metadata mismatch")
         require(phase_state["result"]["correction_limits"]["high_hz"] == 5000, "correction limit metadata mismatch")
+        left_phase_details = phase_state["result"]["graphs"]["left"]["phase"]
+        right_phase_details = phase_state["result"]["graphs"]["right"]["phase"]
+        require(left_phase_details.get("common_lr_phase") and right_phase_details.get("common_lr_phase"), "L/R phase correction is not common-mode")
+        require(left_phase_details.get("relative_output_delay_samples") == 0 and right_phase_details.get("relative_output_delay_samples") == 0, "L/R phase correction introduced relative delay")
+        require(left_phase_details.get("applied_strength") == right_phase_details.get("applied_strength"), "L/R phase strength differs")
         for channel in ("left", "right", "woofer"):
             graph = phase_state["result"]["graphs"][channel]
             require(graph and graph.get("target_db") and graph.get("spatial_std_db"), f"{channel} advanced graph data missing")
             require(graph.get("actual_correction_db") and graph.get("requested_correction_db"), f"{channel} actual FIR graph data missing")
+            require(graph.get("automatic_room_correction_db") and graph.get("preference_correction_db"), f"{channel} room/preference correction split is missing")
             require(graph.get("fir_implementation", {}).get("pass"), f"{channel} FIR implementation verification failed")
             require(graph.get("target_fit", {}).get("pass"), f"{channel} target-fit verification failed")
+        require(max(phase_state["result"]["graphs"]["woofer"]["preference_correction_db"]) > 0.5, "explicit bass preference was erased by automatic woofer cut limiting")
+        require(max(phase_state["result"]["graphs"]["woofer"]["correction_db"]) <= 1e-6, "explicit bass preference bypassed the Woofer cut-only safety policy")
         require(any(value < -0.1 for value in phase_state["result"]["graphs"]["woofer"]["decay_control_db"]), "long bass decay did not activate cut-only damping")
         require(phase_state["result"]["room_decay"]["policy"], "room decay policy metadata missing")
+        alignment = phase_state["result"]["time_alignment"]
+        require(alignment.get("aligned") and alignment.get("residual_total_delay_samples") == 0, "Front/Woofer total acoustic+FIR delay was not aligned")
+        require("front_fir_energy_delay_samples" in alignment and "rear_fir_energy_delay_samples" in alignment, "FIR delay was omitted from crossover alignment")
         phase_seconds = round(time.monotonic() - started, 3)
+
+        # Combined SISO must tune the measured L+Woofer / R+Woofer sum with one
+        # stereo FIR.  It must not invent a separately scaled Rear FIR, and the
+        # measured relative level must be carried into the runtime mixer.
+        dependency_state = engine.load_current()
+        combined_measurements = []
+        for position in range(1, 4):
+            for source, donor in (("left_woofer", "left"), ("right_woofer", "right")):
+                source_name = f"p{position}_{source}_response.json"
+                donor_name = f"p{position}_{donor}_response.json"
+                (session / source_name).write_bytes((session / donor_name).read_bytes())
+                combined_measurements.append({"position": position, "source": source, "response": source_name})
+        combined_state = json.loads(json.dumps(dependency_state))
+        combined_state.update({
+            "state": "measured",
+            "mode": "lr",
+            "sources": ["left_woofer", "right_woofer"],
+            "measurements": combined_measurements,
+            "woofer_measurement_attenuation_db": -9,
+            "result": None,
+        })
+        engine.save_current(combined_state)
+        combined_started = time.monotonic()
+        engine.build_worker("harman", "strong", -9, "magnitude", 200)
+        combined_result = engine.load_current()["result"]
+        require(combined_result["rear"] is None, "combined SISO unexpectedly generated a separate Rear FIR")
+        require(combined_result["rear_metrics"] is None, "combined SISO unexpectedly used four convolution channels")
+        require(combined_result["graphs"]["woofer"]["runtime_mixer_trim"], "combined SISO runtime mixer trim metadata missing")
+        require(combined_result["graphs"]["woofer"]["woofer_trim_db"] == -9, "combined SISO trim does not match measurement")
+        require(combined_result["measurement_output"]["woofer_level_semantics"] == "measured system balance and final runtime trim", "combined level semantics missing")
+        combined_seconds = round(time.monotonic() - combined_started, 3)
+        engine.save_current(dependency_state)
 
         # Wizard navigation itself is client-side and non-mutating. Actual setting
         # application invalidates only dependent artifacts.
-        dependency_state = engine.load_current()
-        dependency_state["level_check"] = {"ok": True, "snr_db": 30.0}
+        dependency_state["level_check"] = {
+            "ok": True,
+            "snr_db": 30.0,
+            "requested_white_noise_level_dbfs": -36,
+            "peak_dbfs": -20.0,
+        }
         engine.save_current(dependency_state)
         same = engine.reconfigure_session("lrw", "90", -42, 8)
         require(same.get("result") and len(same["measurements"]) == 9 and same["level_check"]["ok"], "unchanged settings discarded data")
         mode_changed = engine.reconfigure_session("lr", "90", -42, 8)
         require(mode_changed["result"] is None and mode_changed["measurements"] == [] and mode_changed["level_check"]["ok"], "mode change invalidation scope is wrong")
+        require(mode_changed["sources"] == ["left_woofer", "right_woofer"], "combined mode source routing metadata is wrong")
         engine.save_current(dependency_state)
         level_changed = engine.reconfigure_session("lrw", "90", -36, 8)
-        require(level_changed["result"] is None and level_changed["measurements"] == [] and level_changed.get("level_check") is None, "level change did not invalidate level and downstream")
+        require(level_changed["result"] is None and level_changed["measurements"] == [] and level_changed.get("level_check", {}).get("ok"), "sweep below the tested white-noise level discarded a valid level check")
+        engine.save_current(dependency_state)
+        noise_changed = engine.reconfigure_session("lrw", "90", -42, 8, -30, -9)
+        require(noise_changed.get("level_check") is None and noise_changed["noise_level_dbfs"] == -30, "white-noise slider did not invalidate level check")
+        engine.save_current(dependency_state)
+        woofer_level_changed = engine.reconfigure_session("lrw", "90", -42, 8, -36, -6)
+        require(woofer_level_changed.get("level_check", {}).get("ok") and len(woofer_level_changed["measurements"]) == 6 and all(item["source"] in ("left", "right") for item in woofer_level_changed["measurements"]) and woofer_level_changed["woofer_measurement_attenuation_db"] == -6, "woofer measurement slider did not preserve independent Front measurements")
         engine.save_current(dependency_state)
         prepared = engine.prepare_build()
         require(prepared["result"] is None and len(prepared["measurements"]) == 9 and prepared["level_check"]["ok"], "FIR rebuild invalidated raw measurements")
         preferences = engine.save_correction_preferences({**engine.DEFAULT_CORRECTION_PREFERENCES, "target": "flat", "max_boost_db": 3})
         require(engine.load_correction_preferences() == preferences and preferences["target"] == "flat", "correction preference persistence failed")
+
+        interrupted = dict(dependency_state)
+        interrupted.update(state="processing", worker_pid=2_000_000_000, active_pids=[2_000_000_001])
+        engine.save_current(interrupted)
+        recovered = engine.load_current()
+        require(recovered["state"] == "error" and recovered.get("worker_pid") is None and recovered.get("interrupted_worker"), "dead measurement worker was not recovered safely")
+        persisted = json.loads(engine.CURRENT.read_text(encoding="utf-8"))
+        require(persisted["state"] == "processing", "status-only stale-worker recovery unexpectedly mutated the session")
 
         report = {
             "result": "PASS",
@@ -276,6 +407,12 @@ def main() -> int:
             "variable_smoothing": True,
             "natural_rolloff_guard": True,
             "woofer_measurement_attenuation_db": engine.WOOFER_MEASUREMENT_ATTENUATION_DB,
+            "independent_white_noise_and_sweep_sliders": True,
+            "combined_lr_routing": "L+Woofer / R+Woofer",
+            "woofer_quality_analysis_band": "adaptive sustained -3 dB acoustic passband; 15-300 Hz fallback",
+            "capture_then_batch_response_processing": True,
+            "combined_build_seconds": combined_seconds,
+            "combined_single_convolution_then_copy": True,
             "actual_fir_target_verification": True,
             "room_decay_control": True,
             "dependency_invalidation": True,

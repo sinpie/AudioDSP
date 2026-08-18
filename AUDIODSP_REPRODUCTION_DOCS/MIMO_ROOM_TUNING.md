@@ -105,6 +105,8 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 - Pi 2: 기존 SISO 2/4 convolution만 지원한다. MIMO 모드는 UI에서 비활성이고 API/CLI도 활성화를 거부한다. 측정·오프라인 계산 코드는 공통이지만 실시간 8경로를 적용하지 않는다.
 - Pi 4/Pi 5: MIMO 8 convolution을 허용한다. 활성화 시 effective chunksize는 최소 1024다. 적용 후 실제 CPU load, XRUN, USB 안정성을 확인해야 하며 Pi 5도 실기 장시간 검증 전에는 무조건적인 성능 보장을 하지 않는다.
 
+Pi 5 메모리는 이 AudioDSP 전용이면 2 GB를 권장한다. 8경로 32768탭 float32 원본 계수는 합계 1 MiB이고 partition FFT/history/work buffer도 수십 MiB 규모라 실시간 DSP에 충분하다. 오프라인 MIMO 생성 코드도 920 MiB인 Pi 2 무음 fixture에서 실행된다. 4 GB는 다른 서버를 함께 운영하거나 큰 page cache를 원하는 경우의 선택 여유일 뿐이며, 8 GB 이상을 포함해 RAM 증설 자체는 이 DSP의 음질·latency를 개선하지 않는다. 실제 병목은 CPU와 USB/XRUN 안정성이므로 Pi 5 2 GB 실기 장시간 검증으로 확정한다.
+
 ## 의도적으로 하지 않는 것
 
 - 마이크를 상시 연결한 폐루프 feedback ANC
