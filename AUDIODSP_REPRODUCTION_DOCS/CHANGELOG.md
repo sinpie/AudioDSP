@@ -2,6 +2,10 @@
 
 ## 2026-08-18 · v1.2 유지보수 revision
 
+- 자동 room-EQ cut 포화가 bass/treble 사용자 선호도를 소거하던 문제를 수정하고, 명시적 house curve를 자동 제한 뒤 적용하며 두 correction 성분을 보고서에 분리
+- UMIK 장시간 녹음의 ALSA overrun을 성공으로 오인하지 않도록 `arecord --fatal-errors`를 적용해 해당 측정을 즉시 실패·재시도 대상으로 처리
+- 대역 제한 Woofer ESS의 10.8초 고조파/잡음 peak를 direct delay로 오인하던 문제를 발견해 0~250 ms 인과 gate, phase/decay fallback, 부분 상대지연 금지, `time_alignment_safe` 검사를 추가
+- 실측 한 세트로 모든 UI SISO 값을 one-factor-at-a-time 생성하는 67개 FIR matrix와 134개 저음량 합산 sweep 검증 도구 추가
 - 2026년까지의 MIMO/weighted pressure matching/excess-phase/공간 보간 연구 재검토와 채택·보류 근거 문서화
 - Pi4/5 MIMO Stereo/2.1/2.2, 2×4/8-path 32768탭 bank와 SISO 전이 구현
 - 주파수별 physical-output headroom 투영, 공통 인과 지연, 제어원 coherence·예측 비퇴행 검사 추가

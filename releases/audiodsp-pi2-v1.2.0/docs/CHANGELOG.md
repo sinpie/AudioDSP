@@ -2,6 +2,10 @@
 
 ## 2026-08-18 · v1.2 유지보수 revision
 
+- 자동 room-EQ cut 포화가 bass/treble 사용자 선호도를 소거하던 문제를 수정하고, 명시적 house curve를 자동 제한 뒤 적용하며 두 correction 성분을 보고서에 분리
+- UMIK 장시간 녹음의 ALSA overrun을 성공으로 오인하지 않도록 `arecord --fatal-errors`를 적용해 해당 측정을 즉시 실패·재시도 대상으로 처리
+- 대역 제한 Woofer ESS의 10.8초 고조파/잡음 peak를 direct delay로 오인하던 문제를 발견해 0~250 ms 인과 gate, phase/decay fallback, 부분 상대지연 금지, `time_alignment_safe` 검사를 추가
+- 실측 한 세트로 모든 UI SISO 값을 one-factor-at-a-time 생성하는 67개 FIR matrix와 134개 저음량 합산 sweep 검증 도구 추가
 - 백색소음/sweep 안전 기본값을 모두 -42 dBFS로 통일하고 독립 slider, 높은 출력 실시간 경고, 실제 sweep 전 수치 confirm 추가
 - Woofer SNR을 고정 전대역 대신 chirp-time 지속 -3 dB 통과대역과 pre/post noise PSD로 판정하고 순간 생활소음 confidence 적용
 - 첫 UMIK/ALSA cold-start가 고정 pre-roll을 소비해도 실제 sweep 활성구간과 capture delay를 자동 복구하고, 검출 구간 밖에서만 noise PSD를 계산하도록 수정

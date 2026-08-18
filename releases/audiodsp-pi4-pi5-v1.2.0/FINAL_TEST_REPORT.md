@@ -9,6 +9,14 @@ Web/engine deployment. The later user-authorized quiet paired acoustic A/B test
 intentionally stopped and restored it once; its final PID is 30454 and the active Speaker FIR remained SHA-256
 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`.
 
+The later complete fixed-microphone end-to-end run also passed on the connected
+Pi 2 using the shared SISO code: exactly one L+Woofer, one R+Woofer and one
+Woofer-only generation sweep; all 67 option variants and 134 FIR WAVs; 136/136
+usable acoustic validation captures; two successful low-SNR retries; and
+generated-FIR preview/apply/restore.  See
+`docs/FULL_OPTION_E2E_REPORT_20260818.md`.  Pi 5 2 GB is sufficient for the
+AudioDSP-only MIMO target; 4 GB is not required.
+
 ## Profile and Web matrix
 
 - 4096 states: 3968 valid, 128 expected errors.

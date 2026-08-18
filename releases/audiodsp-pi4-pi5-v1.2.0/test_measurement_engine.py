@@ -154,6 +154,8 @@ def main() -> int:
         engine = load_module("gsonic_measurement_test", args.engine)
 
         fft_test = engine.self_test()
+        engine_source = args.engine.read_text(encoding="utf-8")
+        require(engine_source.count('ARECORD, "-q", "--fatal-errors"') == 3, "UMIK captures do not fail closed on ALSA overrun")
         require(engine.DEFAULT_SWEEP_LEVEL_DBFS == -42 and engine.DEFAULT_NOISE_LEVEL_DBFS == -42, "night-safe default output is not -42 dBFS")
         require(fft_test["taps"] == 32_768 and fft_test["result"] == "PASS", "engine self-test failed")
         estimates = engine.platform_capabilities().get("offline_estimates_seconds", {})
@@ -228,6 +230,13 @@ def main() -> int:
         require(woofer_quality["subwoofer_passband"] is not None, "woofer adaptive -3 dB passband metadata is missing")
         require(full_quality["analysis_band_hz"] == [15.0, 22_000.0], "combined quality gate lost full-band analysis")
         require(woofer_quality["snr_db"] > full_quality["snr_db"] + 2.5, "subwoofer-only SNR still averages its silent high-frequency interval")
+
+        plausible_delay, plausible_details = engine.assess_bulk_delay(2_000, 1_048_576)
+        late_delay, late_details = engine.assess_bulk_delay(518_895, 1_048_576)
+        wrapped_delay, wrapped_details = engine.assess_bulk_delay(1_048_576 - 500, 1_048_576)
+        require(plausible_delay == 2_000 and plausible_details["reliable"], "plausible bulk delay was rejected")
+        require(late_delay == 0 and not late_details["reliable"], "late ESS artifact was accepted as acoustic delay")
+        require(wrapped_delay == 0 and not wrapped_details["reliable"], "negative wrapped peak was accepted as acoustic delay")
 
         # ALSA/USB cold-start latency can consume the nominal 400 ms capture
         # arm interval or add more than it.  Quality and later deconvolution
@@ -309,8 +318,11 @@ def main() -> int:
             graph = phase_state["result"]["graphs"][channel]
             require(graph and graph.get("target_db") and graph.get("spatial_std_db"), f"{channel} advanced graph data missing")
             require(graph.get("actual_correction_db") and graph.get("requested_correction_db"), f"{channel} actual FIR graph data missing")
+            require(graph.get("automatic_room_correction_db") and graph.get("preference_correction_db"), f"{channel} room/preference correction split is missing")
             require(graph.get("fir_implementation", {}).get("pass"), f"{channel} FIR implementation verification failed")
             require(graph.get("target_fit", {}).get("pass"), f"{channel} target-fit verification failed")
+        require(max(phase_state["result"]["graphs"]["woofer"]["preference_correction_db"]) > 0.5, "explicit bass preference was erased by automatic woofer cut limiting")
+        require(max(phase_state["result"]["graphs"]["woofer"]["correction_db"]) <= 1e-6, "explicit bass preference bypassed the Woofer cut-only safety policy")
         require(any(value < -0.1 for value in phase_state["result"]["graphs"]["woofer"]["decay_control_db"]), "long bass decay did not activate cut-only damping")
         require(phase_state["result"]["room_decay"]["policy"], "room decay policy metadata missing")
         alignment = phase_state["result"]["time_alignment"]

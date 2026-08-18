@@ -304,6 +304,11 @@ function Assert-FinalBundle {
         'recover_interrupted_worker',
         'offline_estimates_seconds',
         'fir_energy_delay',
+        'MAX_PLAUSIBLE_BULK_DELAY_SAMPLES',
+        'time_alignment_safe',
+        'automatic_room_correction_db',
+        'preference_correction_db',
+        '--fatal-errors',
         'audiodsp_announce',
         'install-pair',
         'MIMO_MODES'

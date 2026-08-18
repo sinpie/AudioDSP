@@ -38,9 +38,12 @@ print('profile='+s['resolved']['effective_profile'])
 print('chunksize='+str(s['settings']['chunksize']))
 print('speaker_fir_sha256='+f['sha256'])
 PY
-curl -fsS http://127.0.0.1:8080/ | grep -q 'AudioDSP'
-curl -fsS http://127.0.0.1:8080/measure | grep -q 'non_destructive_step_navigation'
-curl -fsS http://127.0.0.1:8080/settings | grep -q '/api/backup/download'
+curl -fsS http://127.0.0.1:8080/ -o /tmp/audiodsp-verify-home.html
+curl -fsS http://127.0.0.1:8080/measure -o /tmp/audiodsp-verify-measure.html
+curl -fsS http://127.0.0.1:8080/settings -o /tmp/audiodsp-verify-settings.html
+grep -q 'AudioDSP' /tmp/audiodsp-verify-home.html
+grep -q 'non_destructive_step_navigation' /tmp/audiodsp-verify-measure.html
+grep -q '/api/backup/download' /tmp/audiodsp-verify-settings.html
 curl -fsS http://127.0.0.1:8080/api/health >/tmp/audiodsp-verify-health.json
 python3 - <<'PY'
 import json

@@ -45,3 +45,5 @@ AudioDSP uses these publications and primary technical sources as design referen
 ## Validation
 
 Run the matching writer with `-ValidateOnly -NoPause` before writing media. The repository also contains exhaustive isolated profile/Web tests and synthetic measurement-engine tests. Actual acoustic acceptance testing must be performed with UMIK-1 at 90° in the intended listening area and requires explicit permission before AudioDSP emits measurement sound.
+
+For a user-authorized full SISO option audit, `diagnostics/run_full_option_matrix.py` generates the baseline plus every selectable value one axis at a time (67 Front/Woofer FIR pairs). `diagnostics/build_option_validation_sequence.py` streams those exact 32768-tap convolutions into one low-level four-channel WAV, `diagnostics/capture_option_validation.py` records it through the production DSP-bypass/U7-input-off path, and `diagnostics/analyze_option_validation.py` reports every L/R sweep, before/after target error, SNR, transient contamination and option-family monotonicity. This is explicit value coverage, not the multi-million-member Cartesian product of every simultaneous combination.

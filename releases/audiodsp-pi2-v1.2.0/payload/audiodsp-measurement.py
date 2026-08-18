@@ -98,6 +98,7 @@ TARGET_FILES = {
 }
 PHASE_CUTOFFS = (80, 120, 160, 200, 250)
 MAX_PHASE_SHIFT = 2048
+MAX_PLAUSIBLE_BULK_DELAY_SAMPLES = RATE // 4
 DEFAULT_CORRECTION_PREFERENCES = {
     "target": "harman",
     "preset": "strong",
@@ -736,7 +737,7 @@ def run_direct_capture_batch(
                 item_base = progress_base + item_span * index
                 capture_seconds = max(2, math.ceil(output.stat().st_size / (RATE * 12) + 1.0))
                 capture = subprocess.Popen([
-                    ARECORD, "-q", "-D", CAPTURE_DEVICE, "-t", "wav", "-f", "S24_3LE",
+                    ARECORD, "-q", "--fatal-errors", "-D", CAPTURE_DEVICE, "-t", "wav", "-f", "S24_3LE",
                     "-r", str(RATE), "-c", "1", "-d", str(capture_seconds), str(recorded),
                 ])
                 active_processes = [capture]
@@ -795,7 +796,7 @@ def run_level_sequence(noise: Path, silence_recorded: Path, noise_recorded: Path
             subprocess.run([AMIXER, "-D", "hw:U7", "set", "Line", "nocap"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             update_current(dsp_mode="direct_bypass", u7_input="off", stage="1/2 · 무음 5초 · 배경소음 측정 중", progress=5.0, eta_seconds=11)
             silence = subprocess.Popen([
-                ARECORD, "-q", "-D", CAPTURE_DEVICE, "-t", "wav", "-f", "S24_3LE",
+                ARECORD, "-q", "--fatal-errors", "-D", CAPTURE_DEVICE, "-t", "wav", "-f", "S24_3LE",
                 "-r", str(RATE), "-c", "1", "-d", "5", str(silence_recorded),
             ])
             processes = [silence]
@@ -806,7 +807,7 @@ def run_level_sequence(noise: Path, silence_recorded: Path, noise_recorded: Path
 
             update_current(stage="2/2 · 백색소음 5초 · 신호 레벨 측정 중", progress=45.0, eta_seconds=6)
             capture = subprocess.Popen([
-                ARECORD, "-q", "-D", CAPTURE_DEVICE, "-t", "wav", "-f", "S24_3LE",
+                ARECORD, "-q", "--fatal-errors", "-D", CAPTURE_DEVICE, "-t", "wav", "-f", "S24_3LE",
                 "-r", str(RATE), "-c", "1", "-d", "6", str(noise_recorded),
             ])
             processes = [capture]
@@ -1308,6 +1309,22 @@ def frequency_noise_metrics(
     }
 
 
+def assess_bulk_delay(raw_peak_index: int, fft_length: int) -> tuple[int, dict[str, Any]]:
+    """Reject non-causal/implausibly late ESS peaks before phase correction."""
+    signed_peak_index = raw_peak_index - fft_length if raw_peak_index > fft_length // 2 else raw_peak_index
+    reliable = 0 <= signed_peak_index <= MAX_PLAUSIBLE_BULK_DELAY_SAMPLES
+    details = {
+        "reliable": reliable,
+        "raw_peak_index": raw_peak_index,
+        "signed_peak_samples": signed_peak_index,
+        "plausible_range_samples": [0, MAX_PLAUSIBLE_BULK_DELAY_SAMPLES],
+        "plausible_range_ms": [0.0, round(MAX_PLAUSIBLE_BULK_DELAY_SAMPLES * 1000.0 / RATE, 3)],
+        "method": "global deconvolved-impulse peak with a causal 250 ms device/acoustic plausibility gate",
+        "reason": None if reliable else "global impulse peak is outside the causal 0-250 ms window; phase, decay and Front/Woofer delay correction are disabled",
+    }
+    return (signed_peak_index if reliable else 0), details
+
+
 def response_from_recording(
     recorded: Path,
     reference: list[float],
@@ -1344,11 +1361,32 @@ def response_from_recording(
         h.append(output_value * input_value.conjugate() / (power + regularization))
     impulse = fft.irfft(h, length)
     raw_peak_index = max(range(length), key=lambda index: abs(impulse[index]))
-    decay = room_decay_metrics(impulse, raw_peak_index, fft)
-    temporal = temporal_room_metrics(impulse, raw_peak_index)
-    peak_index = raw_peak_index
-    if peak_index > length // 2:
-        peak_index -= length
+    peak_index, bulk_delay = assess_bulk_delay(raw_peak_index, length)
+    bulk_delay_reliable = bool(bulk_delay["reliable"])
+    # ESS harmonic products and low-frequency noise can dominate the global
+    # deconvolution peak of a bandwidth-limited subwoofer many seconds after
+    # the direct response.  Never turn that artifact into a physical delay or
+    # a room-decay correction.  Magnitude remains usable through its separate
+    # passband/SNR confidence gate.
+    if bulk_delay_reliable:
+        decay = room_decay_metrics(impulse, raw_peak_index, fft)
+        temporal = temporal_room_metrics(impulse, raw_peak_index)
+    else:
+        decay = {
+            "analysis_window_s": None,
+            "bands": [],
+            "correction_policy": "disabled because the direct impulse peak is not reliable",
+            "median_t20_rt60_s": None,
+            "method": "not evaluated",
+            "reliable_band_count": 0,
+            "reason": bulk_delay["reason"],
+        }
+        temporal = {
+            "reliable": False,
+            "classification": "insufficient_data",
+            "method": "not evaluated",
+            "reason": bulk_delay["reason"],
+        }
     frequencies = [20.0 * (1000.0 ** (index / 511.0)) for index in range(512)]
     frequency_noise = frequency_noise_metrics(
         samples,
@@ -1386,13 +1424,21 @@ def response_from_recording(
         while phases[index] - phases[index - 1] < -math.pi:
             phases[index] += 2.0 * math.pi
     smoothed = variable_smooth(frequencies, levels)
-    group_delay = group_delay_metrics(frequencies, phases)
+    group_delay = group_delay_metrics(frequencies, phases) if bulk_delay_reliable else {
+        "reliable": False,
+        "classification": "insufficient_data",
+        "frequency_range_hz": [20, 300],
+        "method": "not evaluated",
+        "reason": bulk_delay["reason"],
+    }
     return {
         "frequencies": [round(value, 3) for value in frequencies],
         "db": [round(value, 4) for value in smoothed],
         "phase_rad": [round(value, 7) for value in phases],
         "bulk_delay_samples": peak_index,
         "bulk_delay_ms": round(peak_index * 1000.0 / RATE, 3),
+        "bulk_delay_reliable": bulk_delay_reliable,
+        "bulk_delay": bulk_delay,
         "peak_dbfs": round(20.0 * math.log10(max(peak, 1.0e-15)), 2),
         "rms_dbfs": round(20.0 * math.log10(max(rms, 1.0e-15)), 2),
         "capture_bits": bits,
@@ -2546,6 +2592,11 @@ def load_average_response(directory: Path, source: str, spatial_mode: str = "equ
         "frequency_confidence": aggregate_confidence,
         "center_phase_rad": responses[0].get("phase_rad"),
         "center_bulk_delay_samples": responses[0].get("bulk_delay_samples", 0),
+        "center_bulk_delay_reliable": bool(responses[0].get(
+            "bulk_delay_reliable",
+            responses[0].get("bulk_delay", {}).get("reliable", True),
+        )),
+        "center_bulk_delay": responses[0].get("bulk_delay"),
         "spatial_mode": spatial_mode,
         "position_weights": ("equal 1/3 each" if spatial_mode == "equal" else "frequency-dependent: center 1/3 below 200 Hz to 0.60 above 2 kHz") + "; multiplied by per-position noise confidence",
         "smoothing": smoothing_name,
@@ -2639,6 +2690,7 @@ def finalize_graph_with_fir(graph: dict[str, Any], impulse: list[float], fft: FF
 def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_db: list[float], measured_phase: list[float] | None, target_name: str, preset: str, *, woofer: bool, woofer_trim_db: int, phase_mode: str, phase_cutoff: int, spatial_mode: str = "equal", bass_tilt_db: int = 0, treble_tilt_db: int = 0, correction_low_hz: int = 20, correction_high_hz: int = 20_000, max_boost_db: int = 6, max_cut_db: int = 18, decay_frequency_hz: list[float] | None = None, decay_t20_rt60_s: list[float] | None = None, shared_reference_measure_db: float | None = None, shared_reference_target_db: float | None = None, frequency_confidence: list[float] | None = None, fft: FFTBackend) -> tuple[list[float], dict[str, Any]]:
     target_f, target_db = target_curve(target_name)
     reference_band = (50, 120) if woofer else (500, 2000)
+    target_reference_band = (500, 2000) if shared_reference_target_db is not None else reference_band
     local_reference_measure = statistics.median(value for frequency, value in zip(measure_f, measure_db) if reference_band[0] <= frequency <= reference_band[1])
     local_reference_target = statistics.median(
         interpolate_log(target_f, target_db, frequency) + preference_modifier_db(frequency, bass_tilt_db, treble_tilt_db)
@@ -2649,6 +2701,12 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         raise MeasurementError("공통 음압 기준은 측정값과 타겟값을 함께 제공해야 합니다.")
     reference_measure = local_reference_measure if shared_reference_measure_db is None else float(shared_reference_measure_db)
     reference_target = local_reference_target if shared_reference_target_db is None else float(shared_reference_target_db)
+    reference_preference = statistics.median(
+        preference_modifier_db(frequency, bass_tilt_db, treble_tilt_db)
+        for frequency in measure_f
+        if target_reference_band[0] <= frequency <= target_reference_band[1]
+    )
+    reference_target_without_preference = reference_target - reference_preference
     natural_low, natural_high = natural_usable_band(measure_f, measure_db, reference_measure)
     fft_length = TAPS * 2
     gains: list[float] = []
@@ -2660,6 +2718,8 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
     graph_target: list[float] = []
     graph_effective_target: list[float] = []
     graph_correction: list[float] = []
+    graph_automatic_room_correction: list[float] = []
+    graph_preference_correction: list[float] = []
     graph_decay: list[float | None] = []
     graph_decay_cut: list[float] = []
     woofer_target_cut: list[float] = []
@@ -2671,14 +2731,23 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         variation = interpolate_log(measure_f, spatial_std_db, max(measure_f[0], min(measure_f[-1], safe_frequency)))
         noise_confidence = interpolate_log(measure_f, frequency_confidence, max(measure_f[0], min(measure_f[-1], safe_frequency))) if frequency_confidence else 1.0
         noise_confidence = max(0.0, min(1.0, noise_confidence))
-        target_value = interpolate_log(target_f, target_db, max(target_f[0], min(target_f[-1], safe_frequency))) + preference_modifier_db(safe_frequency, bass_tilt_db, treble_tilt_db) - reference_target
+        target_without_preference = interpolate_log(target_f, target_db, max(target_f[0], min(target_f[-1], safe_frequency))) - reference_target_without_preference
         window = correction_window(safe_frequency, correction_low_hz, correction_high_hz)
+        # Keep explicit user tone controls outside the automatic room-EQ
+        # limiter.  Otherwise a large woofer excess that saturates max_cut_db
+        # silently erases every bass-tilt choice.  The preference is still
+        # smoothly windowed, reference-normalized and included in the same
+        # peak-normalized FIR; it cannot create digital clipping.
+        preference_correction = (
+            preference_modifier_db(safe_frequency, bass_tilt_db, treble_tilt_db) - reference_preference
+        ) * window
+        target_value = target_without_preference + preference_correction
         if woofer:
-            correction = max(-float(max_cut_db), min(0.0, target_value - measured)) * window * noise_confidence if 20.0 <= frequency <= 180.0 else 0.0
+            correction = max(-float(max_cut_db), min(0.0, target_without_preference - measured)) * window * noise_confidence if 20.0 <= frequency <= 180.0 else 0.0
             if 40.0 <= frequency <= 120.0:
                 woofer_target_cut.append(correction)
         else:
-            raw_correction = (target_value - measured) * window * noise_confidence
+            raw_correction = (target_without_preference - measured) * window * noise_confidence
             if raw_correction > 0.0:
                 # Deep, position-dependent nulls are not safely invertible. This is the
                 # spatial regularization term: a 3 dB position spread halves the boost.
@@ -2702,10 +2771,13 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
             if correction < 0.0 and decay_value > preferred_decay:
                 decay_cut = min(3.0, (decay_value - preferred_decay) * 5.0) * window
                 correction -= decay_cut
+        automatic_room_correction = correction
+        correction += preference_correction
         if woofer or frequency <= 350.0:
             correction += modifier
         if woofer:
             correction += woofer_trim_db
+            correction = min(0.0, correction)
         gains.append(correction)
         if index > 0 and (not graph_frequency or frequency / graph_frequency[-1] >= 1.025) and frequency <= 20_000:
             graph_frequency.append(round(frequency, 2))
@@ -2717,6 +2789,8 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
             graph_effective_target.append(round(target_value + (modifier if woofer or frequency <= 350.0 else 0.0) - decay_cut + (woofer_trim_db if woofer else 0), 3))
             graph_decay.append(round(decay_value, 3) if decay_value is not None else None)
             graph_decay_cut.append(round(-decay_cut, 3))
+            graph_automatic_room_correction.append(round(automatic_room_correction, 3))
+            graph_preference_correction.append(round(preference_correction, 3))
             graph_correction.append(round(correction, 3))
     impulse = minimum_phase_fir(gains, fft, fft_length)
     phase_details = {"method": "minimum phase magnitude only", "causality_shift_samples": 0, "causality_shift_ms": 0.0}
@@ -2730,11 +2804,13 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         "measurement_confidence": graph_confidence,
         "target_db": graph_target,
         "effective_target_db": graph_effective_target,
+        "automatic_room_correction_db": graph_automatic_room_correction,
+        "preference_correction_db": graph_preference_correction,
         "correction_db": graph_correction,
         "decay_t20_rt60_s": graph_decay,
         "decay_control_db": graph_decay_cut,
         "phase": phase_details,
-        "regularization": "3-position weighted dB prototype; pre/post noise confidence; variable perceptual smoothing; variance-weighted soft boost; natural-rolloff boost guard",
+        "regularization": "3-position weighted dB prototype; pre/post noise confidence; variable perceptual smoothing; variance-weighted soft boost; natural-rolloff boost guard; explicit tone preference after automatic room-EQ limiting",
         "reference_band_hz": list(reference_band),
         "level_reference": "shared Front L/R 500-2000 Hz" if shared_reference_measure_db is not None else f"local {reference_band[0]}-{reference_band[1]} Hz",
         "reference_measure_db": round(reference_measure, 3),
@@ -2914,7 +2990,11 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     left_ir, left_graph = design_channel(left_f, left_db, left_response["spatial_std_db"], left_response["center_phase_rad"], target_name, preset, woofer=False, woofer_trim_db=0, phase_mode=front_design_phase_mode, phase_cutoff=phase_cutoff, decay_frequency_hz=left_response["decay_frequency_hz"], decay_t20_rt60_s=left_response["decay_t20_rt60_s"], frequency_confidence=left_response["frequency_confidence"], **common)
     update_current(stage="Right 32768탭 최소위상 FIR 계산", progress=50.0, eta_seconds=round(build_eta * 0.52))
     right_ir, right_graph = design_channel(right_f, right_db, right_response["spatial_std_db"], right_response["center_phase_rad"], target_name, preset, woofer=False, woofer_trim_db=0, phase_mode=front_design_phase_mode, phase_cutoff=phase_cutoff, decay_frequency_hz=right_response["decay_frequency_hz"], decay_t20_rt60_s=right_response["decay_t20_rt60_s"], frequency_confidence=right_response["frequency_confidence"], **common)
-    if phase_mode == "bass":
+    front_phase_reliable = bool(
+        left_response.get("center_bulk_delay_reliable", True)
+        and right_response.get("center_bulk_delay_reliable", True)
+    )
+    if phase_mode == "bass" and front_phase_reliable:
         update_current(stage="L/R 공통 저역 phase · 동일 지연 안전 투영", progress=62.0, eta_seconds=round(build_eta * 0.40))
         left_ir, right_ir, common_phase_details = apply_common_lr_low_frequency_phase(
             left_ir,
@@ -2931,6 +3011,15 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         right_graph["phase"] = {**common_phase_details, "channel": "right"}
         left_graph = finalize_graph_with_fir(left_graph, left_ir, fft)
         right_graph = finalize_graph_with_fir(right_graph, right_ir, fft)
+    elif phase_mode == "bass":
+        phase_fallback = {
+            "requested_mode": "bass",
+            "effective_mode": "magnitude",
+            "enabled": False,
+            "reason": "L/R direct impulse delay is not reliable; common excess-phase correction was disabled",
+        }
+        left_graph["phase"] = {**phase_fallback, "channel": "left"}
+        right_graph["phase"] = {**phase_fallback, "channel": "right"}
     front = directory / "Generated_Front_LR_32768.wav"
     rear = None
     rear_graph = None
@@ -2939,10 +3028,12 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         update_current(stage="Woofer 32768탭 FIR 계산", progress=72.0, eta_seconds=round(build_eta * 0.30))
         woofer_response = load_average_response(directory, "woofer", spatial_mode)
         woofer_f, woofer_db = woofer_response["frequencies"], woofer_response["average_db"]
+        woofer_phase_reliable = bool(woofer_response.get("center_bulk_delay_reliable", True))
+        woofer_phase_mode = phase_mode if woofer_phase_reliable else "magnitude"
         woofer_ir, rear_graph = design_channel(
             woofer_f, woofer_db, woofer_response["spatial_std_db"], woofer_response["center_phase_rad"],
             target_name, preset, woofer=True, woofer_trim_db=woofer_trim_db,
-            phase_mode=phase_mode, phase_cutoff=phase_cutoff,
+            phase_mode=woofer_phase_mode, phase_cutoff=phase_cutoff,
             decay_frequency_hz=woofer_response["decay_frequency_hz"],
             decay_t20_rt60_s=woofer_response["decay_t20_rt60_s"],
             frequency_confidence=woofer_response["frequency_confidence"],
@@ -2950,53 +3041,94 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             shared_reference_target_db=shared_target_reference_db,
             **common,
         )
+        if phase_mode == "bass" and not woofer_phase_reliable:
+            rear_graph["phase"] = {
+                "requested_mode": "bass",
+                "effective_mode": "magnitude",
+                "enabled": False,
+                "reason": "Woofer direct impulse delay is not reliable; Woofer excess-phase correction was disabled",
+                "bulk_delay": woofer_response.get("center_bulk_delay"),
+            }
         rear_channels = [woofer_ir, woofer_ir]
     decay_summary = {
         "left": dict(zip(left_response["decay_frequency_hz"], left_response["decay_t20_rt60_s"])),
         "right": dict(zip(right_response["decay_frequency_hz"], right_response["decay_t20_rt60_s"])),
         "woofer": dict(zip(woofer_response["decay_frequency_hz"], woofer_response["decay_t20_rt60_s"])) if state["mode"] == "lrw" else None,
     }
-    time_alignment = {"enabled": False, "front_delay_samples": 0, "rear_delay_samples": 0}
+    time_alignment = {
+        "requested": state["mode"] == "lrw" and phase_mode == "bass",
+        "enabled": False,
+        "aligned": None,
+        "front_delay_samples": 0,
+        "rear_delay_samples": 0,
+    }
     if state["mode"] == "lrw" and phase_mode == "bass" and rear_channels is not None:
-        front_acoustic = round(statistics.median((left_response["center_bulk_delay_samples"], right_response["center_bulk_delay_samples"])))
-        rear_acoustic = int(woofer_response["center_bulk_delay_samples"])
-        front_filter = round(statistics.median((fir_energy_delay(left_ir), fir_energy_delay(right_ir))))
-        rear_filter = round(statistics.median((fir_energy_delay(rear_channels[0]), fir_energy_delay(rear_channels[1]))))
-        front_total = front_acoustic + front_filter
-        rear_total = rear_acoustic + rear_filter
-        target_delay = max(front_total, rear_total)
-        # The later FIR path already determines system latency. Delaying only the
-        # earlier path up to the full phase+acoustic budget restores crossover
-        # coherence without increasing the latest output's latency.
         alignment_limit = MAX_PHASE_SHIFT + 960
-        front_delay = min(alignment_limit, max(0, target_delay - front_total))
-        rear_delay = min(alignment_limit, max(0, target_delay - rear_total))
-        left_ir = delay_fir(left_ir, front_delay)
-        right_ir = delay_fir(right_ir, front_delay)
-        rear_channels = [delay_fir(rear_channels[0], rear_delay), delay_fir(rear_channels[1], rear_delay)]
-        aligned_front_total = front_total + front_delay
-        aligned_rear_total = rear_total + rear_delay
-        time_alignment = {
-            "enabled": True,
-            "front_acoustic_delay_samples": front_acoustic,
-            "rear_acoustic_delay_samples": rear_acoustic,
-            "front_fir_energy_delay_samples": front_filter,
-            "rear_fir_energy_delay_samples": rear_filter,
-            "front_total_before_alignment_samples": front_total,
-            "rear_total_before_alignment_samples": rear_total,
-            "front_delay_samples": front_delay,
-            "rear_delay_samples": rear_delay,
-            "front_delay_ms": round(front_delay * 1000.0 / RATE, 3),
-            "rear_delay_ms": round(rear_delay * 1000.0 / RATE, 3),
-            "residual_total_delay_samples": abs(aligned_front_total - aligned_rear_total),
-            "aligned": aligned_front_total == aligned_rear_total,
-            "limit_samples": alignment_limit,
-            "limit_ms": round(alignment_limit * 1000.0 / RATE, 3),
-            "method": "center acoustic bulk delay plus FIR energy-median delay",
-        }
-        left_graph = finalize_graph_with_fir(left_graph, left_ir, fft)
-        right_graph = finalize_graph_with_fir(right_graph, right_ir, fft)
-        rear_graph = finalize_graph_with_fir(rear_graph, rear_channels[0], fft)
+        alignment_reliable = bool(front_phase_reliable and woofer_response.get("center_bulk_delay_reliable", True))
+        if not alignment_reliable:
+            time_alignment.update({
+                "reliable": False,
+                "reason": "Front/Woofer direct impulse delay is not reliable; no relative delay was applied",
+                "front_bulk_delay_reliable": front_phase_reliable,
+                "rear_bulk_delay_reliable": bool(woofer_response.get("center_bulk_delay_reliable", True)),
+                "rear_bulk_delay": woofer_response.get("center_bulk_delay"),
+                "limit_samples": alignment_limit,
+                "limit_ms": round(alignment_limit * 1000.0 / RATE, 3),
+            })
+        else:
+            front_acoustic = round(statistics.median((left_response["center_bulk_delay_samples"], right_response["center_bulk_delay_samples"])))
+            rear_acoustic = int(woofer_response["center_bulk_delay_samples"])
+            front_filter = round(statistics.median((fir_energy_delay(left_ir), fir_energy_delay(right_ir))))
+            rear_filter = round(statistics.median((fir_energy_delay(rear_channels[0]), fir_energy_delay(rear_channels[1]))))
+            front_total = front_acoustic + front_filter
+            rear_total = rear_acoustic + rear_filter
+            required_delay = abs(front_total - rear_total)
+            if required_delay > alignment_limit:
+                time_alignment.update({
+                    "reliable": True,
+                    "reason": "required relative delay exceeds the causal safety limit; no partial delay was applied",
+                    "front_acoustic_delay_samples": front_acoustic,
+                    "rear_acoustic_delay_samples": rear_acoustic,
+                    "front_fir_energy_delay_samples": front_filter,
+                    "rear_fir_energy_delay_samples": rear_filter,
+                    "front_total_before_alignment_samples": front_total,
+                    "rear_total_before_alignment_samples": rear_total,
+                    "required_delay_samples": required_delay,
+                    "limit_samples": alignment_limit,
+                    "limit_ms": round(alignment_limit * 1000.0 / RATE, 3),
+                })
+            else:
+                target_delay = max(front_total, rear_total)
+                front_delay = max(0, target_delay - front_total)
+                rear_delay = max(0, target_delay - rear_total)
+                left_ir = delay_fir(left_ir, front_delay)
+                right_ir = delay_fir(right_ir, front_delay)
+                rear_channels = [delay_fir(rear_channels[0], rear_delay), delay_fir(rear_channels[1], rear_delay)]
+                aligned_front_total = front_total + front_delay
+                aligned_rear_total = rear_total + rear_delay
+                time_alignment = {
+                    "requested": True,
+                    "enabled": True,
+                    "reliable": True,
+                    "front_acoustic_delay_samples": front_acoustic,
+                    "rear_acoustic_delay_samples": rear_acoustic,
+                    "front_fir_energy_delay_samples": front_filter,
+                    "rear_fir_energy_delay_samples": rear_filter,
+                    "front_total_before_alignment_samples": front_total,
+                    "rear_total_before_alignment_samples": rear_total,
+                    "front_delay_samples": front_delay,
+                    "rear_delay_samples": rear_delay,
+                    "front_delay_ms": round(front_delay * 1000.0 / RATE, 3),
+                    "rear_delay_ms": round(rear_delay * 1000.0 / RATE, 3),
+                    "residual_total_delay_samples": abs(aligned_front_total - aligned_rear_total),
+                    "aligned": aligned_front_total == aligned_rear_total,
+                    "limit_samples": alignment_limit,
+                    "limit_ms": round(alignment_limit * 1000.0 / RATE, 3),
+                    "method": "center acoustic bulk delay plus FIR energy-median delay",
+                }
+                left_graph = finalize_graph_with_fir(left_graph, left_ir, fft)
+                right_graph = finalize_graph_with_fir(right_graph, right_ir, fft)
+                rear_graph = finalize_graph_with_fir(rear_graph, rear_channels[0], fft)
     if state["mode"] == "lr":
         # The shared-filter topology convolves once, then copies to Rear with a
         # mixer trim. Creating a scaled Rear WAV here would waste two Conv paths
@@ -3050,6 +3182,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         "fir_matches_design": all(
             item is None or item["pass"] for item in implementation.values()
         ),
+        "time_alignment_safe": not time_alignment.get("enabled") or bool(time_alignment.get("aligned")),
     }
     diagnostics = {
         "lr_median_difference_db": round(statistics.median(lr_differences), 2) if lr_differences else None,
@@ -3067,6 +3200,8 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         diagnostics["warnings"].append("일부 sweep SNR이 권장 15 dB보다 낮습니다. 실제 측정에서는 레벨 또는 sweep 시간을 올리세요.")
     if not all(item is None or item["pass"] for item in target_fit.values()):
         diagnostics["warnings"].append("안전 제한 때문에 일부 채널이 선택 타겟을 허용 오차 안에서 완전히 달성하지 못했습니다.")
+    if time_alignment.get("requested") and not time_alignment.get("enabled"):
+        diagnostics["warnings"].append(f"Front/Woofer 시간 정렬 미적용: {time_alignment.get('reason', '신뢰도 부족')}")
     long_bass_decay = [
         value for channels in decay_summary.values() if isinstance(channels, dict)
         for frequency, value in channels.items() if float(frequency) <= 125.0 and value > 0.70

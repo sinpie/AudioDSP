@@ -28,7 +28,7 @@
 - sweep 길이: UI 4/8/12초, engine 허용값 2~14초 짝수
 - 각 녹음과 알려진 reference를 FFT하고 `Y·conj(X)/(abs(X)^2 + λ)` 형태로 deconvolution한다.
 - `λ`는 reference 최대 power의 `1e-9`로 설정한다.
-- bulk acoustic/device delay는 impulse peak에서 구하고, magnitude와 delay 제거 후 phase를 20 Hz~20 kHz의 512개 log 지점에 저장한다.
+- bulk acoustic/device delay는 impulse peak에서 구하되 인과적인 0~250 ms 구간 안의 peak만 direct 응답으로 인정한다. 대역 제한 Woofer의 ESS 고조파·잡음 peak가 이 범위를 벗어나면 magnitude는 별도 SNR/통과대역 gate로 계속 사용하고 phase·decay·group delay·Front/Woofer 시간 정렬은 비활성화한다.
 - UMIK calibration magnitude를 log-frequency 보간해 적용한다.
 - ALSA/USB cold-start가 nominal 400 ms 준비 시간을 소비해도 50 ms AC-RMS envelope에서 실제 sweep 길이의 최대에너지 구간을 찾는다. 최대값의 0.5% 안에서는 nominal timing을 우선해 대역 제한 Woofer의 무음 고역 때문에 시작점이 밀리지 않게 하며, 검출한 capture delay를 deconvolution과 noise window에 함께 사용한다.
 - 각 녹음의 검출된 sweep 전/후 noise PSD와 sweep 활성 구간으로 주파수별 SNR·신뢰도를 계산한다. Woofer는 chirp-time 에너지의 지속 -3 dB 통과대역을 자동 검출하고 실패할 때만 15~300 Hz로 되돌아간다. 6 dB 미만은 필터 생성을 막고, 15 dB 미만은 결과에 경고한다. 100 ms envelope 이상치는 생활소음 가능성으로 표시하지만 원본 impulse와 잔향을 잘라내지 않는다.
@@ -62,6 +62,8 @@ late reverberation을 FIR로 역보정하지 않는다. 다지점에서 신뢰 �
 
 파일은 `/usr/local/share/audiodsp/targets/target_*.txt`에 있고 API는 1 kHz 기준 곡선을 반환한다. 사용자는 bass tilt -6~+6 dB@20 Hz, treble tilt -6~+2 dB@20 kHz를 부드러운 house curve로 더할 수 있다.
 
+Bass/treble tilt는 자동 룸 EQ의 boost/cut 제한을 계산한 뒤 별도의 명시적 house-curve 성분으로 더한다. 따라서 큰 Woofer 과출력으로 자동 cut이 포화되어도 사용자의 음색 선택이 사라지지 않는다. 이 성분도 correction window와 기준 대역 정규화를 따르고, 동일한 FIR peak 정규화 안에 포함된다. Woofer의 최종 correction은 여전히 0 dB 이하로 clamp해 선호도 때문에 자동 boost가 생기지 않는다. 결과 JSON은 `automatic_room_correction_db`와 `preference_correction_db`를 분리해 보여준다.
+
 우퍼 억제 preset:
 
 - `none`: 추가 저역 억제 없음
@@ -86,7 +88,7 @@ Preset은 boost를 만들지 않으며 Front에는 350 Hz 이하, Woofer에는 �
 
 기본 magnitude 설계는 minimum phase다. `bass` 모드는 중앙 위치의 측정 phase에서 minimum-phase 성분을 빼 excess phase를 구하고 지정 cutoff 80/120/160/200/250 Hz 아래에서만 보정한다. cutoff 전이는 cosine window이며 causality를 위한 shift는 최대 2048 samples로 제한한다. impulse 끝 10%는 fade한다.
 
-L/R/Woofer 모드에서는 중앙 위치 Front L/R의 음향 bulk delay뿐 아니라 생성된 Front/Rear FIR의 에너지 중앙 지연까지 더한 전체 재생 지연을 비교한다. 더 빠른 쪽에만 최대 3008 samples(약 62.7 ms) 안에서 지연을 넣고 최종 잔차를 기록한다. L/R은 같은 phase·강도·상대 지연을 사용하며, dense FFT에서 magnitude 잔차가 0.75 dB를 넘으면 phase 강도를 축소하고 10% 미만이면 자동 해제한다. Woofer 한 개를 Rear L/R 두 채널에 같은 FIR로 복사하므로 T5S의 stereo 입력 케이블을 그대로 쓸 수 있다.
+L/R/Woofer 모드에서는 신뢰 가능한 중앙 위치 Front L/R 음향 bulk delay뿐 아니라 생성된 Front/Rear FIR의 에너지 중앙 지연까지 더한 전체 재생 지연을 비교한다. 필요한 상대 지연이 최대 3008 samples(약 62.7 ms) 안일 때만 더 빠른 쪽을 완전히 맞춘다. direct peak가 신뢰 불가하거나 필요한 지연이 한계를 넘으면 부분 지연도 넣지 않고 이유를 결과에 기록한다. L/R은 같은 phase·강도·상대 지연을 사용하며, dense FFT에서 magnitude 잔차가 0.75 dB를 넘으면 phase 강도를 축소하고 10% 미만이면 자동 해제한다. Woofer 한 개를 Rear L/R 두 채널에 같은 FIR로 복사하므로 T5S의 stereo 입력 케이블을 그대로 쓸 수 있다.
 
 Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니다. 위치별로 달라지는 고역 phase는 보정하지 않고, 시간적으로 비교적 일관된 저역과 source 정렬에만 제한한다.
 
@@ -96,7 +98,7 @@ Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니�
 - `Generated_Rear_LR_32768.wav`: Woofer FIR을 L/R 동일 복사하거나, L/R 모드에서 Front 복사본에 woofer trim을 bake한 stereo float32
 - 둘 다 정확히 48 kHz, 32768 frames
 - 결과 JSON에는 전/후 예상, effective target, 공간편차, requested/actual correction, octave decay, natural band, guarded bin, phase shift, impulse peak/energy, SHA-256가 포함된다.
-- 생성 뒤 실제 32768탭 WAV를 다시 FFT해 설계 잔차, target-fit MAE/P90, 최대 전달 이득, 유한값, impulse 위치를 `self_validation`으로 검증한다. 그래프의 예상 후 곡선도 설계 배열이 아니라 실제 FIR FFT 기준이다.
+- 생성 뒤 실제 32768탭 WAV를 다시 FFT해 설계 잔차, target-fit MAE/P90, 최대 전달 이득, 유한값, impulse 위치와 시간 정렬 안전성을 `self_validation`으로 검증한다. 그래프의 예상 후 곡선도 설계 배열이 아니라 실제 FIR FFT 기준이다.
 
 브라우저 다운로드와 그래프 확인은 playback을 바꾸지 않는다. Preview는 runtime config만 임시 교체하며 profile WAV/settings는 그대로다. Apply에서 기존 파일을 백업한 뒤 정식 WAV를 교체한다.
 
