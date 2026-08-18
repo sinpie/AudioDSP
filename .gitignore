@@ -3,6 +3,9 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/diagnostics/
+/diagnostics/*
+!/diagnostics/refine_tonal_fir.py
 !/AUDIODSP_REPRODUCTION_DOCS/
 !/AUDIODSP_REPRODUCTION_DOCS/**
 !/releases/

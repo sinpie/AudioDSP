@@ -27,6 +27,8 @@ Start with [the reproduction documentation](AUDIODSP_REPRODUCTION_DOCS/README.md
 
 The latest silent regression records are [SILENT_CALIBRATION_SELF_VALIDATION_20260818.md](AUDIODSP_REPRODUCTION_DOCS/SILENT_CALIBRATION_SELF_VALIDATION_20260818.md) and [MIMO_VALIDATION_REPORT_20260818.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_VALIDATION_REPORT_20260818.md). The algorithm, topology and correction limits are documented in [MIMO_ROOM_TUNING.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md).
 
+For a deliberately conservative follow-up to a low-level sweep A/B, `diagnostics/refine_tonal_fir.py` can derive a listening-preview FIR from `frequency_comparison.csv`. It locks 0–120 Hz, applies only broad correction of at most about 1 dB above 120 Hz, preserves the approved FIR phase/peak tap and emits a WAV, JSON audit, CSV comparison and vector SVG. It is not a substitute for multi-position acoustic validation; preview the result before installing it.
+
 ## References
 
 AudioDSP uses these publications and primary technical sources as design references. A reference does not imply that every method is implemented; adopted, adapted and deliberately deferred techniques are distinguished in [MIMO_ROOM_TUNING.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md).
