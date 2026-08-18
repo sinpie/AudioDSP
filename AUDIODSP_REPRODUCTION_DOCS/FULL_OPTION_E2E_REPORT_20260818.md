@@ -60,6 +60,39 @@ Baseline filtered versus unfiltered target fit improved at the fixed point:
 The final filtered MAE was 1.737/1.703 dB over 30 Hz–10 kHz and 3.794/4.845 dB
 over 30–120 Hz for L/R.  These values describe only the present fixed point.
 
+## Closest generated option to the active RefinedTone preview
+
+The active preview
+`Harman_StrongBassControl_RefinedTone_Stereo_48k_NoPreamp.wav` (SHA-256
+`15b215879d17daf501326e206acf642444d629f051603ec12fb2c9a5ea251fbb`)
+was compared with all 67 final option pairs.  Two independent comparisons
+agreed on `correction_low_hz-80` as the closest available option:
+
+- direct FIR transfer comparison: combined Front/full-band and Woofer/20–120
+  Hz RMS difference 3.976 dB; Front 4.046 dB and Woofer 3.807 dB;
+- fixed-point acoustic-shape comparison, aligned only by the 500–2000 Hz
+  session level: combined L/R RMS difference 4.036 dB.
+
+The runner-up was `correction_low_hz-60`, at 4.323 dB by direct FIR transfer
+and 4.172 dB by acoustic shape.  The closest option settings are:
+
+| Setting | Value |
+|---|---|
+| Target / bass control | Harman / Strong |
+| Woofer trim | -9 dB |
+| Phase | Bass, 200 Hz |
+| Spatial weighting | Equal |
+| Bass / treble preference | 0 / 0 dB |
+| Correction range | 80 Hz–20 kHz |
+| Maximum room boost / cut | +6 / -18 dB |
+
+This is the nearest option, not an identical replacement.  RefinedTone is one
+stereo FIR copied to Front and Woofer, preserves the approved source below 120
+Hz, and applies only a broad ±1 dB refinement above it.  The generated option
+uses separately measured Front and Woofer FIRs from the current session.  The
+80 Hz lower correction boundary is the main reason it is closer than the
+nominal 20 Hz baseline.
+
 ## Defects found and corrected
 
 1. A late Woofer ESS impulse peak was being interpreted as 10.8 seconds of
@@ -110,4 +143,3 @@ Raspberry Pi 5 with 2 GB RAM is the recommended MIMO target for AudioDSP-only
 use.  The eight 32768-tap float32 paths contain only 1 MiB of raw coefficients;
 CPU, USB scheduling and XRUN margin—not RAM capacity—are the limiting factors.
 4 GB is optional only when unrelated services will share the Pi.
-
