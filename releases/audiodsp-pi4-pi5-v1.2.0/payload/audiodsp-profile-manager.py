@@ -814,9 +814,67 @@ def preview_status() -> dict[str, Any]:
     return result
 
 
+def resolve_preview(settings: dict[str, Any], preview: dict[str, Any]) -> dict[str, Any]:
+    """Describe the temporary config that is actually running, not the saved profile."""
+    profile = str(preview.get("profile"))
+    mode = str(preview.get("mode"))
+    if profile not in PROFILE_FILES:
+        raise ProfileError("Invalid active preview profile.")
+    if mode == "mimo_2x4":
+        manifest = preview.get("manifest")
+        if not manifest:
+            raise ProfileError("Active MIMO preview manifest is missing.")
+        bank = validate_mimo_bank(Path(str(manifest)))
+        return {
+            "requested_profile": settings["requested_profile"],
+            "chunksize": max(1024, settings["chunksize"]),
+            "effective_profile": profile,
+            "front_path": None,
+            "rear_path": None,
+            "configured_rear_mode": mode,
+            "effective_rear_mode": mode,
+            "bypass": False,
+            "convolution_channels": 8,
+            "woofer_trim_db": 0,
+            "mimo_paths": [item["path"] for item in bank["files"]],
+            "mimo_manifest_path": bank["manifest_path"],
+            "mimo_topology": bank["manifest"].get("topology"),
+            "preview_active": True,
+        }
+    if mode not in ("copy_front", "separate"):
+        raise ProfileError("Invalid active preview mode.")
+    front = preview.get("front") or {}
+    rear = preview.get("rear") or {}
+    front_path = Path(str(front.get("path"))) if front.get("path") else None
+    rear_path = Path(str(rear.get("path"))) if mode == "separate" and rear.get("path") else None
+    if front_path is None or not front_path.is_file():
+        raise ProfileError("Active preview Front FIR is missing.")
+    if mode == "separate" and (rear_path is None or not rear_path.is_file()):
+        raise ProfileError("Active preview Rear FIR is missing.")
+    return {
+        "requested_profile": settings["requested_profile"],
+        "chunksize": settings["chunksize"],
+        "effective_profile": profile,
+        "front_path": front_path,
+        "rear_path": rear_path,
+        "configured_rear_mode": mode,
+        "effective_rear_mode": mode,
+        "bypass": False,
+        "convolution_channels": 4 if rear_path is not None else 2,
+        "woofer_trim_db": int(preview.get("woofer_trim_db", 0)),
+        "mimo_paths": None,
+        "mimo_manifest_path": None,
+        "mimo_unavailable_reason": None,
+        "preview_active": True,
+    }
+
+
 def status() -> dict[str, Any]:
     settings = load_settings()
     resolved = resolve_profile(settings)
+    preview = preview_status()
+    if preview.get("active") and not preview.get("stale"):
+        resolved = resolve_preview(settings, preview)
     files: dict[str, Any] = {}
     for profile, bands in PROFILE_FILES.items():
         files[profile] = {}
@@ -843,7 +901,7 @@ def status() -> dict[str, Any]:
                 mimo[profile] = {"manifest": str(path), "valid": False, "error": str(exc)}
         else:
             mimo[profile] = None
-    return serializable({"settings": settings, "resolved": resolved, "files": files, "mimo": mimo, "capabilities": platform_capability(), "u7_selector": selector_status(), "preview": preview_status()})
+    return serializable({"settings": settings, "resolved": resolved, "files": files, "mimo": mimo, "capabilities": platform_capability(), "u7_selector": selector_status(), "preview": preview})
 
 
 def activate(profile: str, restart: bool = True) -> dict[str, Any]:

@@ -122,3 +122,54 @@ the active Speaker FIR SHA-256 was still
 The paired test stopped and restored CamillaDSP once by design; it did not
 change the profile, FIR, volume or persistent audio configuration. Pre-deployment code is recoverable from
 `/var/lib/audiodsp/code-backups/20260818T030943Z`.
+
+## 2026-08-18 output-path lock and signal-flow maintenance
+
+- Common Pi2/Pi4/Pi5 Web and measurement sources passed the Pi 2 silent profile matrix: 4096 total states, 3968 valid, 128 expected errors and 3136 ordered setting pairs.
+- Offline ARMv7 measurement build passed magnitude, bass-phase and combined-copy 32768-tap output checks plus U7 bind/same-path/change-path/cross-profile rejection fixtures.
+- Writer preflight now requires the responsive vector signal console, measurement path-lock UI, path enforcement functions and the shared selector-state default.
+- Live deployment and visual inspection were performed on Pi 2 only. Pi 4/5 common-source and writer checks are covered, but this revision does not claim a Pi 4/5 hardware runtime or MIMO acoustic acceptance test.
+
+## 2026-08-18 FIR-embedded digital crossover maintenance
+
+- Independent L/R/Woofer SISO defaults to an embedded 100 Hz Linkwitz-Riley
+  fourth-order crossover. Front HPF, Woofer LPF and the joint cut-only sum guard
+  are all multiplied into the existing 32768-tap WAVs; no runtime filter stage,
+  convolution path or CamillaDSP block-latency increment is added.
+- The common measurement regression passed LR4-complement, default migration,
+  joint Front+Woofer guard, acoustic-false-positive rejection and 32768-tap WAV
+  structure checks. The common MIMO self-test also passed causality and physical
+  output limits, including fail-closed rejection of its unsafe fixture.
+- The final isolated Web/profile matrix on Pi 2, using byte-identical common
+  Pi 4/5 sources, passed 4096 states (3968 valid, 128 expected errors), 56
+  operations, 3136 ordered operation pairs and 28 unique CamillaDSP configs.
+- The Pi 4/5 writer passed `-ValidateOnly`; Python compilation and repository
+  whitespace checks passed. This is common-source and bundle validation, not a
+  claim of Pi 4/5 hardware acoustic or real-time MIMO acceptance.
+
+## 2026-08-18 resumable measurement UX and disclosure maintenance
+
+- The active session summary is rendered above the six workflow tabs and shows
+  session ID, note, creation time, state, measurement count, resumable step and
+  FIR availability. Saved sessions can be searched, annotated and resumed from
+  their last verified checkpoint; editing only the note does not invalidate any
+  measurement, calculation or completion state.
+- Session loading validates persisted response JSON and Front/Rear WAV
+  artifacts. Automatic diagnostics label applicable rows `PASS` or `FAIL` and
+  unavailable/non-applicable evidence `N/A`; failed rows are red and provide a
+  concrete next action.
+- Every native expandable section has a CSS-vector chevron, a 48 px summary hit
+  area and an accented open state, making disclosure controls visually distinct
+  from static cards.
+- Common-source responsive validation passed at 375x812 and 1440x900 with zero
+  horizontal overflow, six tabs/panels, correct disclosure toggling, session
+  search and note dirty/clean transitions. The reusable validator is
+  `diagnostics/validate_web_mobile.ps1`.
+- The common Web/profile/session source passed the complete isolated matrix on
+  Pi 2: 4096 states (3968 valid, 128 expected errors), 56 operations, 3136
+  ordered pairs, 16 Preview resolution cases and 33 concurrent writes. The Pi
+  4/5 writer passed `-ValidateOnly`; this is release/common-source validation,
+  not a Pi 4/5 hardware runtime claim.
+- Common request handling absorbs normal BrokenPipe/ConnectionReset client
+  disconnects at the connection boundary so polling-browser navigation does not
+  produce misleading Web error tracebacks.

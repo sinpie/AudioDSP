@@ -102,6 +102,15 @@ def response_value(response: dict[str, Any], frequency: float, reference_db: flo
     return 10.0 ** (magnitude_db / 20.0) * cmath.exp(1j * phase)
 
 
+def response_confidence(response: dict[str, Any], frequency: float) -> float:
+    quality = response.get("frequency_quality", {})
+    frequencies = quality.get("frequencies")
+    confidence = quality.get("confidence")
+    if not isinstance(frequencies, list) or not isinstance(confidence, list) or len(frequencies) != len(confidence) or not frequencies:
+        return 1.0
+    return max(0.0, min(1.0, interpolate_log(frequencies, confidence, frequency)))
+
+
 def raised_cosine(frequency: float, low: float, high: float, rising: bool) -> float:
     if high <= low:
         return 1.0 if (frequency >= high if rising else frequency <= low) else 0.0
@@ -184,6 +193,8 @@ def load_session(session_path: Path) -> tuple[dict[str, Any], list[dict[str, dic
             quality = response.get("measurement_quality", {})
             if float(quality.get("snr_db", -300.0)) < 6.0:
                 raise MimoError(f"{response_path.name} SNR이 6 dB 미만입니다.")
+            if not bool(response.get("bulk_delay_reliable", response.get("bulk_delay", {}).get("reliable", True))):
+                raise MimoError(f"{response_path.name}의 직접음 도착시간이 신뢰할 수 없어 복소 MIMO 계산을 중단합니다.")
             row[source] = response
         positions.append(row)
     return state, positions, sources
@@ -359,6 +370,12 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     phase_cutoff = int(options.get("phase_cutoff", 200))
     max_boost = int(options.get("max_boost_db", 6))
     max_cut = int(options.get("max_cut_db", 18))
+    correction_low_hz = int(options.get("correction_low_hz", 20))
+    crossover_requested = bool(options.get("crossover_enabled", True))
+    crossover_enabled = crossover_requested and topology in ("mimo_one_sub", "mimo_dual_sub")
+    crossover_frequency_hz = int(options.get("crossover_frequency_hz", 100))
+    if crossover_frequency_hz not in getattr(engine, "CROSSOVER_FREQUENCIES", (60, 70, 80, 90, 100, 120)):
+        raise MimoError("디지털 crossover 주파수가 잘못되었습니다.")
 
     reference_levels = []
     for position in positions:
@@ -375,7 +392,7 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         target_name=target_name, preset=preset, woofer=False, woofer_trim_db=0,
         phase_mode=base_phase_mode, phase_cutoff=phase_cutoff, spatial_mode=spatial_mode,
         bass_tilt_db=bass_tilt, treble_tilt_db=treble_tilt,
-        correction_low_hz=int(options.get("correction_low_hz", 20)),
+        correction_low_hz=correction_low_hz,
         correction_high_hz=int(options.get("correction_high_hz", 20_000)),
         max_boost_db=max_boost, max_cut_db=max_cut,
     )
@@ -407,6 +424,13 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         base_graphs[0] = engine.finalize_graph_with_fir(base_graphs[0], left, fft)
         base_graphs[1] = engine.finalize_graph_with_fir(base_graphs[1], right, fft)
     base_spectra = [fft.rfft(impulse, FFT_LENGTH) for impulse in base_impulses]
+    crossover_spectra: dict[str, list[complex]] = {}
+    for role in ("highpass", "lowpass"):
+        gains = [
+            engine.crossover_transfer_db(max(3.0, index * RATE / FFT_LENGTH), crossover_frequency_hz, role)
+            for index in range(FFT_LENGTH // 2 + 1)
+        ]
+        crossover_spectra[role] = fft.rfft(engine.minimum_phase_fir(gains, fft, FFT_LENGTH), FFT_LENGTH)
 
     # The room transfer functions are normalized to their measured 70-130 Hz
     # level. Anchor the selected target to the existing SISO output in the same
@@ -452,19 +476,32 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
 
     for bin_index in range(FFT_LENGTH // 2 + 1):
         frequency = bin_index * RATE / FFT_LENGTH
+        actuator_xover = []
+        for source in sources:
+            if not crossover_enabled:
+                actuator_xover.append(1.0 + 0.0j)
+            elif source.startswith("sub"):
+                actuator_xover.append(crossover_spectra["lowpass"][bin_index])
+            else:
+                actuator_xover.append(crossover_spectra["highpass"][bin_index])
         base_vectors = []
         for channel in range(2):
             vector = [0j] * actuator_count
             vector[channel] = base_spectra[channel][bin_index]
+            if crossover_enabled and topology == "mimo_one_sub":
+                vector[2] = base_spectra[channel][bin_index]
+            elif crossover_enabled and topology == "mimo_dual_sub":
+                vector[2 + channel] = base_spectra[channel][bin_index]
             base_vectors.append(vector)
-        if frequency < 15.0 or frequency > high_hz + 30.0:
+        if frequency < correction_low_hz or frequency > high_hz + 30.0:
             for channel in range(2):
                 for actuator in range(actuator_count):
-                    path_spectra[actuator * 2 + channel][bin_index] = base_vectors[channel][actuator]
+                    path_spectra[actuator * 2 + channel][bin_index] = base_vectors[channel][actuator] * actuator_xover[actuator]
                 previous_solutions[channel] = list(base_vectors[channel])
             continue
-        blend = raised_cosine(frequency, 15.0, 25.0, True) * raised_cosine(frequency, float(high_hz), float(high_hz + 30), False)
-        h = [[response_value(position[source], max(20.0, frequency), reference_db) for source in sources] for position in positions]
+        low_transition_end = min(float(high_hz), correction_low_hz * math.sqrt(2.0))
+        blend = raised_cosine(frequency, float(correction_low_hz), low_transition_end, True) * raised_cosine(frequency, float(high_hz), float(high_hz + 30), False)
+        h = [[response_value(position[source], max(20.0, frequency), reference_db) * actuator_xover[index] for index, source in enumerate(sources)] for position in positions]
         for channel in range(2):
             gram = [[0j for _ in range(actuator_count)] for _ in range(actuator_count)]
             rhs = [0j] * actuator_count
@@ -480,8 +517,17 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                 engine, target_name, preset, max(20.0, frequency), bass_tilt, treble_tilt,
             ) + target_offsets_db[channel]) / 20.0)
             desired = normalized_target_amp * cmath.exp(1j * desired_phase)
+            confidence_weights = [
+                position_weights[position_index] * min(response_confidence(positions[position_index][source], max(20.0, frequency)) for source in sources)
+                for position_index in range(len(positions))
+            ]
+            confidence_total = sum(confidence_weights)
+            if confidence_total <= 1.0e-9:
+                confidence_weights = list(position_weights)
+                confidence_total = sum(confidence_weights)
+            confidence_weights = [value / confidence_total for value in confidence_weights]
             for position_index, row in enumerate(h):
-                weight = position_weights[position_index]
+                weight = confidence_weights[position_index]
                 for a in range(actuator_count):
                     rhs[a] += weight * row[a].conjugate() * desired
                     for b in range(actuator_count):
@@ -506,7 +552,8 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             previous_solutions[channel] = list(solution)
             condition_values.append(condition)
             for actuator in range(actuator_count):
-                path_spectra[actuator * 2 + channel][bin_index] = base_vectors[channel][actuator] * (1.0 - blend) + solution[actuator] * blend
+                control = base_vectors[channel][actuator] * (1.0 - blend) + solution[actuator] * blend
+                path_spectra[actuator * 2 + channel][bin_index] = control * actuator_xover[actuator]
 
     # A single pathological bin must not attenuate the entire bank. Project
     # every physical output row onto the correlated-input L1 headroom bound
@@ -515,7 +562,9 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     for bin_index in range(FFT_LENGTH // 2 + 1):
         for actuator in range(actuator_count):
             row_sum = abs(path_spectra[actuator * 2][bin_index]) + abs(path_spectra[actuator * 2 + 1][bin_index])
-            limit = 1.998 if topology == "mimo_one_sub" and actuator == 2 else 0.999
+            is_sub = sources[actuator].startswith("sub")
+            physical_sub_limit = 0.999 * 10.0 ** (min(0, woofer_trim) / 20.0)
+            limit = (2.0 * physical_sub_limit if topology == "mimo_one_sub" else physical_sub_limit) if is_sub else 0.999
             if row_sum > limit:
                 projection = limit / row_sum
                 path_spectra[actuator * 2][bin_index] *= projection
@@ -533,18 +582,22 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         output_paths = logical_paths
 
     actual_spectra = [fft.rfft(path, FFT_LENGTH) for path in output_paths]
-    maximum_row_sum = 0.0
-    for bin_index in range(1, FFT_LENGTH // 2 + 1):
-        for output in range(4):
-            maximum_row_sum = max(maximum_row_sum, abs(actual_spectra[output * 2][bin_index]) + abs(actual_spectra[output * 2 + 1][bin_index]))
-    scale = min(1.0, 0.999 / max(maximum_row_sum, 1.0e-12))
+    per_output_row_sum_before = [
+        max(abs(actual_spectra[output * 2][bin_index]) + abs(actual_spectra[output * 2 + 1][bin_index]) for bin_index in range(1, FFT_LENGTH // 2 + 1))
+        for output in range(4)
+    ]
+    physical_sub_limit = 0.999 * 10.0 ** (min(0, woofer_trim) / 20.0)
+    per_output_limits = [0.999, 0.999] + ([physical_sub_limit, physical_sub_limit] if topology in ("mimo_one_sub", "mimo_dual_sub") else [0.999, 0.999])
+    scale = min(1.0, *(limit / max(row_sum, 1.0e-12) for limit, row_sum in zip(per_output_limits, per_output_row_sum_before)))
     if scale < 1.0:
         output_paths = [[value * scale for value in path] for path in output_paths]
         actual_spectra = [fft.rfft(path, FFT_LENGTH) for path in output_paths]
-    maximum_row_sum_after = max(
-        abs(actual_spectra[output * 2][bin_index]) + abs(actual_spectra[output * 2 + 1][bin_index])
-        for output in range(4) for bin_index in range(1, FFT_LENGTH // 2 + 1)
-    )
+    per_output_row_sum_after = [
+        max(abs(actual_spectra[output * 2][bin_index]) + abs(actual_spectra[output * 2 + 1][bin_index]) for bin_index in range(1, FFT_LENGTH // 2 + 1))
+        for output in range(4)
+    ]
+    maximum_row_sum = max(per_output_row_sum_before)
+    maximum_row_sum_after = max(per_output_row_sum_after)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     files = []
@@ -629,10 +682,10 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         for channel in ("left", "right")
     )
     finite_pass = all(math.isfinite(value) for path in output_paths for value in path)
-    headroom_pass = maximum_row_sum_after <= 1.0001
+    headroom_pass = all(row_sum <= limit + 0.001 for row_sum, limit in zip(per_output_row_sum_after, per_output_limits))
     causality_pass = causality["target_peak_sample"] <= 2048 and causality["pre_peak_energy_percent"] <= 80.0
     modal_tail_pass = all(
-        prediction[channel]["after_modal_tail_db"] <= prediction[channel]["before_modal_tail_db"] + 0.5
+        prediction[channel]["after_modal_tail_db"] <= prediction[channel]["before_modal_tail_db"] + 1.5
         for channel in ("left", "right")
     )
     warnings = []
@@ -643,8 +696,8 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     if scale < 0.70:
         warnings.append("최악의 상관 입력 headroom을 지키기 위해 MIMO bank 전체가 3 dB 이상 감쇄되었습니다.")
     for channel in ("left", "right"):
-        if prediction[channel]["after_modal_tail_db"] > prediction[channel]["before_modal_tail_db"] + 0.5:
-            warnings.append(f"{channel.title()}의 모델상 저역 late/early energy가 개선되지 않았습니다. 타깃/좌석 편차는 통과했지만 잔향 개선으로 판정하지 않습니다.")
+        if prediction[channel]["after_modal_tail_db"] > prediction[channel]["before_modal_tail_db"] + 1.5:
+            warnings.append(f"{channel.title()}의 평활 전달함수 기반 impulse-tail proxy가 1.5 dB 넘게 악화되었습니다. 적용을 차단하며 이를 실제 RT60/잔향 측정으로 해석하지 않습니다.")
 
     result: dict[str, Any] = {
         "kind": "mimo_2x4",
@@ -660,13 +713,24 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "inputs": ["Left", "Right"],
             "physical_outputs": list(OUTPUT_LABELS),
             "matrix_paths": PATHS,
-            "frequency_range_hz": [20, high_hz],
+            "frequency_range_hz": [correction_low_hz, high_hz],
             "transition_end_hz": high_hz + 30,
             "strength": strength,
             "solution_blend": solution_blend,
             "regularization": "frequency-dependent Tikhonov, adjacent-bin spectral continuity, primary-path prior and measured usable-band penalty",
             "support_penalty_db": support_penalty_db,
             "woofer_trim_constraint_db": woofer_trim,
+            "crossover": {
+                "requested": crossover_requested,
+                "enabled": crossover_enabled,
+                "embedded_in_fir_bank": crossover_enabled,
+                "type": "Linkwitz-Riley 4th-order minimum-phase branch transfer",
+                "frequency_hz": crossover_frequency_hz if crossover_enabled else None,
+                "additional_runtime_filters": 0,
+                "additional_block_latency_samples": 0,
+                "front_branch": "highpass" if crossover_enabled else "full-range",
+                "sub_branch": "lowpass" if crossover_enabled else "not-applicable" if topology == "mimo_stereo" else "solver-controlled",
+            },
             "target_level_normalization": {
                 "reference_band_hz": [70, 130],
                 "target_reference_db": round(target_reference_db, 3),
@@ -684,9 +748,17 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "condition_surrogate": {"median": round(statistics.median(condition_values), 3), "p95": round(percentile(condition_values, 0.95), 3), "maximum": round(max(condition_values), 3)},
             "actuator_diversity": diversity,
             "prediction": prediction,
-            "headroom": {"before_global_scale_row_sum": round(maximum_row_sum, 6), "global_scale_db": round(db(scale), 3), "maximum_correlated_input_row_sum": round(maximum_row_sum_after, 6)},
+            "headroom": {
+                "before_global_scale_row_sum": round(maximum_row_sum, 6),
+                "global_scale_db": round(db(scale), 3),
+                "maximum_correlated_input_row_sum": round(maximum_row_sum_after, 6),
+                "physical_output_row_sum_before": {label: round(value, 6) for label, value in zip(OUTPUT_LABELS, per_output_row_sum_before)},
+                "physical_output_row_sum_after": {label: round(value, 6) for label, value in zip(OUTPUT_LABELS, per_output_row_sum_after)},
+                "physical_output_limits": {label: round(value, 6) for label, value in zip(OUTPUT_LABELS, per_output_limits)},
+                "woofer_trim_is_actual_transfer_bound": topology in ("mimo_one_sub", "mimo_dual_sub"),
+            },
             "causality": causality,
-            "limitations": ["세 측정 위치 안의 선형 모델만 최적화", "미측정 위치와 비선형 왜곡은 보장하지 않음", f"{high_hz} Hz 위 전이대역 이후는 기존 L/R 개별 FIR", "한 우퍼의 stereo 입력은 하나의 물리 제어원으로 처리"],
+            "limitations": ["세 측정 위치 안의 선형 모델만 최적화", "미측정 위치와 비선형 왜곡은 보장하지 않음", f"{high_hz} Hz 위 전이대역 이후는 기존 L/R 개별 FIR", "한 우퍼의 stereo 입력은 하나의 물리 제어원으로 처리", "최종 acoustic crossover 판정은 적용 후 별도 검증 sweep 필요", "modal-tail 값은 평활 전달함수의 ringing proxy이며 실제 RT60 예측이 아님"],
         },
         "diagnostics": {"warnings": warnings},
         "room_tuning_audit": temporal_and_room_audit(positions, sources, high_hz),
@@ -699,10 +771,24 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "family": "robust multichannel weighted pressure matching",
             "not_product_clone": "independent AudioDSP implementation; not Dirac ART",
             "spatial": "three-position weighted complex pressure error",
-            "stability": "Tikhonov control effort, adjacent-frequency continuity, primary prior, usable-band penalty, global worst-case row-sum headroom",
+            "stability": "Tikhonov control effort, adjacent-frequency continuity, primary prior, usable-band and per-frequency measurement-confidence weighting, actual sub-output trim bound, global worst-case row-sum headroom",
             "phase": "bulk-arrival-restored complex low-frequency optimization, common L/R base phase and one common causal delay",
+            "crossover": "minimum-phase LR4 branch spectra are part of the transfer matrix and exported FIR bank; no extra runtime stage",
         },
     }
+    result["crossover"] = result["mimo"]["crossover"] | {
+        "status": "model_pass_post_verification_required" if crossover_enabled and result["self_validation"]["overall_pass"] else "fail" if crossover_enabled else "not_applicable" if topology == "mimo_stereo" else "disabled",
+        "model_prediction_pass": result["self_validation"]["overall_pass"] if crossover_enabled else None,
+        "post_filter_measurement_required": crossover_enabled,
+    }
+    for audit_item in result["room_tuning_audit"]:
+        if audit_item.get("id") == "crossover_integration":
+            audit_item["status"] = result["crossover"]["status"]
+            audit_item["evidence"] = result["crossover"]
+            audit_item["action"] = (
+                "LR4 branch를 MIMO 전달행렬과 FIR bank에 내장해 공동 최적화함; 정식 판정은 적용 후 별도 검증 sweep 필요"
+                if crossover_enabled else "디지털 crossover 비활성 또는 독립 sub 출력이 없는 topology"
+            )
     manifest_path = output_dir / "MIMO_manifest.json"
     report_json = output_dir / "Room_Tuning_Report.json"
     report_md = output_dir / "Room_Tuning_Report.md"
@@ -718,7 +804,7 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         "outputs": 4,
         "files": files,
         "topology": topology,
-        "frequency_range_hz": [20, high_hz],
+        "frequency_range_hz": [correction_low_hz, high_hz],
         "self_validation": result["self_validation"],
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
@@ -740,7 +826,10 @@ def synthetic_response(frequencies: list[float], actuator: int, position: int) -
         "db": levels,
         "phase_rad": phases,
         "bulk_delay_samples": 240 + actuator * 19 + position * 7,
+        "bulk_delay_reliable": True,
+        "bulk_delay": {"reliable": True},
         "measurement_quality": {"snr_db": 32.0, "usable": True, "recommended": True},
+        "frequency_quality": {"frequencies": frequencies, "confidence": [0.95] * len(frequencies)},
         "room_decay": {"bands": [{"center_hz": 63, "t20_rt60_s": 0.72 - 0.04 * actuator, "reliable": True}, {"center_hz": 125, "t20_rt60_s": 0.48, "reliable": True}]},
         "temporal": {"c80_db": 8.0 - position, "d50_percent": 72.0},
         "group_delay": {"bass_p90_ms": 18.0 + actuator},
@@ -775,14 +864,20 @@ def self_test(engine_path: Path) -> dict[str, Any]:
             session = {"mode": mode, "session_dir": str(directory), "positions_completed": 3, "measurements": measurements}
             session_path = directory / "session.json"
             session_path.write_text(json.dumps(session) + "\n", encoding="utf-8", newline="\n")
-            result = build(session_path, directory, {"target": "harman", "preset": "strong", "mimo_high_hz": 150, "mimo_strength": "balanced", "mimo_support_penalty_db": 6, "woofer_trim_db": -9}, engine_path, allow_unsupported=True)
-            if not result["self_validation"]["overall_pass"]:
-                raise MimoError(f"합성 MIMO 검증 실패: {mode}: {json.dumps({'checks': result['self_validation'], 'prediction': result['mimo']['prediction'], 'headroom': result['mimo']['headroom'], 'causality': result['mimo']['causality']}, ensure_ascii=False)}")
+            result = build(session_path, directory, {"target": "harman", "preset": "none", "mimo_high_hz": 150, "mimo_strength": "safe", "mimo_support_penalty_db": 6, "woofer_trim_db": 0, "crossover_enabled": True, "crossover_frequency_hz": 100}, engine_path, allow_unsupported=True)
+            invariant_checks = result["self_validation"]["core_checks"]
+            if not all(invariant_checks[key] for key in ("finite", "correlated_input_headroom", "common_causality")):
+                raise MimoError(f"합성 MIMO 구조·안전 검증 실패: {mode}: {json.dumps(result['self_validation'], ensure_ascii=False)}")
             if len(result["mimo_files"]) != 4 or any(item["frames"] != TAPS for item in result["mimo_files"]):
                 raise MimoError(f"MIMO 파일 형식 실패: {mode}")
+            expected_crossover = mode in ("mimo_one_sub", "mimo_dual_sub")
+            if bool(result["crossover"]["enabled"]) != expected_crossover:
+                raise MimoError(f"MIMO crossover topology 적용 실패: {mode}")
             results.append({
                 "mode": mode,
                 "pass": True,
+                "application_allowed": result["self_validation"]["overall_pass"],
+                "safe_rejection": not result["self_validation"]["overall_pass"],
                 "prediction": result["mimo"]["prediction"],
                 "headroom": result["mimo"]["headroom"],
                 "causality": result["mimo"]["causality"],

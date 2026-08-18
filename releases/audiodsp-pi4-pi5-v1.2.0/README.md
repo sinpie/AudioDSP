@@ -37,6 +37,19 @@ UMIK 0°/90° calibration, level precheck, three-position room measurement,
 32768-tap regularized correction, target/preset selection, A/B review and safe
 permanent apply.
 
+Independent L/R/Woofer and sub-MIMO correction defaults to a 100 Hz LR4 digital
+crossover. Front HPF and Woofer LPF are embedded in the generated 32768-tap WAV
+or MIMO FIR bank, so no extra runtime filter stage or block latency is added.
+SISO adds a three-position cut-only constructive-sum guard; MIMO includes the
+complex crossover branches in its transfer matrix. Acoustic PASS still needs
+reliable phase/model checks and an applied low-level validation sweep.
+
+The Status screen includes a responsive vector signal console from U7 Line
+input through DSP/routing to the physical output. `Speaker` and `Headphone` are
+independent output-chain profile keys; either physical path may feed speakers.
+The level check binds the session to the selected U7 path, later playback stops
+on selector mismatch, and Preview/Apply are restricted to the measured chain.
+
 This 64-bit bundle additionally supports Pi-4/Pi-5-only MIMO Stereo, 2.1 and
 2.2 measurement/correction. It creates a robust 2-input x 4-output bank as four
 stereo float32 WAVs (eight 32768-tap convolution paths), validates correlated-

@@ -13,35 +13,51 @@
 ## 현황 화면
 
 - 첫 카드는 측정 session 상태에 따라 하나의 `지금 할 일`을 제안한다.
+- 그 다음 `오디오 신호 흐름` console은 U7 Line input → CamillaDSP → Front/Rear routing → U7 물리 selector → 실제 스피커 체인을 SVG 아이콘 박스와 연결선으로 보여준다. PC에서는 가로, 980 px 이하에서는 같은 순서를 세로로 배치한다.
+- 신호 console의 U7 경로명과 설정 카드 강조는 `/api/status`를 1초 polling해 실제 상단 버튼 전환을 반영한다. 웹은 하드웨어 selector를 쓰지 않는다.
 - 출력 볼륨 카드는 큰 dB 숫자, -60~0 slider, ±1 dB, -40/-30/-20/-10 preset, 저장·적용 버튼을 가진다.
 - Slider 이동 중 예상값을 즉시 표시하고 release 시 PUT한다. 명시적 버튼은 키보드/비-JS fallback이다.
 - U7 실제값과 재부팅 저장값이 다르면 `물리 노브 변경 감지`를 표시한다.
 - 볼륨은 Front/Rear 전체 하드웨어 출력이라는 설명과 CamillaDSP 무재시작 설명을 항상 보인다.
 - 현재 설정 표는 U7 실제 출력, 요청/유효 profile, fallback, bypass, A/B, Rear mode, convolution 수, 서비스, 장치, format/chunksize를 보여준다.
-- FIR 그래프는 L/R 또는 L/R+Woofer toggle이며 브라우저가 WAV를 받아 SVG를 계산한다.
+- FIR 그래프는 L/R 또는 L/R+Woofer toggle이며 브라우저가 WAV를 받아 SVG를 계산한다. 이 그래프는 측정 응답에 곱하는 **보정 전달함수**이며 목표 청취 음압이 아님을 제목과 설명에서 명시한다.
 
 ## 측정 화면
 
-상단 workflow는 `연결·Cal → 레벨 → 3위치 측정 → FIR 계산 → 검토·A/B → 정식 적용`이다.
+상단 workflow는 PC 한 줄·모바일 3×2의 6단계 탭 `연결·Cal → 레벨 확인 → 위치 측정 → FIR 계산 → 검토·A/B → 정식 적용`이다. 선택한 단계의 패널 하나만 탭 바로 아래에 표시하며 긴 문서 anchor 이동을 사용하지 않는다.
 
-- 완료/현재 step은 anchor로 이동할 수 있다. 미래 step은 비활성이다.
+- 모든 탭은 이전/현재/미래 상태와 관계없이 열 수 있다. 데이터가 아직 없는 단계는 선행 조건 안내를 표시하고, 실제 실행 버튼만 조건에 따라 비활성화한다.
+- 클릭·방향키·Home/End로 탭을 바꿀 수 있고 `role=tablist/tab/tabpanel`, `aria-selected`, `aria-current=step`을 함께 유지한다.
 - step click은 navigation뿐이며 데이터 mutation을 하지 않는다.
 - 편집한 설정은 `변경 적용` 전까지 기존 결과에 영향을 주지 않는다.
 - 재검사/재측정/재계산 버튼은 초기화 범위를 confirm 문구로 정확히 말한다.
 - 진행 중에는 progress, percent, 단계명, ETA를 1초 polling한다.
 - Level 결과는 OK/NOT OK, background, white-noise RMS, 추정 signal, SNR, peak를 카드로 보여준다.
+- 활성 session의 ID, 생성 시각, 상태, 완료 위치, 이어갈 단계, FIR 결과 유무와 주석 편집은 1–6 단계 탭 바로 위에 항상 표시한다. 주석 저장은 별도 metadata만 바꾸며 어떤 측정·FIR 단계도 초기화하지 않는다.
+- session은 생성 즉시 자동 저장한다. 1단계의 저장 session 목록은 최신순으로 ID·시각·측정 구성·완료 단계·위치·FIR 유무·주석을 함께 보여주고, `이어하기`는 파일 무결성을 확인한 뒤 저장된 1–6 완료 지점 전체를 복원한다. 작업 중 session 전환은 차단한다.
+- 저장 session 목록은 ID·날짜·주석 client-side 검색을 제공한다. 활성 주석을 편집하면 즉시 `저장되지 않은 주석` 상태를 표시하고, 저장 전에 페이지를 떠날 때만 확인한다.
+- 레벨 검사를 누르는 순간 현재 U7 물리 출력을 session의 `measurement_profile`로 고정한다. 화면은 현재/고정 경로의 일치 여부를 별도 lock 카드로 보여주고, 불일치하면 위치 측정과 A/B를 비활성화한다.
+- 생성 결과의 Preview/Apply 버튼은 고정된 한 출력 체인만 제공한다. 경로 정보가 없는 schema-1 이전 session에만 수동 확인 경고와 두 버튼을 보이는 호환 모드를 쓴다.
 - 백색소음과 sweep 출력은 별도 slider이며 fresh session은 둘 다 -42 dBFS다. 현재 Woofer 실효값을 계산하고 높은 조합을 색+문구로 경고하며 실제 위치 sweep 전 confirm에 수치를 다시 표시한다.
 - Target을 바꾸면 1 kHz 기준 곡선과 bass/treble preference를 즉시 SVG에 반영한다.
+- L/R/Woofer와 sub MIMO에서는 디지털 crossover를 주요 옵션으로 표시하고 기본 ON/100 Hz로 둔다. 설명은 Front LR4 HPF, Woofer LR4 LPF, 32768탭 WAV 내장, 추가 block latency 0을 함께 말한다. 합산 L/R 모드에서는 숨은 OFF 값과 독립 branch가 없다는 이유를 표시한다.
 - 결과 그래프는 각 채널의 측정 전 ±공간 편차, 적용 후 예상, target을 구분한다.
+- 결과의 `Woofer 최종 trim`은 FIR 계산 옵션을, `측정 시 Woofer 감쇄`는 sweep SNR 확보용 측정 조건을 별도 항목으로 표시한다.
+- 결과에 기록된 `algorithm_revision`이 현재 엔진과 다르면 측정 원본은 보존하되 이전 계산임을 경고하고 4단계 FIR 재계산 전 Preview/Apply를 차단한다.
+- 최신 결과라도 `self_validation.overall_pass=false`이면 다운로드와 A/B Preview는 허용하지만 정식 Apply는 UI와 엔진 양쪽에서 차단한다.
+- 자동 검증 체크리스트는 모든 core/FIR, 독립 3위치, L/R/Woofer target-fit, crossover 합산, SNR 판정을 `PASS`, `FAIL`, `N/A`로 표시한다. FAIL 행은 빨간색과 함께 설정 변경·재측정·배치 확인 순서의 직접 행동 지침을 제공한다.
+- 결과 카드는 crossover 상태를 `pass`, `limited_unverified_phase`, `fail_target`, `fail_upper_guard`로 구분하고, WAV 형식 검증만 통과한 결과를 acoustic PASS로 표시하지 않는다.
 - Pi4/5는 SISO와 MIMO Stereo/2.1/2.2를 구분한다. Pi2는 MIMO 항목과 차단 이유를 보이되 선택할 수 없다.
-- MIMO 결과는 타깃 MAE, 좌석 편차, modal late/early 모델값, 기존 SISO 저역 레벨 기준 offset, 해 혼합 강도, 제어원 coherence, headroom과 전체 보정 가능성 분류표를 보인다.
+- MIMO 결과는 타깃 MAE, 좌석 편차, 평활 전달함수 기반 impulse-tail proxy, 기존 SISO 저역 레벨 기준 offset, 해 혼합 강도, 제어원 coherence, crossover, 실제 output별 headroom과 전체 보정 가능성 분류표를 보인다. impulse-tail proxy는 RT60/잔향 예측이 아니며 1.5 dB 초과 악화 시 적용을 차단한다.
 - 다운로드와 A/B는 비파괴라고 명시하고, 정식 적용 버튼만 덮어쓰기 경고를 낸다.
+- 모든 펼침 영역은 일반 카드와 구분되는 테두리·배경, 최소 48 px 제목 행과 오른쪽 vector chevron을 사용한다. 닫힘/열림에 따라 chevron 방향과 제목 accent가 바뀌며 브라우저 기본 marker는 중복 표시하지 않는다.
 
 ## 설정 화면
 
 - 전체 백업은 페이지 첫 영역이다. 복원은 ZIP 선택 → 무결성 검사 → 내용 확인 → 적용의 네 단계를 시각화한다.
 - Engine 표에서 chunksize를 바꾸면 오디오가 잠시 재시작된다고 표시한다.
-- Speaker/Headphones는 동일 구조의 카드다. U7 실제 선택 카드만 `active-profile` 외곽선과 badge를 가진다.
+- 내부 키 `speaker/headphone`은 호환성을 위해 유지하지만 화면의 두 카드는 각각 `Speaker 출력 체인`, `Headphone 잭 출력 체인`이다. 이 설치에서는 둘 다 실제 스피커에 연결됨을 subtitle로 명시한다. U7 실제 선택 카드만 `active-profile` 외곽선과 badge를 가진다.
+- 각 카드 상단은 Front FIR → Front/Rear routing → speaker chain의 compact signal-flow를 SVG 아이콘과 함께 표시한다.
 - 카드에는 bypass, Front/Rear 파일 metadata, staged upload workflow, 기존/새 response graph, A/B, 정식 apply, Rear mode, woofer trim이 있다.
 - Speaker 카드에는 검증된 MIMO bank 설치/활성 상태와 8-path 여부를 표시한다. Headphones에는 4채널 MIMO 적용 버튼을 만들지 않는다.
 - 웹은 프로필 설정을 바꿀 수 있지만 U7 물리 LED/출력 selector를 바꾸는 버튼은 제공하지 않는다.
@@ -51,6 +67,7 @@
 - 모든 form은 한 번 submit된 동안 버튼을 비활성화하고 `처리 중…`으로 바꾼다.
 - 삭제·덮어쓰기·후속 측정 무효화는 confirm을 사용한다.
 - staging과 preview 상태를 명확히 분리하고 `정식 WAV는 그대로` 문구를 반복한다.
+- Preview가 active이면 현재 설정 표·signal-flow·FIR API는 저장된 profile mode보다 실제 임시 CamillaDSP 구성을 우선한다. 저장 `copy_front`/Preview `separate`와 그 반대 방향을 모두 정확히 표시하고 복귀 즉시 저장 mode로 돌아간다.
 - invalid 요청은 원래 상태를 유지한 채 해당 화면에 오류를 표시한다.
 - restore는 server-side 자동 rollback을 만든 뒤에만 실제 파일을 교체한다.
 
@@ -58,8 +75,13 @@
 
 - 기본은 `prefers-color-scheme`; 사용자는 Auto/Light/Dark를 localStorage에 저장한다.
 - 색만으로 상태를 구분하지 않고 badge, 텍스트, border를 같이 쓴다.
-- 모든 SVG는 `role=img`와 설명 label이 있다.
-- range/select/button에는 이름 또는 label이 있어야 한다.
+- Light/Dark의 primary control은 별도 `--on-accent` 전경색을 사용해 cyan 계열 accent에서도 텍스트 대비를 유지한다. 현재 탭은 배경뿐 아니라 하단 indicator와 `aria-current=page`로 표시한다.
+- 본문 건너뛰기 링크와 화면별 `<title>`, 측정 단계의 `aria-current=step`, 오류의 `role=alert`를 제공한다.
+- 장식 SVG 아이콘은 `aria-hidden=true`; 실제 응답 그래프만 `role=img`와 설명 label을 사용한다.
+- range/select/button/file input에는 이름 또는 연결된 label이 있어야 한다. 파일 입력은 native selector를 테마 색에 맞추되 OS 파일 선택 동작은 유지한다.
+- 좁은 화면의 700 px 주파수 그래프는 페이지 전체를 넘치게 하지 않고 자체 영역에서 스크롤한다. 이 영역은 키보드 focus와 region 설명을 제공한다.
+- PC의 button/select는 최소 40 px, 760 px 이하 화면의 주요 control은 최소 44 px 높이를 사용한다. 고정 하단 navigation을 고려해 모바일 본문과 anchor에 여유 공간을 둔다.
+- 수치·표·진행률은 tabular numeral을 사용해 polling 중 자리 폭 변화를 줄인다.
 - `prefers-reduced-motion`에서는 transition을 끈다.
 - 긴 hash/path와 좁은 모바일 폭은 wrap하며 수평 page overflow를 만들지 않는다.
 

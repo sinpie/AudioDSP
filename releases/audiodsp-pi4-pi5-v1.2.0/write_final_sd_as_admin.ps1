@@ -240,11 +240,12 @@ function Assert-FinalBundle {
         $managerText -notmatch 'install-mimo' -or
         $managerText -notmatch 'ALLOWED_CHUNKSIZES' -or
         $managerText -notmatch 'selector_status' -or
+        $managerText -notmatch 'resolve_preview' -or
         $managerText -notmatch 'remain active for one second') {
         throw 'The FIR profile manager is missing profile, selector, or chunk-size support.'
     }
 
-    $webText = Get-Content -LiteralPath $profileWeb -Raw
+    $webText = Get-Content -LiteralPath $profileWeb -Raw -Encoding UTF8
     if ($webText -notmatch 'client_svg_graph' -or
         $webText -notmatch '/bypass' -or
         $webText -notmatch '/chunksize' -or
@@ -258,7 +259,14 @@ function Assert-FinalBundle {
         $webText -notmatch '/api/volume' -or
         $webText -notmatch 'output_volume_control' -or
         $webText -notmatch 'output-volume-control' -or
-        $webText -notmatch 'non_destructive_step_navigation' -or
+        $webText -notmatch 'non_destructive_measurement_tabs' -or
+        $webText -notmatch 'role="tablist"' -or
+        $webText -notmatch 'Woofer 최종 trim' -or
+        $webText -notmatch 'session-overview' -or
+        $webText -notmatch 'build-fieldset' -or
+        $webText -notmatch 'validation-checklist' -or
+        $webText -notmatch '\-\-step-accent' -or
+        $webText -notmatch 'summary::after' -or
         $webText -notmatch 'room_tuning_audit' -or
         $webText -notmatch 'output-level-warning' -or
         $webText -notmatch '−42부터 시작' -or
@@ -267,6 +275,17 @@ function Assert-FinalBundle {
         $webText -notmatch 'live_u7_status_poll' -or
         $webText -notmatch "fetch\('/api/status'" -or
         $webText -notmatch 'active-profile' -or
+        $webText -notmatch 'signal_flow_diagram' -or
+        $webText -notmatch 'measurement-path-lock' -or
+        $webText -notmatch 'name="crossover_enabled"' -or
+        $webText -notmatch 'additional_block_latency_samples' -or
+        $webText -notmatch 'aria-current="page"' -or
+        $webText -notmatch 'aria-current="step"' -or
+        $webText -notmatch 'class="skip-link"' -or
+        $webText -notmatch 'id="main-content"' -or
+        $webText -notmatch 'file-picker-label' -or
+        $webText -notmatch '\-\-on-accent' -or
+        $webText -notmatch 'RESULT_ALGORITHM_REVISION' -or
         $webText -match 'action="/switch"') {
         throw 'The profile Web UI is missing display-only U7 state, graph, bypass, or chunk-size support.'
     }
@@ -292,11 +311,22 @@ function Assert-FinalBundle {
         'time_alignment_safe',
         'automatic_room_correction_db',
         'preference_correction_db',
+        'CROSSOVER_FREQUENCIES',
+        'apply_joint_crossover_guard',
+        'additional_block_latency_samples',
         '--fatal-errors',
         'audiodsp_announce',
         'invalidate_from_step',
         'install-pair',
-        'MIMO_MODES'
+        'MIMO_MODES',
+        'ensure_measurement_output_path',
+        'validate_result_profile',
+        'validate_result_revision',
+        'RESULT_ALGORITHM_REVISION',
+        'set-session-note',
+        'load-session',
+        'session_integrity',
+        '/var/lib/audiodsp/u7-selector-state.json'
     )) {
         if ($measurementText -notmatch [regex]::Escape($requiredText)) {
             throw "Measurement engine validation is missing: $requiredText"
@@ -304,7 +334,7 @@ function Assert-FinalBundle {
     }
 
     $mimoText = Get-Content -LiteralPath $mimo -Raw
-    foreach ($requiredText in @('weighted pressure matching', 'MIMO_manifest.json', 'correlated_input_headroom', 'mimo_one_sub', 'bulk_delay_samples', 'spectral_continuity', 'solution_blend', 'target_level_normalization', 'predicted_modal_tail_non_regression')) {
+    foreach ($requiredText in @('weighted pressure matching', 'MIMO_manifest.json', 'correlated_input_headroom', 'mimo_one_sub', 'bulk_delay_samples', 'spectral_continuity', 'solution_blend', 'target_level_normalization', 'predicted_modal_tail_non_regression', 'response_confidence', 'crossover_spectra', 'physical_output_limits')) {
         if ($mimoText -notmatch [regex]::Escape($requiredText)) {
             throw "MIMO engine validation is missing: $requiredText"
         }

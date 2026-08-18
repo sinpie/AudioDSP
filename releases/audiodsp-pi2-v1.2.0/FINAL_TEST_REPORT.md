@@ -121,3 +121,80 @@ the active Speaker FIR SHA-256 was still
 The paired test stopped and restored CamillaDSP once by design; it did not
 change the profile, FIR, volume or persistent audio configuration. Pre-deployment code is recoverable from
 `/var/lib/audiodsp/code-backups/20260818T030943Z`.
+
+## 2026-08-18 output-path lock and signal-flow maintenance
+
+- Silent profile/Web matrix reran twice after fixes: 4096 total states, 3968 valid, 128 expected errors, 3136 ordered setting pairs, result `PASS`.
+- Added silent session `new/configure/cancel-error`, Markdown/JSON/ZIP report download, one bound-profile Preview and two wrong-profile Preview/Apply rejection checks.
+- Offline measurement engine result `PASS`: magnitude 52.269 s, bass phase 77.203 s, combined-copy 33.602 s; every generated WAV remained 48 kHz stereo float32 × 32768 taps.
+- Unit fixtures verified U7 path bind, same-path allow, changed-path stop and cross-profile result rejection. Live preflight then found and fixed a default-path mismatch: measurement now reads the same `/var/lib/audiodsp/u7-selector-state.json` as monitor/manager; production status reported `profile=speaker`, `stale=false`.
+- Desktop 1440×1200 and compact 390×844 dark-theme renders were inspected. The new vector signal console shows Input → DSP → Routing → U7 selector → physical speaker chain; compact layout changes the connectors to a vertical flow.
+- Live Pi 2 deployment replaced only Web/measurement code and restarted only `audiodsp-web`. CamillaDSP PID stayed `17814`; config SHA stayed `dfc5d12715b9e543fc87a1349a636cf26a43df454ac172f7d0377e586f532786`; Speaker FIR SHA stayed `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`.
+- `audiodsp-web`, `camilladsp`, and `audiodsp-profile-monitor` remained active; `/`, `/measure`, `/settings` returned HTTP 200 and recent Web warning journal was empty. No measurement sound was played.
+- Previous production code backup: `/var/backups/audiodsp/code-20260818-signal-flow-path-lock`.
+
+## 2026-08-18 FIR-embedded digital crossover maintenance
+
+- Independent L/R/Woofer SISO defaults to an embedded 100 Hz Linkwitz-Riley
+  fourth-order crossover. Front HPF, Woofer LPF and the joint cut-only sum guard
+  are all multiplied into the existing 32768-tap WAVs; no runtime filter stage,
+  convolution path or CamillaDSP block-latency increment is added.
+- FFTW3f measurement regression on the physical Pi 2 passed. The reported
+  round-trip error was `2.562475210909909e-07`; all crossover-default,
+  LR4-complement, joint Front+Woofer guard and acoustic-false-positive rejection
+  fixtures passed. Magnitude/bass-phase/combined builds took approximately
+  52.24/137.83/33.93 seconds in that run.
+- MIMO silent self-test passed structural, causality and physical-output-limit
+  checks. Stereo and one-sub fixtures were applicable; the deliberately unsafe
+  dual-sub fixture was rejected by the impulse-tail proxy instead of being
+  misreported as an acoustic pass.
+- The final isolated Web/profile matrix, including legacy preference migration
+  to crossover `ON/100 Hz`, passed 4096 states (3968 valid, 128 expected errors),
+  56 operations, 3136 ordered operation pairs and 28 unique CamillaDSP configs.
+- Both release writers passed `-ValidateOnly`; Python compilation and repository
+  whitespace checks passed. Pi 2 and Pi 4/5 common engine/Web/test sources have
+  identical SHA-256 values.
+- Production received only the three common Python programs and only
+  `audiodsp-web` was restarted. At final read-only verification all three
+  services were active, CamillaDSP PID remained `17814`, and the managed Speaker
+  FIR remained
+  `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`.
+  No measurement sound was played and no new FIR was applied. Previous code is
+  recoverable from `/var/backups/audiodsp-code-20260818-crossover`.
+
+## 2026-08-18 resumable measurement UX and disclosure maintenance
+
+- The active session summary is rendered above the six workflow tabs and shows
+  session ID, note, creation time, state, measurement count, resumable step and
+  FIR availability. Saved sessions can be searched, annotated and resumed from
+  their last verified checkpoint; editing only the note does not invalidate any
+  measurement, calculation or completion state.
+- Session loading validates persisted response JSON and Front/Rear WAV
+  artifacts. A copied 41 MB completed session restored all three positions,
+  level check, build result, target and bass preset without playing sound or
+  changing the live session.
+- Automatic diagnostics now label every applicable row as `PASS` or `FAIL` and
+  unavailable/non-applicable evidence as `N/A`. Failed rows are red and include
+  a concrete next action. Acoustic failure is not conflated with a structurally
+  valid downloadable WAV.
+- Every native expandable section now has a CSS-vector chevron, a 48 px summary
+  hit area and an accented open state. The browser-default marker is suppressed
+  consistently, so expandable controls are distinguishable from static cards.
+- Hidden Chromium validation passed at 375x812 and 1440x900: zero horizontal
+  overflow, six tabs/panels, overview containment, disclosure toggle, open-state
+  chevron rule, session search and note dirty/clean transitions. The reusable
+  validator is `diagnostics/validate_web_mobile.ps1`.
+- The final isolated Pi 2 matrix passed 4096 states (3968 valid, 128 expected
+  errors), 56 operations, 3136 ordered pairs, 16 Preview resolution cases, 33
+  concurrent writes and Web/session integration. Both release writers passed
+  `-ValidateOnly`.
+- Only `audiodsp-web` was restarted for the final live UI deployment.
+  `camilladsp` remained active with pre/post PID `7731`; no sound was played, no FIR was
+  applied and the audio engine was not restarted.
+- A final headless-browser close exposed harmless but noisy client-disconnect
+  tracebacks. The request handler now absorbs BrokenPipe/ConnectionReset at the
+  connection boundary; two PC/mobile close tests left the Web journal clean.
+  The active Front FIR SHA-256 remained
+  `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`.
+  Previous Web code is recoverable from
+  `/usr/local/bin/audiodsp-profile-web.py.pre-disclosure-final-20260818`.

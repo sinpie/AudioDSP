@@ -14,6 +14,10 @@ AudioDSP의 MIMO는 Dirac ART의 복제품이 아니다. 공개 연구의 robust
 
 같은 T5S의 좌·우 입력은 두 우퍼가 아니다. 알고리즘과 보고서는 이를 `sub_pair` 한 제어원으로 취급한다. 독립 우퍼 모드는 실제로 서로 다른 위치에 놓고 U7 Rear L/R에 각각 연결한 경우에만 선택한다.
 
+Sub가 있는 topology는 기본 ON/100 Hz LR4 crossover의 complex minimum-phase branch spectrum을 전달행렬 자체에 포함한다. 따라서 최적화가 Front HPF/Woofer LPF를 우회하지 않으며, 결과는 8개 convolution path WAV에 이미 내장된다. 주파수별 noise confidence를 위치 가중치에 반영하고, `correction_low_hz` 아래에서는 최적화를 하지 않되 crossover routing은 유지한다. Woofer trim은 regularization 힌트가 아니라 Rear physical-output row-sum의 실제 transfer 상한으로 적용한다.
+
+보고서의 `before/after_modal_tail_db`는 512점 평활 전달함수에서 만든 impulse-tail proxy다. 실제 RT60이나 late reverberation 예측이 아니며 1.5 dB 넘게 악화될 때 적용을 차단하는 보수적 ringing gate로만 쓴다. 실제 잔향 판정은 저장된 deconvolution impulse의 octave EDT/T20과 적용 후 측정으로 한다.
+
 ## 연구 근거와 채택 범위
 
 - Dirac의 공개 ART 설명은 여러 스피커를 공동 제어하는 MIMO, 최소 두 스피커, 주로 20–150 Hz의 능동 저역 제어를 설명한다. Stereo L/R도 서로 지원할 수 있어 sub가 필수는 아니지만, 실용적인 지원 스피커는 충분한 저역 재생 능력이 필요하다. 3개 이상의 유효 측정 위치를 요구하고 제어원·측정점이 늘면 공간 제어가 개선될 수 있다고 설명한다.
@@ -91,7 +95,7 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 | SBIR·초기반사·명료도 | 진단/배치 | C50/C80/D50·반사창 진단, 깊은 null boost 금지 | 벽 거리, 스피커/좌석 이동, 1차 반사 흡음 |
 | 중·고역 late reverb | 물리 처리 | EDT/T20 보고만 함 | 흡음·확산·가구·배치 필요 |
 | L/R 감도·음색 | FIR 보정 가능 | 독립 L/R magnitude | 지향성 차이와 power response는 별도 문제 |
-| 메인–우퍼 합산 | 제한적/MIMO | 레벨·지연·극성·저역 phase | 아날로그 crossover와 비선형은 변경 불가 |
+| 메인–우퍼 합산 | 제한적/MIMO | FIR 내장 LR4 HPF/LPF, 레벨·지연·극성·저역 phase, 세 위치 복소합 | 적용 후 검증 sweep 전에는 확정하지 않으며 아날로그 crossover와 비선형은 변경 불가 |
 | 고조파 왜곡·압축·잡음 | 미측정 | 현재 없음 | 다중 레벨 Farina harmonic 분리 측정 필요; 선형 FIR로 보정 불가 |
 | 지향성·오프축/power response | 미측정 | 현재 없음 | 회전/근접 다각도 측정 필요 |
 | IACC·양이간 공간감 | 미측정 | 현재 없음 | 단일 UMIK-1로 직접 측정 불가; 2마이크/더미헤드 필요 |

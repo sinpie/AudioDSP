@@ -59,6 +59,8 @@ def synthetic_response(frequencies: list[float], source: str, position: int) -> 
         "db": db,
         "phase_rad": phase,
         "bulk_delay_samples": delay,
+        "bulk_delay_reliable": True,
+        "bulk_delay": {"reliable": True},
         "peak": 0.1,
         "rms": 0.02,
         "measurement_quality": {
@@ -72,6 +74,7 @@ def synthetic_response(frequencies: list[float], source: str, position: int) -> 
                 for center in (63, 125, 250, 500, 1000, 2000, 4000)
             ]
         },
+        "frequency_quality": {"frequencies": frequencies, "confidence": [0.95] * len(frequencies)},
     }
 
 
@@ -143,6 +146,15 @@ def main() -> int:
             shutil.copyfile(source, calibration / source.name)
         for source in args.target_dir.glob("*.txt"):
             shutil.copyfile(source, targets / source.name)
+        boot_id_path = root / "boot-id"
+        selector_state_path = root / "u7-selector.json"
+        boot_id_path.write_text("measurement-test-boot\n", encoding="ascii")
+        selector_state_path.write_text(json.dumps({
+            "profile": "speaker",
+            "state_byte": "0xa0",
+            "source": "offline-test",
+            "boot_id": "measurement-test-boot",
+        }), encoding="utf-8")
         os.environ.update({
             "GSONIC_MEASUREMENT_DIR": str(measurements),
             "GSONIC_CAL_DIR": str(calibration),
@@ -150,12 +162,41 @@ def main() -> int:
             "GSONIC_MEASUREMENT_LOCK": str(root / "measurement.lock"),
             "GSONIC_AUDIO_LOCK": str(root / "audio.lock"),
             "GSONIC_PREFERENCES_PATH": str(root / "correction-preferences.json"),
+            "GSONIC_SELECTOR_STATE_PATH": str(selector_state_path),
+            "GSONIC_BOOT_ID_PATH": str(boot_id_path),
         })
         engine = load_module("gsonic_measurement_test", args.engine)
+
+        bound_state = {"mode": "lrw"}
+        engine.bind_measurement_output(bound_state)
+        require(bound_state["measurement_profile"] == "speaker", "level-check output did not bind to the physical U7 path")
+        require(engine.ensure_measurement_output_path(bound_state)["profile"] == "speaker", "bound U7 path was rejected")
+        selector_state_path.write_text(json.dumps({
+            "profile": "headphone", "state_byte": "0x30", "source": "offline-test",
+            "boot_id": "measurement-test-boot",
+        }), encoding="utf-8")
+        try:
+            engine.ensure_measurement_output_path(bound_state)
+        except engine.MeasurementError:
+            pass
+        else:
+            raise AssertionError("physical U7 path change did not stop a bound measurement")
+        selector_state_path.write_text(json.dumps({
+            "profile": "speaker", "state_byte": "0xa0", "source": "offline-test",
+            "boot_id": "measurement-test-boot",
+        }), encoding="utf-8")
+        engine.validate_result_profile({"measurement_profile": "speaker"}, "speaker")
+        try:
+            engine.validate_result_profile({"measurement_profile": "speaker"}, "headphone")
+        except engine.MeasurementError:
+            pass
+        else:
+            raise AssertionError("measured FIR was accepted by a different output profile")
 
         fft_test = engine.self_test()
         engine_source = args.engine.read_text(encoding="utf-8")
         require(engine_source.count('ARECORD, "-q", "--fatal-errors"') == 3, "UMIK captures do not fail closed on ALSA overrun")
+        require('/var/lib/audiodsp/u7-selector-state.json' in engine_source, "measurement selector default differs from monitor/manager state path")
         require(engine.DEFAULT_SWEEP_LEVEL_DBFS == -42 and engine.DEFAULT_NOISE_LEVEL_DBFS == -42, "night-safe default output is not -42 dBFS")
         require(fft_test["taps"] == 32_768 and fft_test["result"] == "PASS", "engine self-test failed")
         estimates = engine.platform_capabilities().get("offline_estimates_seconds", {})
@@ -173,6 +214,12 @@ def main() -> int:
         require(smoothed[100] < 12.0 and max(smoothed) <= 12.0, "variable smoothing failed")
         require(abs(engine.preference_modifier_db(20.0, 4, -3) - 4.0) < 1e-6, "bass preference anchor failed")
         require(abs(engine.preference_modifier_db(20_000.0, 4, -3) + 3.0) < 1e-6, "treble preference anchor failed")
+        for frequency in (20.0, 60.0, 80.0, 100.0, 120.0, 200.0, 1000.0):
+            highpass = engine.linkwitz_riley_4_magnitude(frequency, 100.0, "highpass")
+            lowpass = engine.linkwitz_riley_4_magnitude(frequency, 100.0, "lowpass")
+            require(abs(highpass + lowpass - 1.0) < 1e-12, "LR4 acoustic branch magnitudes are not complementary")
+        require(abs(engine.crossover_transfer_db(100.0, 100, "highpass") + 6.020599913) < 1e-5, "LR4 highpass is not -6.02 dB at crossover")
+        require(engine.DEFAULT_CORRECTION_PREFERENCES["crossover_enabled"] is True and engine.DEFAULT_CORRECTION_PREFERENCES["crossover_frequency_hz"] == 100, "digital crossover is not default ON at 100 Hz")
 
         noise_path = root / "level-white.wav"
         engine.write_white_noise(noise_path, -42, 5)
@@ -266,7 +313,7 @@ def main() -> int:
                 (session / response_name).write_text(json.dumps(response), encoding="utf-8")
                 measurements_index.append({"position": position, "source": source, "response": response_name})
         state = {
-            "version": 1,
+            "version": 2,
             "state": "measured",
             "stage": "synthetic",
             "progress": 100.0,
@@ -285,11 +332,13 @@ def main() -> int:
             "measurements": measurements_index,
             "validation": None,
             "result": None,
+            "measurement_profile": "speaker",
+            "measurement_output": {"profile": "speaker", "label": engine.OUTPUT_PROFILE_LABELS["speaker"]},
         }
         engine.save_current(state)
 
         started = time.monotonic()
-        engine.build_worker("harman", "strong", -9, "magnitude", 200)
+        engine.build_worker("harman", "strong", -9, "magnitude", 200, crossover_enabled=False)
         magnitude_state = engine.load_current()
         magnitude = validate_result(engine, magnitude_state, phase=False)
         level_control = magnitude_state["result"]["woofer_level_control"]
@@ -303,7 +352,7 @@ def main() -> int:
         magnitude_seconds = round(time.monotonic() - started, 3)
 
         started = time.monotonic()
-        engine.build_worker("flat", "primus360", -6, "bass", 200, "center", 2, -2, 30, 5000, 3, 12)
+        engine.build_worker("flat", "none", 0, "bass", 200, "center", 2, -2, 30, 5000, 3, 12)
         phase_state = engine.load_current()
         phase_result = validate_result(engine, phase_state, phase=True)
         require(phase_state["result"]["spatial_mode"] == "center", "spatial weighting metadata missing")
@@ -328,7 +377,24 @@ def main() -> int:
         alignment = phase_state["result"]["time_alignment"]
         require(alignment.get("aligned") and alignment.get("residual_total_delay_samples") == 0, "Front/Woofer total acoustic+FIR delay was not aligned")
         require("front_fir_energy_delay_samples" in alignment and "rear_fir_energy_delay_samples" in alignment, "FIR delay was omitted from crossover alignment")
+        crossover = phase_state["result"]["crossover"]
+        require(crossover.get("enabled") and crossover.get("embedded_in_fir") and crossover.get("frequency_hz") == 100, "default digital crossover was not embedded in FIR")
+        require(crossover.get("additional_runtime_filters") == 0 and crossover.get("additional_block_latency_samples") == 0, "embedded crossover incorrectly adds runtime/block latency")
+        require(crossover.get("coherent_upper_guard_pass"), "joint Front+Woofer constructive-sum guard failed")
+        require(crossover.get("complex_sum_target_pass"), "joint Front+Woofer complex target verification failed")
+        require(phase_state["result"]["graphs"]["left"]["crossover"]["role"] == "highpass", "Front crossover is not HPF")
+        require(phase_state["result"]["graphs"]["woofer"]["crossover"]["role"] == "lowpass", "Woofer crossover is not LPF")
         phase_seconds = round(time.monotonic() - started, 3)
+
+        # A deliberately over-attenuated woofer preference can no longer be
+        # mislabeled as a successful acoustic crossover merely because the WAV
+        # files are structurally valid. It is still generated for Preview, but
+        # the target-sum status must remain explicit.
+        engine.build_worker("harman", "strong", -9, "bass", 200)
+        conservative_state = engine.load_current()
+        conservative_crossover = conservative_state["result"]["crossover"]
+        require(conservative_crossover.get("embedded_in_fir") and conservative_crossover.get("coherent_upper_guard_pass"), "conservative crossover lost FIR embedding or upper-sum safety")
+        require(not conservative_state["result"]["self_validation"]["overall_pass"] and conservative_crossover.get("status") == "fail_target", "over-attenuated synthetic crossover was falsely labeled PASS")
 
         # Combined SISO must tune the measured L+Woofer / R+Woofer sum with one
         # stereo FIR.  It must not invent a separately scaled Rear FIR, and the
@@ -352,7 +418,13 @@ def main() -> int:
         })
         engine.save_current(combined_state)
         combined_started = time.monotonic()
-        engine.build_worker("harman", "strong", -9, "magnitude", 200)
+        try:
+            engine.build_worker("harman", "strong", -9, "magnitude", 200)
+        except engine.MeasurementError as exc:
+            require("L/R/W" in str(exc), "combined mode crossover rejection is unclear")
+        else:
+            raise AssertionError("combined L+Woofer mode incorrectly accepted independent crossover ON")
+        engine.build_worker("harman", "strong", -9, "magnitude", 200, crossover_enabled=False)
         combined_result = engine.load_current()["result"]
         require(combined_result["rear"] is None, "combined SISO unexpectedly generated a separate Rear FIR")
         require(combined_result["rear_metrics"] is None, "combined SISO unexpectedly used four convolution channels")
@@ -391,6 +463,52 @@ def main() -> int:
         preferences = engine.save_correction_preferences({**engine.DEFAULT_CORRECTION_PREFERENCES, "target": "flat", "max_boost_db": 3})
         require(engine.load_correction_preferences() == preferences and preferences["target"] == "flat", "correction preference persistence failed")
 
+        # Session notes are metadata only. Saving them must not invalidate any
+        # completed wizard stage, while loading a saved session restores the
+        # exact verified checkpoint and rejects fake completion metadata.
+        dependency_state["level_check"] = {"ok": True, "snr_db": 30.0}
+        engine.save_current(dependency_state)
+        engine.atomic_json(session / "session.json", dependency_state)
+        before_note = engine.load_current()
+        note_result = engine.set_session_note("중앙 청취점 · Woofer 노브 11시")
+        after_note = engine.load_current()
+        require(note_result["session_note"].startswith("중앙 청취점"), "session note was not saved")
+        for key in ("state", "positions_completed", "measurements", "level_check", "result", "applied_profile"):
+            require(after_note.get(key) == before_note.get(key), f"session note unexpectedly changed {key}")
+        paused = measurements / "paused"
+        paused.mkdir()
+        paused_state = dict(dependency_state)
+        paused_state.update({
+            "session_id": "paused", "session_dir": str(paused), "state": "ready",
+            "stage": "위치 2에서 이어가기", "positions_completed": 1,
+            "measurements": [item for item in measurements_index if item["position"] == 1],
+            "result": None, "applied_profile": None,
+        })
+        for item in paused_state["measurements"]:
+            shutil.copyfile(session / item["response"], paused / item["response"])
+        engine.atomic_json(paused / "session.json", paused_state)
+        (paused / "session-note.txt").write_text("소파 왼쪽 위치까지 완료\n", encoding="utf-8")
+        loaded_paused = engine.load_session("paused")
+        require(loaded_paused["integrity"]["positions_completed"] == 1, "saved session checkpoint was not restored")
+        paused_current = engine.load_current()
+        require(paused_current["session_note"] == "소파 왼쪽 위치까지 완료" and paused_current["positions_completed"] == 1, "saved session note/progress was not loaded")
+        catalog_sessions = engine.list_sessions()["sessions"]
+        require(any(item["session_id"] == "paused" and item["note"].startswith("소파") for item in catalog_sessions), "session list omitted the adjacent note")
+        loaded_full = engine.load_session("synthetic")
+        require(loaded_full["integrity"]["positions_completed"] == 3 and loaded_full["integrity"]["has_result"], "completed FIR session was not restored")
+        broken = measurements / "broken"
+        broken.mkdir()
+        broken_state = dict(paused_state)
+        broken_state.update({"session_id": "broken", "session_dir": str(broken)})
+        engine.atomic_json(broken / "session.json", broken_state)
+        try:
+            engine.load_session("broken")
+        except engine.MeasurementError as exc:
+            require("파일" in str(exc), "corrupt session load error lacks artifact guidance")
+        else:
+            raise AssertionError("session with missing completed artifacts was loaded")
+        engine.save_current(dependency_state)
+
         interrupted = dict(dependency_state)
         interrupted.update(state="processing", worker_pid=2_000_000_000, active_pids=[2_000_000_001])
         engine.save_current(interrupted)
@@ -413,6 +531,12 @@ def main() -> int:
             "capture_then_batch_response_processing": True,
             "combined_build_seconds": combined_seconds,
             "combined_single_convolution_then_copy": True,
+            "embedded_lr4_crossover_default_on": True,
+            "joint_front_woofer_sum_guard": True,
+            "acoustic_crossover_false_positive_rejected": True,
+            "session_checkpoint_resume": True,
+            "session_note_non_invalidating": True,
+            "session_artifact_integrity_gate": True,
             "actual_fir_target_verification": True,
             "room_decay_control": True,
             "dependency_invalidation": True,

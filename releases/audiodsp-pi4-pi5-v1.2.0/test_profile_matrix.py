@@ -670,28 +670,41 @@ def main() -> int:
                 raise AssertionError("Web server did not listen")
 
             status_page, _ = get_bytes(base + "/?woofer=1")
-            for marker in ("현황", "측정 · 보정", "프로필 · 설정", "현재 설정", "현재 FIR 주파수 응답", "시스템 상태", "지금 할 일", "출력 볼륨", "output-volume-control"):
+            for marker in ("현황", "측정 · 보정", "프로필 · 설정", "현재 설정", "현재 FIR 보정 전달함수", "목표 청취 음압 그래프가 아닙니다", "시스템 상태", "지금 할 일", "출력 볼륨", "output-volume-control", "오디오 신호 흐름", "signal-flow", "U7 PHYSICAL SELECTOR", "두 U7 경로 모두 스피커에 연결됨"):
                 require(marker.encode("utf-8") in status_page, f"Status-page marker missing: {marker}")
             require(b"measurement card-wide" not in status_page and b"Front WAV" not in status_page, "status page contains another screen")
+            require("<title>현황 · AudioDSP</title>".encode("utf-8") in status_page, "status page title is not contextual")
             measure_page, _ = get_bytes(base + "/measure")
-            for marker in (b"32768", b"UMIK-1", b"target-graph", b"job-progress", b"workflow", b"cal-card", b'name="noise_level_dbfs"', b'name="level_dbfs" type="range"', b'name="woofer_measurement_attenuation_db"', b'value="-42"', b"output-level-warning", "−42부터 시작".encode("utf-8"), "안전 시작 범위".encode("utf-8"), "L+Woofer / R+Woofer".encode("utf-8"), "Front L / Front R / Woofer".encode("utf-8"), "90° · 천장 방향".encode("utf-8"), "0° · 마이크 정면".encode("utf-8")):
+            for marker in (b"32768", b"UMIK-1", b"target-graph", b"job-progress", b"workflow", b"cal-card", b"session-overview", b"session-library", b'name="noise_level_dbfs"', b'name="level_dbfs" type="range"', b'name="woofer_measurement_attenuation_db"', b'value="-42"', b"output-level-warning", b"measurement-path-lock", b'data-measurement-path="unbound"', "−42부터 시작".encode("utf-8"), "안전 시작 범위".encode("utf-8"), "L+Woofer / R+Woofer".encode("utf-8"), "Front L / Front R / Woofer".encode("utf-8"), "90° · 천장 방향".encode("utf-8"), "0° · 마이크 정면".encode("utf-8"), "활성 Session 없음".encode("utf-8")):
                 require(marker in measure_page, f"Measurement-page marker missing: {marker!r}")
             web_source = args.web.read_text(encoding="utf-8")
-            for marker in ("실제 측정음을 재생합니다", "저역 late/early", "기존 SISO 저역 레벨", "0.5 dB 넘게 악화"):
+            for marker in ("실제 측정음을 재생합니다", "저역 late/early", "기존 SISO 저역 레벨", "1.5 dB 넘게 악화", "실제 RT60/잔향 예측이 아니며", "디지털 Crossover", "LR4 HPF", "additional_block_latency_samples", "set-session-note", "load-session", "build-fieldset", "validation-checklist", "--step-accent", "summary::after", "details[open]>summary::after"):
                 require(marker in web_source, f"Measurement/MIMO safety UI source marker missing: {marker}")
-            require(b'<a class="flow-step current" href="#measurement-step-1"' in measure_page, "current measurement step is not a non-destructive link")
+            require(b'role="tab" class="flow-step current"' in measure_page, "current measurement step is not an accessible non-destructive tab")
+            require(b'aria-current="step"' in measure_page, "current measurement step lacks accessible state")
+            require("<title>측정 · 보정 · AudioDSP</title>".encode("utf-8") in measure_page, "measurement page title is not contextual")
             require(b"/measurement/rewind" not in measure_page, "step navigation unexpectedly discards data")
             require(b"current FIR" not in measure_page and b"data-profile=" not in measure_page, "measurement page contains another screen")
             settings_page, _ = get_bytes(base + "/settings")
-            for marker in (b"DSP Bypass", b"MIMO 2", b"Front WAV", b"Rear WAV", b"chunksize", b"live_u7_status_poll", "전체 백업 · 안전 복원".encode("utf-8"), b"schema v2"):
+            for marker in (b"DSP Bypass", b"MIMO 2", b"Front WAV", b"Rear WAV", b"chunksize", b"live_u7_status_poll", b"profile-mini-flow", "Speaker 출력 체인".encode("utf-8"), "Headphone 잭 출력 체인".encode("utf-8"), "전체 백업 · 안전 복원".encode("utf-8"), b"schema v2"):
                 require(marker in settings_page, f"Settings-page marker missing: {marker!r}")
+            for marker in (b'id="speaker-front-wav-input"', b'id="speaker-rear-wav-input"', b'id="headphone-front-wav-input"', b'id="headphone-rear-wav-input"', b'id="backup-zip-input"', b'class="file-picker-label"'):
+                require(marker in settings_page, f"Accessible file-input marker missing: {marker!r}")
+            require("<title>프로필 · 설정 · AudioDSP</title>".encode("utf-8") in settings_page, "settings page title is not contextual")
             require(b"measurement card-wide" not in settings_page and b"fir-response" not in settings_page, "settings page contains another screen")
             for page in (status_page, measure_page, settings_page):
-                for marker in (b"prefers-color-scheme", b"fetch('/api/status'", b"document.hidden"):
+                for marker in (b"prefers-color-scheme", b"fetch('/api/status'", b"document.hidden", b'class="skip-link"', b'id="main-content"', b'aria-current="page"', b"--on-accent", b'aria-hidden="true" focusable="false"'):
                     require(marker in page, f"Shared Web marker missing: {marker!r}")
+                require(page.count(b'aria-current="page"') == 1, "page has an invalid current-navigation count")
+            for marker in (b'role="alert"', b'graph-scroll" tabindex="0" role="region"', b"input::file-selector-button", b"j.measurement_output_match==null?'':"):
+                require(marker in web_source.encode("utf-8"), f"Accessibility source marker missing: {marker!r}")
             measurement_status = json.loads(get_bytes(base + "/api/measurement/status")[0])
             require(measurement_status["state"] == "idle", "measurement status is not idle")
             require(measurement_status["installed_calibrations"]["90"]["available"], "90-degree calibration is not reported as installed")
+            legacy_preferences = {key: value for key, value in measurement_status["correction_preferences"].items() if not key.startswith("crossover_")}
+            (state / "correction-preferences.json").write_text(json.dumps(legacy_preferences), encoding="utf-8")
+            migrated_preferences = json.loads(get_bytes(base + "/api/measurement/status")[0])["correction_preferences"]
+            require(migrated_preferences["crossover_enabled"] is True and migrated_preferences["crossover_frequency_hz"] == 100, "legacy preferences did not inherit default crossover settings")
             post_calibration(base + "/measurement/calibration", "0", args.cal_dir / "7200660.txt")
             post_calibration(base + "/measurement/calibration", "90", args.cal_dir / "7200660_90deg.txt")
             calibration_status = json.loads(get_bytes(base + "/api/measurement/status")[0])["installed_calibrations"]
@@ -702,6 +715,40 @@ def main() -> int:
             health = json.loads(get_bytes(base + "/api/health")[0])
             require("memory_used_percent" in health and len(health.get("load", [])) == 3, "system health response incomplete")
 
+            # Session creation and reconfiguration are silent control-plane paths.
+            # They must initialize the physical-output lock as unbound and change
+            # only the dependency-affected fields; no level/sweep route is invoked.
+            session_fields = {
+                "mode": "lrw", "orientation": "90", "level_dbfs": "-42",
+                "noise_level_dbfs": "-42", "woofer_measurement_attenuation_db": "-9",
+                "sweep_seconds": "8",
+            }
+            post_form(base + "/measurement/new", session_fields)
+            created_session = json.loads(get_bytes(base + "/api/measurement/status")[0])
+            require(created_session["version"] == 2 and created_session.get("measurement_profile") is None, "new session did not start with an unbound physical output")
+            reconfigured_fields = dict(session_fields, noise_level_dbfs="-43", sweep_seconds="4")
+            post_form(base + "/measurement/configure", reconfigured_fields)
+            configured_session = json.loads(get_bytes(base + "/api/measurement/status")[0])
+            require(configured_session["noise_level_dbfs"] == -43 and configured_session["sweep_seconds"] == 4, "silent measurement reconfiguration failed")
+            first_session_id = configured_session["session_id"]
+            checkpoint = {key: configured_session.get(key) for key in ("state", "positions_completed", "level_check", "measurements", "result")}
+            post_form(base + "/measurement/session-note", {"note": "소파 중앙 · Woofer 노브 11시"})
+            noted_session = json.loads(get_bytes(base + "/api/measurement/status")[0])
+            require(noted_session["session_note"].startswith("소파 중앙"), "session note was not persisted")
+            require({key: noted_session.get(key) for key in checkpoint} == checkpoint, "session note reset measurement progress")
+            noted_page, _ = get_bytes(base + "/measure")
+            require("소파 중앙 · Woofer 노브 11시".encode("utf-8") in noted_page and b"active-session-note" in noted_page and b"session-save-state" in noted_page, "active session summary/note is not above the wizard")
+            post_form(base + "/measurement/new", session_fields)
+            second_session = json.loads(get_bytes(base + "/api/measurement/status")[0])
+            require(second_session["session_id"] != first_session_id, "second saved session was not created")
+            library_page, _ = get_bytes(base + "/measure")
+            require(first_session_id.encode() in library_page and "소파 중앙".encode("utf-8") in library_page and "이어하기".encode("utf-8") in library_page and b"session-filter-input" in library_page, "saved session list omitted the adjacent note/resume/search action")
+            post_form(base + "/measurement/load-session", {"session_id": first_session_id})
+            resumed_session = json.loads(get_bytes(base + "/api/measurement/status")[0])
+            require(resumed_session["session_id"] == first_session_id and resumed_session["session_note"].startswith("소파 중앙"), "saved session did not resume with its note")
+            require({key: resumed_session.get(key) for key in checkpoint} == checkpoint, "saved session did not preserve its completed wizard checkpoint")
+            post_form(base + "/measurement/cancel", {}, expected=400)
+
             # Versioned full backup is downloadable, staged without mutation, integrity
             # checked, and restored only after a separate explicit confirmation.
             backup_payload, backup_headers = get_bytes(base + "/api/backup/download")
@@ -711,6 +758,8 @@ def main() -> int:
                 require({"manifest.json", "profile-settings.json", "correction-preferences.json", "profiles/Factory_Speaker_Front_LR.wav"}.issubset(backup_names), "full backup is missing required members")
                 backup_manifest = json.loads(archive.read("manifest.json"))
                 require(backup_manifest["format"] == "AudioDSP Backup" and backup_manifest["schema_version"] == 2, "backup schema mismatch")
+                correction_preferences = json.loads(archive.read("correction-preferences.json"))
+                require(correction_preferences["crossover_enabled"] is True and correction_preferences["crossover_frequency_hz"] == 100, "backup lost default digital crossover preferences")
                 for name, item in backup_manifest["files"].items():
                     require(hashlib.sha256(archive.read(name)).hexdigest() == item["sha256"], f"backup hash mismatch: {name}")
             restore_settings_before = manager.load_settings()
@@ -775,8 +824,18 @@ def main() -> int:
             browser_session.mkdir()
             browser_front = browser_session / "Generated_Front_LR_32768.wav"
             browser_rear = browser_session / "Generated_Rear_LR_32768.wav"
+            browser_report_md = browser_session / "Room_Tuning_Report.md"
+            browser_report_json = browser_session / "Room_Tuning_Report.json"
             write_wave(browser_front, left=0.123, right=0.087)
             write_wave(browser_rear, left=0.234, right=0.156)
+            browser_report_md.write_text("# Room tuning report\n", encoding="utf-8")
+            browser_report_json.write_text(json.dumps({"status": "PASS"}), encoding="utf-8")
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+            selector_path = Path(environment["GSONIC_SELECTOR_STATE_PATH"])
+            selector_path.write_text(json.dumps({
+                "profile": "speaker", "state_byte": "0xa0", "source": "matrix",
+                "updated_unix": time.time(), "boot_id": boot_id,
+            }), encoding="utf-8")
             browser_job = {
                 "state": "built",
                 "stage": "32768탭 FIR 생성 완료",
@@ -786,7 +845,10 @@ def main() -> int:
                 "mode": "lrw",
                 "positions_completed": 3,
                 "positions_total": 3,
+                "measurement_profile": "speaker",
+                "measurement_output": {"profile": "speaker", "label": "U7 Speaker output · speaker chain"},
                 "result": {
+                    "algorithm_revision": "2026-08-18-crossover-sum-v2",
                     "front": browser_front.name,
                     "rear": browser_rear.name,
                     "taps": 32768,
@@ -794,13 +856,40 @@ def main() -> int:
                     "preset": "strong",
                     "front_sha256": hashlib.sha256(browser_front.read_bytes()).hexdigest(),
                     "front_metrics": {"left": {"peak_tap": 0, "peak_delay_ms": 0.0}},
+                    "self_validation": {"overall_pass": True, "target_fit": {}},
                     "graphs": {},
+                    "report_md": browser_report_md.name,
+                    "report_json": browser_report_json.name,
                 },
             }
             (measurements / "current.json").write_text(json.dumps(browser_job), encoding="utf-8")
             result_page, _ = get_bytes(base + "/measure")
-            for marker in (b"Front WAV", b"Rear WAV", "WAV + 보고서 ZIP".encode("utf-8"), b"measurement-result-graph", "A/B 청취 비교".encode("utf-8"), "자동 백업".encode("utf-8"), "덮어쓰기".encode("utf-8")):
+            for marker in (b"Front WAV", b"Rear WAV", "WAV + 보고서 ZIP".encode("utf-8"), b"measurement-result-graph", "A/B 청취 비교".encode("utf-8"), "자동 백업".encode("utf-8"), "덮어쓰기".encode("utf-8"), b'data-measurement-path="speaker"', "이 결과의 전용 경로".encode("utf-8"), b"Speaker output", b'role="tablist"', b'role="tabpanel"', b"non_destructive_measurement_tabs", "Woofer 최종 trim".encode("utf-8"), "측정 시 Woofer 감쇄".encode("utf-8"), "자동 검증 체크리스트".encode("utf-8"), b"status-badge na"):
                 require(marker in result_page, f"generated-result Web marker missing: {marker!r}")
+            require(result_page.count(b'role="tab"') == 6 and result_page.count(b'role="tabpanel"') == 6, "measurement workflow is not a six-tab/six-panel interface")
+            require(b'value="headphone"' not in result_page, "speaker-bound result offered the Headphone-jack profile")
+            stale_job = copy.deepcopy(browser_job)
+            stale_job["result"].pop("algorithm_revision")
+            (measurements / "current.json").write_text(json.dumps(stale_job), encoding="utf-8")
+            stale_page, _ = get_bytes(base + "/measure")
+            require("이전 알고리즘으로 계산된 결과".encode("utf-8") in stale_page and "재계산 후 정식 적용 가능".encode("utf-8") in stale_page, "stale-result UI did not block audition/apply")
+            post_form(base + "/measurement/preview", {"profile": "speaker"}, expected=400)
+            post_form(base + "/measurement/apply", {"profile": "speaker"}, expected=400)
+            failed_job = copy.deepcopy(browser_job)
+            failed_job["result"]["self_validation"].update({
+                "overall_pass": False,
+                "independent_positions": {"pass": False, "reused_measurements": [{"position": 2}]},
+                "target_fit": {"woofer": {"pass": False, "mae_db": 12.9, "p90_abs_error_db": 19.5}},
+                "crossover_sum": {"required": True, "pass": False, "status": "limited_unverified_phase"},
+                "measurement_snr_db": {"minimum": 19.0, "recommended_minimum": 15.0},
+            })
+            (measurements / "current.json").write_text(json.dumps(failed_job), encoding="utf-8")
+            failed_page, _ = get_bytes(base + "/measure")
+            require("타겟/합산 셀프검증 미통과".encode("utf-8") in failed_page and "셀프검증 통과 후 정식 적용 가능".encode("utf-8") in failed_page, "failed target-fit UI did not block permanent apply")
+            for marker in (b"validation-error", b"status-badge fail", "해결 방법".encode("utf-8"), "서로 다른 3위치".encode("utf-8"), "Woofer 타겟 달성".encode("utf-8"), "합산 검증을 다시 측정".encode("utf-8"), b"status-badge pass"):
+                require(marker in failed_page, f"failed validation guidance marker missing: {marker!r}")
+            post_form(base + "/measurement/apply", {"profile": "speaker"}, expected=400)
+            (measurements / "current.json").write_text(json.dumps(browser_job), encoding="utf-8")
             downloaded_front, download_headers = get_bytes(base + "/api/measurement/download/front")
             require(downloaded_front == browser_front.read_bytes(), "browser Front WAV download content mismatch")
             require("attachment" in download_headers.get("Content-Disposition", "") and browser_front.name in download_headers.get("Content-Disposition", ""), "browser Front WAV download header missing")
@@ -810,29 +899,76 @@ def main() -> int:
             downloaded_zip, download_headers = get_bytes(base + "/api/measurement/download/all")
             require("attachment" in download_headers.get("Content-Disposition", "") and download_headers.get("Content-Type") == "application/zip", "browser ZIP download header missing")
             with zipfile.ZipFile(io.BytesIO(downloaded_zip)) as archive:
-                require(set(archive.namelist()) == {browser_front.name, browser_rear.name, "manifest.json"}, "browser ZIP members mismatch")
+                require(set(archive.namelist()) == {browser_front.name, browser_rear.name, browser_report_md.name, browser_report_json.name, "manifest.json"}, "browser ZIP members mismatch")
                 require(archive.read(browser_front.name) == browser_front.read_bytes(), "ZIP Front content mismatch")
                 require(archive.read(browser_rear.name) == browser_rear.read_bytes(), "ZIP Rear content mismatch")
                 require(json.loads(archive.read("manifest.json"))["taps"] == 32768, "ZIP manifest tap count mismatch")
+            downloaded_report_md, report_md_headers = get_bytes(base + "/api/measurement/download/report-md")
+            require(downloaded_report_md == browser_report_md.read_bytes() and "attachment" in report_md_headers.get("Content-Disposition", ""), "browser Markdown report download failed")
+            downloaded_report_json, report_json_headers = get_bytes(base + "/api/measurement/download/report-json")
+            require(downloaded_report_json == browser_report_json.read_bytes() and report_json_headers.get("Content-Type", "").startswith("application/json"), "browser JSON report download failed")
 
             # Non-destructive A/B preview switches the live config only. Profile WAVs and
             # saved settings remain byte-for-byte unchanged until permanent apply.
             profiles_before_preview = {path: path.read_bytes() for bands in manager.PROFILE_FILES.values() for path in bands.values()}
             settings_before_preview = manager.SETTINGS_PATH.read_bytes()
             config_before_preview = manager.CONFIG_PATH.read_bytes()
-            for preview_profile in ("speaker", "headphone"):
-                post_form(base + "/measurement/preview", {"profile": preview_profile})
-                preview_status = json.loads(get_bytes(base + "/api/status")[0])
-                require(preview_status["preview"]["active"] and preview_status["preview"]["profile"] == preview_profile, "A/B preview status mismatch")
-                require(manager.CONFIG_PATH.read_bytes() != config_before_preview, "A/B preview did not change live config")
-                require(manager.SETTINGS_PATH.read_bytes() == settings_before_preview, "A/B preview changed saved settings")
-                require(all(path.read_bytes() == content for path, content in profiles_before_preview.items()), "A/B preview modified a managed profile WAV")
-                post_form(base + "/measurement/restore", {})
-                restored_status = json.loads(get_bytes(base + "/api/status")[0])
-                require(not restored_status["preview"]["active"], "A/B restore left preview active")
-                require(manager.CONFIG_PATH.read_bytes() == config_before_preview, "A/B restore did not restore the original config")
-                require(manager.SETTINGS_PATH.read_bytes() == settings_before_preview, "A/B restore changed saved settings")
-                require(all(path.read_bytes() == content for path, content in profiles_before_preview.items()), "A/B restore modified a managed profile WAV")
+            post_form(base + "/measurement/preview", {"profile": "headphone"}, expected=400)
+            post_form(base + "/measurement/preview", {"profile": "speaker"})
+            preview_status = json.loads(get_bytes(base + "/api/status")[0])
+            require(preview_status["preview"]["active"] and preview_status["preview"]["profile"] == "speaker", "A/B preview status mismatch")
+            require(preview_status["resolved"]["effective_rear_mode"] == "separate" and preview_status["resolved"]["convolution_channels"] == 4, "4ch A/B preview status incorrectly followed saved copy mode")
+            preview_front, _ = get_bytes(base + "/api/fir/front")
+            preview_rear, preview_rear_headers = get_bytes(base + "/api/fir/rear")
+            require(preview_front == browser_front.read_bytes() and preview_rear == browser_rear.read_bytes(), "A/B FIR endpoints did not expose the running preview pair")
+            require(preview_rear_headers.get("X-AudioDSP-Rear-Mode") == "separate", "A/B Rear endpoint reported the saved mode instead of preview mode")
+            require(manager.CONFIG_PATH.read_bytes() != config_before_preview, "A/B preview did not change live config")
+            require(manager.SETTINGS_PATH.read_bytes() == settings_before_preview, "A/B preview changed saved settings")
+            require(all(path.read_bytes() == content for path, content in profiles_before_preview.items()), "A/B preview modified a managed profile WAV")
+            post_form(base + "/measurement/restore", {})
+            restored_status = json.loads(get_bytes(base + "/api/status")[0])
+            require(not restored_status["preview"]["active"], "A/B restore left preview active")
+            require(manager.CONFIG_PATH.read_bytes() == config_before_preview, "A/B restore did not restore the original config")
+            require(manager.SETTINGS_PATH.read_bytes() == settings_before_preview, "A/B restore changed saved settings")
+            require(all(path.read_bytes() == content for path, content in profiles_before_preview.items()), "A/B restore modified a managed profile WAV")
+
+            # Saved configuration and temporary audition configuration are independent axes.
+            # Cover both directions (saved copy -> preview separate and saved separate -> preview copy),
+            # both profiles, and saved bypass on/off before returning to the exact saved state.
+            original_settings = manager.load_settings()
+            preview_resolution_cases = 0
+            for profile in ("speaker", "headphone"):
+                for saved_mode in ("copy_front", "separate"):
+                    for saved_bypass in (False, True):
+                        for preview_rear_source in (None, browser_rear):
+                            case_settings = copy.deepcopy(original_settings)
+                            case_settings["requested_profile"] = profile
+                            case_settings["rear_mode"][profile] = saved_mode
+                            case_settings["bypass"][profile] = saved_bypass
+                            manager.apply_settings(case_settings, restart=False)
+                            saved_bytes = manager.SETTINGS_PATH.read_bytes()
+                            manager.preview_pair(profile, browser_front, preview_rear_source, -9)
+                            during = manager.status()
+                            expected_preview_mode = "separate" if preview_rear_source is not None else "copy_front"
+                            expected_preview_channels = 4 if preview_rear_source is not None else 2
+                            require(during["preview"]["active"], "preview matrix did not report active")
+                            require(during["resolved"]["effective_profile"] == profile, "preview matrix profile mismatch")
+                            require(during["resolved"]["effective_rear_mode"] == expected_preview_mode, "preview matrix mode followed saved mode")
+                            require(during["resolved"]["convolution_channels"] == expected_preview_channels and not during["resolved"]["bypass"], "preview matrix channel/bypass mismatch")
+                            require(manager.SETTINGS_PATH.read_bytes() == saved_bytes, "preview matrix changed saved settings")
+                            running_config = manager.CONFIG_PATH.read_text(encoding="utf-8")
+                            require(("rear_left:" in running_config) == (preview_rear_source is not None), "preview matrix CamillaDSP channel topology mismatch")
+                            manager.restore_profile(restart=False)
+                            after = manager.status()
+                            expected_restored_mode = "bypass" if saved_bypass else saved_mode
+                            expected_restored_channels = 0 if saved_bypass else (4 if saved_mode == "separate" else 2)
+                            require(not after["preview"]["active"], "preview matrix restore left preview active")
+                            require(after["resolved"]["effective_rear_mode"] == expected_restored_mode, "preview matrix restore mode mismatch")
+                            require(after["resolved"]["convolution_channels"] == expected_restored_channels, "preview matrix restore channels mismatch")
+                            preview_resolution_cases += 1
+            manager.apply_settings(original_settings, restart=False)
+            require(manager.CONFIG_PATH.read_bytes() == config_before_preview, "preview matrix did not restore the original config")
+            report["preview_resolution_matrix"] = {"cases": preview_resolution_cases, "profiles": 2, "saved_modes": 2, "saved_bypass_states": 2, "preview_modes": 2}
             post_form(base + "/measurement/preview", {"profile": "speaker"})
             stale_preview = json.loads(manager.PREVIEW_STATE_PATH.read_text(encoding="utf-8"))
             stale_preview["boot_id"] = "previous-boot-id"
@@ -842,6 +978,7 @@ def main() -> int:
             require(manager.CONFIG_PATH.read_bytes() == config_before_preview, "stale preview recovery did not restore the profile config")
             before_apply = manager.PROFILE_FILES["speaker"]["front"].read_bytes()
             backups_before_apply = len(list(manager.BACKUP_DIR.glob("*.wav")))
+            post_form(base + "/measurement/apply", {"profile": "headphone"}, expected=400)
             post_form(base + "/measurement/apply", {"profile": "speaker"})
             require(manager.PROFILE_FILES["speaker"]["front"].read_bytes() == browser_front.read_bytes(), "generated FIR apply did not overwrite Front")
             require(manager.PROFILE_FILES["speaker"]["front"].read_bytes() != before_apply, "generated FIR apply did not change Front")
@@ -866,8 +1003,6 @@ def main() -> int:
             post_form(base + "/switch", {"profile": "headphone"}, expected=404)
 
             # Current U7 state is display-only and highlights exactly one profile card.
-            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
-            selector_path = Path(environment["GSONIC_SELECTOR_STATE_PATH"])
             for profile, state_byte in (("speaker", "0xa0"), ("headphone", "0x30")):
                 selector_path.write_text(json.dumps({
                     "profile": profile,
@@ -1052,7 +1187,8 @@ def main() -> int:
                 "system_health": True,
                 "browser_wav_downloads": 2,
                 "browser_zip_download": True,
-                "non_destructive_ab_preview_profiles": 2,
+                "non_destructive_ab_preview_profiles": 1,
+                "measurement_result_wrong_profile_rejections": 2,
                 "preview_reboot_recovery": True,
                 "generated_pair_overwrite_with_backup": True,
                 "uploads": web_uploads,

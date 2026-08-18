@@ -36,8 +36,11 @@
 - Xonar U7: 입력 2채널, 출력 4채널, 48 kHz
 - CamillaDSP I/O: `S32_LE`; U7 공유 출력 dmix: `S24_3LE`
 - FIR: stereo IEEE float32 WAV, 48 kHz, 32768 taps, 디지털 preamp 없음
+- L/R/Woofer 개별 룸보정은 기본 ON/100 Hz LR4 디지털 crossover를 Front/Rear FIR WAV 안에 내장한다. 별도 runtime filter와 block latency 증가는 0이며, 최종 acoustic 합산은 phase 신뢰도와 세 위치 복소합 검증을 별도로 통과해야 한다.
 - Factory/Speaker FIR SHA-256: `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`
 - 출력 볼륨: U7 `PCM,0`, 웹/API 범위 -60~0 dB, 초기 저장값 -10 dB
+- Web Status는 입력→DSP→라우팅→U7 selector→실제 출력의 반응형 SVG signal console을 표시한다.
+- 레벨 검사에서 현재 U7 물리 출력을 session에 고정하며, 경로 변경 시 측정/Preview를 중단하고 다른 profile Apply를 거부한다. selector 공통 상태 파일은 `/var/lib/audiodsp/u7-selector-state.json`이다.
 - Pi 2 초기 chunksize 2048; Pi 4/5 초기 chunksize 1024
 - Pi 2는 SISO 2/4 convolution만 지원; Pi 4/5 MIMO는 2입력×4출력, 8 convolution, 최소 effective chunksize 1024
 - 네트워크는 DHCP만 사용하며 고정·비상 주소를 만들지 않는다.

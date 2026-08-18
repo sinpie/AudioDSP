@@ -8,6 +8,8 @@
 
 정규화된 settings, fallback을 반영한 resolved profile, SISO/MIMO 관리 FIR metadata, 플랫폼 MIMO capability, U7 selector, A/B preview 상태를 반환한다.
 
+A/B Preview가 활성 상태이면 `settings`는 저장된 설정을 유지하지만 `resolved`는 실제 임시 CamillaDSP 구성의 mode, 2/4/8채널 수와 FIR 경로를 반환한다. 이때 `/api/fir/front|rear`도 profile 폴더가 아니라 검증된 측정 session 안의 현재 Preview WAV를 제공한다.
+
 ### `GET /api/health`
 
 load average, 온도, 메모리, Xonar U7/UMIK 연결 여부를 반환한다.
@@ -80,7 +82,18 @@ Invoke-RestMethod -Uri 'http://audiodsp-pi2.local:8080/api/volume' -Method Put -
 
 MIMO 결과의 `/download/all`은 네 MIMO WAV, MIMO manifest, JSON/Markdown 보고서를 한 ZIP으로 반환한다.
 
-측정 실행은 현재 HTML form POST 경로를 사용한다: `/measurement/new`, `/configure`, `/level`, `/position`, `/restart-positions`, `/validation`, `/build`, `/preview`, `/restore`, `/apply`, `/cancel`, `/calibration`.
+`GET /api/measurement/status`의 출력 경로 필드:
+
+- `output_selector`: 현재 boot에서 HID monitor가 읽은 실제 U7 경로, label, state byte, stale 여부
+- `measurement_profile`: 레벨 검사에서 고정된 `speaker|headphone`; 검사 전에는 `null`
+- `measurement_output`: 고정 당시 label/state byte/source/boot ID/time
+- `measurement_output_match`: 현재 물리 경로와 고정 경로가 같으면 `true`, 다르면 `false`, 아직 고정 전이면 `null`
+
+고정 경로가 바뀌면 측정/검증/Preview는 HTTP 400으로 실패한다. 생성 결과의 profile과 다른 `/measurement/preview` 또는 `/measurement/apply` 요청도 HTTP 400이며 WAV/settings는 변경되지 않는다.
+
+측정 실행은 현재 HTML form POST 경로를 사용한다: `/measurement/new`, `/configure`, `/session-note`, `/load-session`, `/level`, `/position`, `/restart-positions`, `/validation`, `/build`, `/preview`, `/restore`, `/apply`, `/cancel`, `/calibration`. Session은 자동 저장되며 `/session-note`는 진행 상태를 건드리지 않고 최대 500자 주석만 저장한다. `/load-session`은 저장 artifact 무결성을 확인하고 완료된 1–6 checkpoint를 복원한다.
+
+내부 measurement CLI에는 `list-sessions`, `set-session-note <text>`, `load-session <id>`가 있다. Web의 1단계 session 목록은 `list-sessions`의 ID, 완료 위치, 결과 유무와 인접 주석을 사용한다.
 
 `result`에는 `self_validation`(실제 FIR FFT/target-fit/전달 이득/impulse),
 `room_decay`(채널별 octave T20→RT60), `graphs.*.actual_correction_db`,
@@ -93,6 +106,13 @@ MIMO 결과의 `/download/all`은 네 MIMO WAV, MIMO manifest, JSON/Markdown 보
 MIMO 결과는 `kind=mimo_2x4`, `mimo`, `mimo_files`, `room_tuning_audit`를 추가하며,
 `mimo.target_level_normalization`, `solution_blend`, `prediction.*.before/after_modal_tail_db`와
 `self_validation.core_checks.predicted_modal_tail_non_regression`을 포함한다.
+
+`POST /measurement/build` form은 기존 필드 뒤에 다음 두 값을 보낸다.
+
+- `crossover_enabled=on|off`: L/R/Woofer 및 sub MIMO의 디지털 crossover. 기본 `on`
+- `crossover_frequency_hz=60|70|80|90|100|120`: 기본 `100`
+
+SISO 결과의 `result.crossover`는 `embedded_in_fir`, `frequency_hz`, `additional_runtime_filters=0`, `additional_block_latency_samples=0`, `coherent_upper_guard_pass`, `complex_sum_target_pass`, `phase_alignment_reliable`, `status`를 제공한다. MIMO 결과는 같은 top-level 필드와 `mimo.crossover`를 제공하고, 실제 Woofer trim transfer 한계는 `mimo.headroom.physical_output_limits`에서 확인한다. 합산 L/R 모드는 독립 branch가 없으므로 crossover `on` 요청을 HTTP 400으로 거부한다.
 
 ## 백업
 

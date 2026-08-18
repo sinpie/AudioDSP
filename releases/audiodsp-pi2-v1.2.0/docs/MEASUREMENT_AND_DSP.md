@@ -84,6 +84,16 @@ Preset은 boost를 만들지 않으며 Front에는 350 Hz 이하, Woofer에는 �
 - 보정 범위는 사용자가 20/30/40/60/80 Hz 하한과 300/500/1k/5k/20k Hz 상한을 선택한다.
 - 최종 FIR의 최대 전달 이득은 0 dB 이하가 되도록 정규화한다.
 
+## 디지털 crossover와 실제 합산
+
+`L/R/Woofer 개별` 측정에서는 디지털 crossover가 기본 `ON`, 기본 주파수는 100 Hz다. 선택 범위는 60/70/80/90/100/120 Hz다. Front WAV에는 Linkwitz–Riley 4차 HPF, Rear/Woofer WAV에는 같은 주파수의 LR4 LPF magnitude와 그 minimum-phase 전달함수를 넣는다. 별도의 CamillaDSP biquad/filter stage를 추가하지 않고 기존 32768탭 WAV에 곱해 합치므로 convolution 수, chunksize, block latency는 늘지 않는다. FIR 자체의 group delay/phase는 결과에 계속 기록한다.
+
+두 branch를 따로 target에 맞추는 것으로 끝내지 않는다. acoustic bulk delay와 FIR energy delay를 맞춘 뒤 세 위치 각각의 `Front+Woofer` 복소합과 `|Front|+|Woofer|` 최악 구성 상한을 다시 계산한다. 상한이 target을 넘는 대역에는 두 branch에 같은 minimum-phase cut-only guard를 내장한다. null/cancellation은 boost로 메우지 않는다. 신뢰 가능한 상대 phase가 없거나 최종 복소합 MAE/P90을 통과하지 못하면 WAV는 Preview용으로 만들 수 있지만 `self_validation.overall_pass`와 crossover 상태는 PASS가 아니다.
+
+`L+Woofer/R+Woofer 합산` 모드는 이미 하나의 FIR 뒤에서 Front/Rear를 복사하므로 두 출력을 독립 HPF/LPF로 분리할 수 없다. 이 모드에서는 crossover를 강제로 OFF하며, 사용자가 ON을 요청하면 조용히 무시하지 않고 계산을 거부한다. 독립 crossover가 필요하면 L/R/Woofer 개별 측정을 새로 해야 한다.
+
+Woofer trim과 Strong/Primus 억제는 의도적인 target 이탈을 만들 수 있다. 구조적으로 유효한 WAV라는 사실과 acoustic target 달성을 분리해서 표시하며, 적용 후 작은 레벨의 별도 검증 sweep 전에는 실제 crossover 성공을 확정하지 않는다.
+
 ## Phase와 시간 정렬
 
 기본 magnitude 설계는 minimum phase다. `bass` 모드는 중앙 위치의 측정 phase에서 minimum-phase 성분을 빼 excess phase를 구하고 지정 cutoff 80/120/160/200/250 Hz 아래에서만 보정한다. cutoff 전이는 cosine window이며 causality를 위한 shift는 최대 2048 samples로 제한한다. impulse 끝 10%는 fade한다.
@@ -94,16 +104,29 @@ Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니�
 
 ## 출력과 검토
 
+### U7 물리 출력 경로 고정
+
+새 session은 아직 특정 프로필에 묶이지 않는다. `5초 무음 + 5초 백색소음`을 시작하기 직전에 HID monitor가 기록한 현재 boot의 U7 selector 상태를 읽고 `measurement_profile=speaker|headphone`과 state byte를 session에 저장한다. 오래된 boot ID, 없는 state 파일, 알 수 없는 profile이면 소리를 시작하지 않는다. MIMO는 실제 4채널 Speaker output에서만 고정할 수 있다.
+
+모든 sweep/validation은 DSP를 멈추기 전, 각 재생 직전, 재생 polling 중, 재생 직후에 selector를 다시 확인한다. 상단 버튼을 눌러 경로가 달라지면 재생·녹음 프로세스를 종료하고 저장된 이전 측정값은 유지한 채 worker를 오류로 끝낸다. Preview도 현재 물리 경로가 원래 측정 경로와 같아야 한다. Apply는 생성 FIR을 측정한 프로필에만 허용하므로 한 출력 체인의 룸 응답을 다른 스피커 체인에 잘못 덮어쓸 수 없다.
+
 - `Generated_Front_LR_32768.wav`: L/R 독립 stereo float32
 - `Generated_Rear_LR_32768.wav`: Woofer FIR을 L/R 동일 복사하거나, L/R 모드에서 Front 복사본에 woofer trim을 bake한 stereo float32
 - 둘 다 정확히 48 kHz, 32768 frames
 - 결과 JSON에는 전/후 예상, effective target, 공간편차, requested/actual correction, octave decay, natural band, guarded bin, phase shift, impulse peak/energy, SHA-256가 포함된다.
 - 생성 뒤 실제 32768탭 WAV를 다시 FFT해 설계 잔차, target-fit MAE/P90, 최대 전달 이득, 유한값, impulse 위치와 시간 정렬 안전성을 `self_validation`으로 검증한다. 그래프의 예상 후 곡선도 설계 배열이 아니라 실제 FIR FFT 기준이다.
+- crossover 결과는 `result.crossover`에 내장 여부, 주파수, 추가 runtime filter/block latency(모두 0), 상한 guard, 복소합 target, phase 신뢰도와 상태를 저장한다.
 
 브라우저 다운로드와 그래프 확인은 playback을 바꾸지 않는다. Preview는 runtime config만 임시 교체하며 profile WAV/settings는 그대로다. Apply에서 기존 파일을 백업한 뒤 정식 WAV를 교체한다.
 
+현황/설정에서 표시하는 FIR FFT는 목표 음압 자체가 아니라 측정 응답에 곱하는 보정 전달함수다. 따라서 Harman target의 저역 상승·고역 하강과 같은 모양일 필요가 없다. 목표 달성 여부는 측정·보정 결과의 `effective_target_db`와 실제 FIR FFT 기반 `predicted_db`, 그리고 crossover 사용 시 Front+Woofer 합산 검증으로 판단한다.
+
+모든 새 SISO/MIMO 결과는 `algorithm_revision`을 기록한다. 저장된 측정값으로 만든 이전 revision 결과는 보존·다운로드할 수 있지만 Preview/Apply할 수 없으며, FIR 계산만 다시 수행해야 한다. 최신 revision도 `self_validation.overall_pass=false`이면 정식 Apply를 엔진에서 거부한다.
+
 ## 작업 복구와 계산 성능
 
+- 각 session 디렉터리의 `session.json`은 설정, level 검사, 측정 index, 생성 FIR 결과와 적용 이력을 자동 보존하고 `session-note.txt`는 최대 500자의 사용자 주석을 독립 보존한다. 주석 변경은 dependency invalidation을 일으키지 않는다.
+- 저장 session 불러오기는 현재 session을 먼저 자동 저장한 뒤 응답 JSON과 Front/Rear WAV 등 완료 상태의 근거 파일을 검증한다. 검증 성공 시 레벨·3위치·FIR·적용 이력을 그대로 복원하며, 완료 숫자만 있고 근거 파일이 빠진 session은 불러오지 않는다.
 - FFTW3f forward/inverse plan과 aligned buffer는 한 작업 안에서 재사용하고 호출마다 입력 buffer를 0으로 초기화한다.
 - Pi 2 UI 예상치는 응답 채널당 약 70초, magnitude FIR 약 55초, bass-phase FIR 약 85초다. Pi 4/5는 각각 약 20/20/40초를 기준으로 표시하되 실제 시간은 sweep 길이와 온도에 따라 달라진다.
 - 실행 PID와 `/proc/<pid>/cmdline`을 함께 확인한다. 전원·SSH·서비스 중단으로 worker가 사라지면 원본 session JSON을 조회만으로 덮어쓰지 않고 UI에 복구 가능한 오류 상태를 파생해 무한 진행 표시를 막는다.
