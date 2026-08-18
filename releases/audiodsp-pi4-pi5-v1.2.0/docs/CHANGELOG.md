@@ -4,6 +4,7 @@
 
 - 백색소음/sweep 안전 기본값을 모두 -42 dBFS로 통일하고 독립 slider, 높은 출력 실시간 경고, 실제 sweep 전 수치 confirm 추가
 - Woofer SNR을 고정 전대역 대신 chirp-time 지속 -3 dB 통과대역과 pre/post noise PSD로 판정하고 순간 생활소음 confidence 적용
+- 첫 UMIK/ALSA cold-start가 고정 pre-roll을 소비해도 실제 sweep 활성구간과 capture delay를 자동 복구하고, 검출 구간 밖에서만 noise PSD를 계산하도록 수정
 - Front/Woofer 정렬에 음향 bulk delay와 FIR 에너지 지연을 함께 사용하고 L/R 공통 phase·magnitude 보존 자동 축소 추가
 - FFTW plan/buffer 재사용, Pi별 offline ETA, PID/cmdline 기반 중단 worker 복구 추가
 - MIMO에 상대 bulk-delay phase 복원, 기존 SISO 저역 레벨 anchor, 인접-bin continuity, 안전 해 blend, modeled late/early 0.5 dB 적용 차단 추가

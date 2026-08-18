@@ -84,7 +84,7 @@ sudo /usr/local/bin/audiodsp-measurement.py self-test-targets
 
 6 target × 3 preset × Front/Woofer의 실제 32768탭 FFT와 bass-phase 대표
 조합을 검증한다. Offline engine test는 합성 0.60초 감쇠의 Schroeder T20,
-조절 가능한 Woofer 측정/reference 비율, 적응형 -3 dB 통과대역 SNR, 잔향 cut-only,
+조절 가능한 Woofer 측정/reference 비율, 적응형 -3 dB 통과대역 SNR, 정상 0.4초·cold-start 앞부분 절단·1.1초 USB 지연 sweep timing 복구, 잔향 cut-only,
 음향+FIR 총지연 정렬과 중단 worker 복구도 확인한다.
 
 ## 4. MIMO 무음 시험

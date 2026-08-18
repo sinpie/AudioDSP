@@ -229,6 +229,25 @@ def main() -> int:
         require(full_quality["analysis_band_hz"] == [15.0, 22_000.0], "combined quality gate lost full-band analysis")
         require(woofer_quality["snr_db"] > full_quality["snr_db"] + 2.5, "subwoofer-only SNR still averages its silent high-frequency interval")
 
+        # ALSA/USB cold-start latency can consume the nominal 400 ms capture
+        # arm interval or add more than it.  Quality and later deconvolution
+        # must locate the recorded sweep instead of assuming fixed timing.
+        timing_noise = lambda count: [0.0004 * math.sin(2.0 * math.pi * index / 97.0) for index in range(count)]
+        standard_timing = timing_noise(capture_lead + len(front_reference))
+        for index, value in enumerate(front_reference):
+            standard_timing[capture_lead + index] += 8.0 * value
+        standard_quality = engine.sweep_capture_quality(standard_timing, front_reference, "left_woofer")
+        truncated_quality = engine.sweep_capture_quality(standard_timing[capture_lead:], front_reference, "left_woofer")
+        extra_delay = round(1.10 * engine.RATE)
+        delayed_timing = timing_noise(extra_delay + len(front_reference))
+        for index, value in enumerate(front_reference):
+            delayed_timing[extra_delay + index] += 8.0 * value
+        delayed_quality = engine.sweep_capture_quality(delayed_timing, front_reference, "left_woofer")
+        require(standard_quality["usable"] and truncated_quality["usable"] and delayed_quality["usable"], "dynamic sweep timing rejected a valid capture")
+        require(abs(standard_quality["capture_delay_ms"] - 400.0) <= 60.0, "normal capture arm delay was not recovered")
+        require(abs(truncated_quality["capture_delay_ms"]) <= 60.0, "truncated cold-start capture timing was not recovered")
+        require(abs(delayed_quality["capture_delay_ms"] - 1100.0) <= 60.0, "long USB capture startup delay was not recovered")
+
         frequencies = [round(20.0 * (1000.0 ** (index / 511.0)), 6) for index in range(512)]
         measurements_index = []
         for position in range(1, 4):

@@ -5,7 +5,8 @@ Date: 2026-08-18 · hardware: Raspberry Pi 2 Model B Rev 1.1
 ## Result
 
 PASS. Production CamillaDSP was not restarted by the candidate tests or final
-Web/engine deployment; its PID remained 12593 and the active Speaker FIR remained SHA-256
+Web/engine deployment. The later user-authorized quiet paired acoustic A/B test
+intentionally stopped and restored it once; its final PID is 30454 and the active Speaker FIR remained SHA-256
 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`.
 
 ## Profile and Web matrix
@@ -35,6 +36,33 @@ Web/engine deployment; its PID remained 12593 and the active Speaker FIR remaine
   test; phase build produced -5.91 dB after acoustic-plus-FIR total-delay alignment.
 - Six targets × three presets and one representative bass-phase actual-FIR
   matrix passed; bass-phase implementation MAE/P95 was 0.0123/0.0548 dB.
+- Dynamic sweep timing recovered nominal 400 ms, a cold-start capture with the
+  nominal arm interval removed, and 1100 ms delayed capture. Adaptive Woofer
+  passband SNR remained higher than full-band SNR in the regression fixture.
+
+## Quiet applied-FIR acoustic A/B
+
+- Four 14-second sweeps at -15 dBFS: raw/FIR for L+Woofer and R+Woofer. This is
+  15 dB below the previous 0 dBFS sweep. U7 Mic/Line capture was disabled during
+  playback and restored afterward.
+- Low-noise-window raw/FIR SNR estimates were 28.29/20.92 and 7.15/7.68 dB
+  (L/R). The production gate, which conservatively retains the noisier valid
+  pre/post segment, reported raw 27.22/14.94 dB and FIR -2.12/4.59 dB. It rejects
+  both filtered captures because the approved FIR attenuates roughly 9-12 dB
+  through much of the midband and 20-26 dB around 60-100 Hz; fine residuals are
+  exploratory supporting evidence, not a certification.
+- Measured applied transfer tracked the FIR from 120 Hz to 10 kHz with MAE
+  0.46/0.36 dB (120-500 Hz) and 0.45/0.38 dB (500 Hz-10 kHz). Low-bass tracking
+  was less certain: 5.02/1.90 dB MAE for L/R at 30-120 Hz.
+- Harman-aligned raw bass peak excess fell from 15.12 to 4.98 dB on L and from
+  13.24 to 6.06 dB on R in the measured curves. The theoretical high-confidence
+  prediction is a 14.60/10.44 dB L/R peak reduction.
+- The strong-control FIR overshoots the Harman bass level after independent
+  500-2000 Hz alignment: predicted 30-120 Hz median residual changes from
+  +6.41 to -7.24 dB on L and +8.53 to -4.59 dB on R. It is effective boom
+  suppression, not the closest neutral-Harman fit.
+- Artifacts: `analysis_summary.json`, `frequency_comparison.csv`, and
+  `comparison.svg` under `applied_validation_20260818_122253`.
 
 ## Live hardware and UI
 
@@ -73,17 +101,16 @@ Web/engine deployment; its PID remained 12593 and the active Speaker FIR remaine
   separate FIR/MIMO-correctable findings from placement/treatment limits,
   unmeasured items and required runtime/post-measurement validation.
 - See `MIMO_VALIDATION_REPORT.md` for metrics and the remaining sound-producing
-  Pi 4/5 acceptance tests. No actual sweep was performed in this revision.
+  Pi 4/5 MIMO acceptance tests. The acoustic sweep above validates SISO only.
 
 ## Final read-only live check
 
-At closeout on 2026-08-18, the connected production Pi 2 reported CamillaDSP
-PID 12593; `camilladsp`, `audiodsp-web` and `audiodsp-profile-monitor` were all
+At closeout on 2026-08-18, after the user-authorized paired sweep, the connected
+production Pi 2 reported CamillaDSP PID 30454; `camilladsp`, `audiodsp-web` and `audiodsp-profile-monitor` were all
 active, CamillaDSP restart count was zero, the last 30 minutes contained zero
 XRUN/underrun/overrun/panic/error matches, and
 the active Speaker FIR SHA-256 was still
 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`.
-The Web service alone was restarted for the verified code deployment; no audio
-was generated and no CamillaDSP service, profile, FIR, volume or audio
-configuration was changed. Pre-deployment code is recoverable from
+The paired test stopped and restored CamillaDSP once by design; it did not
+change the profile, FIR, volume or persistent audio configuration. Pre-deployment code is recoverable from
 `/var/lib/audiodsp/code-backups/20260818T030943Z`.

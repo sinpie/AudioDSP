@@ -931,28 +931,76 @@ def sweep_capture_quality(
     reference: list[float],
     source: str | None = None,
 ) -> dict[str, Any]:
-    """Estimate in-room sweep SNR from the known pre-roll and active interval."""
+    """Estimate sweep SNR after locating the actual recorded active interval.
+
+    ALSA process startup is not deterministic, especially on the first UMIK
+    capture after boot.  A fixed 400 ms arm delay can therefore put part of the
+    sweep in the nominal pre-roll and make a valid capture look quieter than its
+    background.  Locate the highest-energy sweep-length window on a compact
+    50 ms envelope, then use only noise blocks outside that window.
+    """
     active_indices = [index for index, value in enumerate(reference) if abs(value) > 1.0e-12]
     if not active_indices:
         raise MeasurementError("측정 sweep 기준 신호가 비어 있습니다.")
-    capture_lead = round(0.4 * RATE)
     reference_start = active_indices[0]
     reference_end = active_indices[-1] + 1
     analysis_band_hz = [15.0, 22_000.0]
     full_reference_end = reference_end
-    active_start = min(len(samples), capture_lead + reference_start)
-    active_end = min(len(samples), capture_lead + reference_end)
-    background_start = min(round(0.05 * RATE), active_start)
-    background_end = max(background_start + 1, active_start - round(0.10 * RATE))
-    background = samples[background_start:background_end]
 
     def ac_rms(values: list[float]) -> float:
         mean = sum(values) / len(values)
         return math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
 
-    if len(background) < round(0.20 * RATE):
+    envelope_block = round(0.05 * RATE)
+    envelope_power = []
+    for start in range(0, len(samples), envelope_block):
+        values = samples[start:min(len(samples), start + envelope_block)]
+        if len(values) >= envelope_block // 2:
+            value = ac_rms(values)
+            envelope_power.append(value * value)
+    active_length = reference_end - reference_start
+    active_blocks = max(1, math.ceil(active_length / envelope_block))
+    if len(envelope_power) < active_blocks:
+        raise MeasurementError("측정 sweep의 신호 구간을 평가할 수 없습니다.")
+    rolling = sum(envelope_power[:active_blocks])
+    window_powers = [rolling]
+    for index in range(active_blocks, len(envelope_power)):
+        rolling += envelope_power[index] - envelope_power[index - active_blocks]
+        window_powers.append(rolling)
+    best_power = max(window_powers)
+    # A bandwidth-limited actuator can produce a plateau of equally energetic
+    # sweep-length windows.  Prefer the nominal ALSA arm timing within 0.5% of
+    # the maximum, while still allowing a clearly truncated/delayed recording
+    # to move away from that anchor.
+    nominal_block = round((round(0.4 * RATE) + reference_start) / envelope_block)
+    near_best = [
+        index for index, power in enumerate(window_powers)
+        if power >= best_power * 0.995
+    ]
+    best_block = min(near_best, key=lambda index: abs(index - nominal_block))
+    active_start = min(len(samples), best_block * envelope_block)
+    active_end = min(len(samples), active_start + active_length)
+    capture_lead = active_start - reference_start
+
+    # Median 200 ms AC-RMS rejects switching clicks.  When both sides of the
+    # sweep are available, retain the noisier median as a conservative floor.
+    noise_guard = round(0.10 * RATE)
+    noise_block = round(0.20 * RATE)
+    noise_segments = [
+        samples[:max(0, active_start - noise_guard)],
+        samples[min(len(samples), active_end + noise_guard):],
+    ]
+    noise_estimates = []
+    for segment in noise_segments:
+        blocks = [
+            ac_rms(segment[start:start + noise_block])
+            for start in range(0, len(segment) - noise_block + 1, noise_block)
+        ]
+        if blocks:
+            noise_estimates.append(statistics.median(blocks))
+    if not noise_estimates:
         raise MeasurementError("측정 sweep의 무음 구간을 평가할 수 없습니다.")
-    background_rms = ac_rms(background)
+    background_rms = max(noise_estimates)
     passband: dict[str, Any] | None = None
     if source in SUBWOOFER_ONLY_SOURCES:
         passband = detect_subwoofer_passband(
@@ -974,7 +1022,7 @@ def sweep_capture_quality(
             analysis_band_hz = [15.0, 300.0]
     active = samples[active_start:active_end]
     minimum_active_samples = RATE // 5 if source in SUBWOOFER_ONLY_SOURCES else RATE
-    if len(background) < round(0.20 * RATE) or len(active) < minimum_active_samples:
+    if len(active) < minimum_active_samples:
         raise MeasurementError("측정 sweep의 무음/신호 구간을 평가할 수 없습니다.")
     active_rms = ac_rms(active)
     signal_power = max(0.0, active_rms * active_rms - background_rms * background_rms)
@@ -991,6 +1039,11 @@ def sweep_capture_quality(
         "analysis_band_hz": analysis_band_hz,
         "subwoofer_passband": passband,
         "source": source,
+        "active_interval_samples": [active_start, active_end],
+        "capture_delay_samples": capture_lead,
+        "capture_delay_ms": round(capture_lead * 1000.0 / RATE, 3),
+        "timing_method": "maximum-energy sweep-length window on 50 ms AC-RMS envelope",
+        "noise_segments_used": len(noise_estimates),
     }
 
 
@@ -1162,10 +1215,24 @@ def frequency_noise_metrics(
     frequencies: list[float],
     fft: FFTBackend,
     evaluation_band_hz: list[float] | None = None,
+    active_interval_samples: list[int] | None = None,
 ) -> dict[str, Any]:
     """Estimate per-band confidence from pre/post-roll noise and sweep spectrum."""
-    pre = samples[round(0.05 * RATE):round(0.65 * RATE)]
-    post = samples[max(0, len(samples) - round(0.75 * RATE)):]
+    if active_interval_samples and len(active_interval_samples) == 2:
+        active_start = max(0, min(len(samples), int(active_interval_samples[0])))
+        active_end = max(active_start, min(len(samples), int(active_interval_samples[1])))
+        guard = round(0.10 * RATE)
+        pre_end = max(0, active_start - guard)
+        post_start = min(len(samples), active_end + guard)
+        pre = samples[max(0, pre_end - round(0.60 * RATE)):pre_end]
+        post = samples[post_start:min(len(samples), post_start + round(0.75 * RATE))]
+        if len(pre) < round(0.20 * RATE):
+            pre = post
+        if len(post) < round(0.20 * RATE):
+            post = pre
+    else:
+        pre = samples[round(0.05 * RATE):round(0.65 * RATE)]
+        post = samples[max(0, len(samples) - round(0.75 * RATE)):]
 
     def centered(values: list[float]) -> list[float]:
         mean = sum(values) / max(1, len(values))
@@ -1260,8 +1327,12 @@ def response_from_recording(
             f"측정 sweep SNR이 {quality['snr_db']:.1f} dB로 너무 낮습니다. "
             "측정 레벨 또는 sweep 시간을 올리세요."
         )
-    length = next_power_of_two(max(len(samples), round(0.4 * RATE) + len(reference)))
-    delayed_reference = [0.0] * round(0.4 * RATE) + reference
+    capture_delay = int(quality.get("capture_delay_samples", round(0.4 * RATE)))
+    if capture_delay >= 0:
+        delayed_reference = [0.0] * capture_delay + reference
+    else:
+        delayed_reference = reference[min(len(reference), -capture_delay):]
+    length = next_power_of_two(max(len(samples), len(delayed_reference)))
     fft = FFTBackend()
     y = fft.rfft(samples, length)
     x = fft.rfft(delayed_reference, length)
@@ -1279,7 +1350,15 @@ def response_from_recording(
     if peak_index > length // 2:
         peak_index -= length
     frequencies = [20.0 * (1000.0 ** (index / 511.0)) for index in range(512)]
-    frequency_noise = frequency_noise_metrics(samples, y, length, frequencies, fft, quality.get("analysis_band_hz"))
+    frequency_noise = frequency_noise_metrics(
+        samples,
+        y,
+        length,
+        frequencies,
+        fft,
+        quality.get("analysis_band_hz"),
+        quality.get("active_interval_samples"),
+    )
     quality["frequency_noise"] = {
         key: value for key, value in frequency_noise.items()
         if key not in ("frequencies", "snr_db", "confidence")
