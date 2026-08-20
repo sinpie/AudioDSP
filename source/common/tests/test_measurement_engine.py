@@ -142,6 +142,64 @@ def synthetic_combined_response(
     return result
 
 
+def write_synthetic_phase_references(
+    engine,
+    session: Path,
+    positions: int,
+) -> list[dict[str, Any]]:
+    """Persist a reliable same-recording L/R/W phase reference per position."""
+    index: list[dict[str, Any]] = []
+    for position in range(1, positions + 1):
+        responses = {
+            source: json.loads((session / f"p{position}_{source}_response.json").read_text(encoding="utf-8"))
+            for source in ("left", "right", "woofer")
+        }
+        frequencies = [
+            float(value) for value in responses["left"]["frequencies"]
+            if 30.0 <= float(value) <= 800.0
+        ]
+        sources: dict[str, Any] = {}
+        for source, response in responses.items():
+            values = [engine.response_complex(response, frequency) for frequency in frequencies]
+            sources[source] = {
+                "frequencies": frequencies,
+                "db": [round(20.0 * math.log10(max(abs(value), 1.0e-15)), 6) for value in values],
+                "phase_rad": engine.unwrap([math.atan2(value.imag, value.real) for value in values]),
+                "median_snr_db": 30.0,
+                "phase_repeatability_p90_deg": 0.0,
+                "tone_count": len(frequencies),
+            }
+        result = {
+            "version": 1,
+            "method": "synthetic same-recording L/R/W multisine",
+            "reliable": True,
+            "recommended": True,
+            "period_correlation": 1.0,
+            "minimum_median_snr_db": 30.0,
+            "phase_repeatability_p90_deg": 0.0,
+            "sources": sources,
+            "pairs": {
+                "left_right": {"second_minus_first_delay_samples": 8.0, "delay_fit_residual_p90_deg": 0.0},
+                "left_woofer": {"second_minus_first_delay_samples": 23.0, "delay_fit_residual_p90_deg": 0.0},
+                "right_woofer": {"second_minus_first_delay_samples": 15.0, "delay_fit_residual_p90_deg": 0.0},
+            },
+            "timing_scope": "synthetic relative timing",
+            "normalization_applied": False,
+        }
+        result_name = f"p{position}_phase_reference.json"
+        (session / result_name).write_text(json.dumps(result), encoding="utf-8")
+        index.append({
+            "position": position,
+            "recording": f"p{position}_phase_reference_recorded.wav",
+            "signal": f"p{position}_phase_reference_signal.json",
+            "result": result_name,
+            "reliable": True,
+            "minimum_median_snr_db": 30.0,
+            "phase_repeatability_p90_deg": 0.0,
+        })
+    return index
+
+
 def read_float_stereo(path: Path) -> tuple[int, int, list[tuple[float, float]]]:
     data = path.read_bytes()
     require(data[:4] == b"RIFF" and data[8:12] == b"WAVE", "not a RIFF/WAVE file")
@@ -419,6 +477,60 @@ def main() -> int:
             require(abs(highpass + lowpass - 1.0) < 1e-12, "LR4 acoustic branch magnitudes are not complementary")
         require(abs(engine.crossover_transfer_db(100.0, 100, "highpass") + 6.020599913) < 1e-5, "LR4 highpass is not -6.02 dB at crossover")
         require(engine.DEFAULT_CORRECTION_PREFERENCES["crossover_enabled"] is True and engine.DEFAULT_CORRECTION_PREFERENCES["crossover_frequency_hz"] == 100, "digital crossover is not default ON at 100 Hz")
+        require(engine.DEFAULT_CORRECTION_PREFERENCES["max_boost_db"] == 10, "maximum relative compensation default is not 10 dB")
+
+        reliability_f = [20.0 * (1000.0 ** (index / 511.0)) for index in range(512)]
+        notch_db = [0.0] * len(reliability_f)
+        notch_index = min(range(len(reliability_f)), key=lambda index: abs(reliability_f[index] - 1_000.0))
+        notch_db[notch_index] = -15.0
+        notch_reliability = engine.narrow_notch_reliability(reliability_f, notch_db)
+        require(notch_reliability[notch_index] < 0.10, "narrow deep null did not lose boost authority")
+        require(notch_reliability[0] == 1.0 and notch_reliability[-1] == 1.0, "measurement edge was falsely classified as a local null")
+
+        broad_left = [
+            -14.0 * max(0.0, math.log(max(frequency, 8_000.0) / 8_000.0) / math.log(20_000.0 / 8_000.0))
+            for frequency in reliability_f
+        ]
+        broad_right = [value + 0.8 for value in broad_left]
+        raw_confidence = [0.05] * len(reliability_f)
+        (
+            left_confidence,
+            right_confidence,
+            left_rolloff_floor,
+            right_rolloff_floor,
+            rolloff_summary,
+        ) = engine.stereo_broad_rolloff_confidence(
+            reliability_f, broad_left, raw_confidence,
+            reliability_f, broad_right, raw_confidence,
+            [20.0, 20_000.0], [0.0, 0.0], 0.0, 0.0,
+        )
+        upper_index = min(range(len(reliability_f)), key=lambda index: abs(reliability_f[index] - 16_000.0))
+        require(left_confidence[upper_index] >= 0.25 and right_confidence[upper_index] >= 0.25, "independent L/R broad roll-off did not raise confidence")
+        require(left_rolloff_floor[upper_index] >= 0.25 and right_rolloff_floor[upper_index] >= 0.25, "broad roll-off evidence was not separated from raw SNR confidence")
+        require(rolloff_summary["narrow_null_guard_remains_enabled"], "stereo roll-off inference disabled the null guard")
+        rolloff_ir, rolloff_graph = engine.design_channel(
+            reliability_f, broad_left, [0.2] * len(reliability_f), [0.0] * len(reliability_f),
+            "flat", "none", woofer=False, woofer_trim_db=0,
+            phase_mode="magnitude", phase_cutoff=200,
+            frequency_confidence=left_confidence,
+            corroborated_rolloff_confidence=left_rolloff_floor,
+            shared_reference_measure_db=0.0, shared_reference_target_db=0.0,
+            max_boost_db=10, fft=fft_backend,
+        )
+        rolloff_graph_index = min(range(len(rolloff_graph["frequency"])), key=lambda index: abs(rolloff_graph["frequency"][index] - 16_000.0))
+        require(rolloff_graph["requested_correction_db"][rolloff_graph_index] > 1.0, "trusted broad high-frequency roll-off was left completely uncorrected")
+        deep_ir, deep_graph = engine.design_channel(
+            reliability_f, notch_db, [0.2] * len(reliability_f), [0.0] * len(reliability_f),
+            "flat", "none", woofer=False, woofer_trim_db=0,
+            phase_mode="magnitude", phase_cutoff=200,
+            frequency_confidence=[1.0] * len(reliability_f),
+            shared_reference_measure_db=0.0, shared_reference_target_db=0.0,
+            max_boost_db=10, fft=fft_backend,
+        )
+        require(deep_graph["narrow_notch_guarded_bins"] > 0 and deep_graph["maximum_narrow_notch_boost_db"] <= 3.01, "narrow deep null could force excessive common attenuation")
+        common_bank, common_normalization = engine.normalize_fir_bank([rolloff_ir, deep_ir, deep_ir, rolloff_ir], fft_backend)
+        require(common_normalization["scope"] == "complete_l_r_woofer_bank" and not common_normalization["independent_channel_normalization"], "L/R/W bank did not use one common 0 dB origin")
+        require(common_normalization["maximum_relative_level_error_db"] <= 1.0e-6, "common normalization changed an inter-branch level delta")
 
         noise_path = root / "level-white.wav"
         engine.write_white_noise(noise_path, -42, 5)
@@ -579,6 +691,7 @@ def main() -> int:
                 response = synthetic_response(frequencies, source, position)
                 (session / response_name).write_text(json.dumps(response), encoding="utf-8")
                 measurements_index.append({"position": position, "source": source, "response": response_name})
+        phase_index = write_synthetic_phase_references(engine, session, 3)
         state = {
             "version": 2,
             "state": "measured",
@@ -597,6 +710,8 @@ def main() -> int:
             "woofer_measurement_attenuation_db": -9,
             "sweep_seconds": 8,
             "measurements": measurements_index,
+            "phase_references": phase_index,
+            "phase_reference_acquisition_revision": "simultaneous-multisine-v1",
             "validation": None,
             "result": None,
             "measurement_profile": "speaker",
@@ -607,8 +722,8 @@ def main() -> int:
         # Reference acceptance case: Flat target, no extra bass suppression,
         # 0 dB Woofer trim and otherwise default safe settings.  The isolated
         # LPF Woofer branch is diagnostic-only; the final Front+Woofer sum is
-        # the target gate; the conservative joint sum guard is calculated in
-        # the FIR bank and a later post-FIR capture remains optional evidence.
+        # the target gate; same-recording relative phase drives the joint sum
+        # guard and a later post-FIR capture remains optional evidence.
         baseline_started = time.monotonic()
         engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 6, 18, crossover_enabled=True, crossover_frequency_hz=100)
         baseline_state = engine.load_current()
@@ -617,8 +732,8 @@ def main() -> int:
         baseline_target_fit = baseline_validation["target_fit"]
         require(baseline_target_fit["left"]["pass"] and baseline_target_fit["right"]["pass"], "Flat/none/0 Front branches missed the selected target")
         require(baseline_target_fit["woofer"]["applicable"] is False and baseline_target_fit["woofer"]["pass"] is None, "Flat/none/0 incorrectly grades an isolated LPF Woofer against the full-system target")
-        require(baseline_validation["overall_pass"] and baseline_validation["crossover_sum"]["status"] == "pass_safe_upper_phase_limited", "Flat/none/0 did not pass the clock-safe L/R/W sum guard")
-        require(baseline_state["result"]["crossover"]["safe_deploy_pass"] and baseline_state["result"]["crossover"]["complex_sum_target_pass"] is None, "Flat/none/0 did not separate safe sum PASS from unavailable absolute phase")
+        require(baseline_validation["overall_pass"] and baseline_validation["crossover_sum"]["status"] == "pass_independent_complex_model", "Flat/none/0 did not pass the same-recording L/R/W sum guard")
+        require(baseline_state["result"]["crossover"]["safe_deploy_pass"] and baseline_state["result"]["crossover"]["complex_sum_target_pass"] is True, "Flat/none/0 did not use reliable relative phase")
         for side in ("left", "right"):
             crossover_graph = baseline_state["result"]["crossover"]["channels"][side]
             require(crossover_graph["frequency"][0] <= 20.1 and crossover_graph["frequency"][-1] >= 19_000.0, "A/B sum graph is not full range")
@@ -631,8 +746,8 @@ def main() -> int:
         baseline_seconds = round(time.monotonic() - baseline_started, 3)
 
         # Precision mode must finish every acoustic capture before FIR design.
-        # Its two physical sums validate the complex L/R/W model, are not fed
-        # back into correction, and therefore cannot alter the generated bank.
+        # Its two physical sums validate the complex L/R/W model and constrain
+        # the dense acoustic cross term without branch averaging.
         precise_index = list(measurements_index)
         for position in range(1, 4):
             woofer_response = json.loads((session / f"p{position}_woofer_response.json").read_text(encoding="utf-8"))
@@ -649,15 +764,22 @@ def main() -> int:
             "measurements": precise_index,
             "result": None,
         })
+        require(
+            engine.position_measurement_source_order(precise_state)
+            == ["left", "right", "woofer", "left_woofer", "right_woofer"],
+            "Standard measurement order is not stable L/R/W/L+W/R+W at every position",
+        )
         engine.save_current(precise_state)
         engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 6, 18, crossover_enabled=True, crossover_frequency_hz=100)
         precise_built = engine.load_current()
         validate_result(engine, precise_built, phase=True)
         precise_validation = precise_built["result"]["self_validation"]
         require(precise_validation["premeasured_sum_model"]["pass"], "exact premeasured complex sums failed model closure")
-        require(precise_validation["crossover_sum"]["status"] == "pass_safe_sum_phase_limited", "precision mode still requires a later acoustic sweep")
-        require(precise_validation["premeasured_sum_model"]["phase_verification_status"] == "limited", "independent U7/UMIK clocks falsely claimed exact phase")
-        require(precise_built["result"]["front_sha256"] == baseline_front_hash and precise_built["result"]["rear_sha256"] == baseline_rear_hash, "diagnostic L+W/R+W responses changed or double-normalized the designed FIR bank")
+        require(precise_validation["crossover_sum"]["status"] == "pass_premeasured_complex_model", "precision mode did not complete six-capture validation")
+        require(precise_validation["premeasured_sum_model"]["phase_verification_status"] == "pass", "same-recording relative phase was not used")
+        physical_constraints = precise_built["result"]["crossover"]["physical_sum_constraints"]
+        require(physical_constraints["used"], "L+W/R+W cross-term was not used by FIR synthesis")
+        require(physical_constraints["phase_adjustment_p90_deg"] <= 0.25, "an exact physical sum produced a material phase adjustment")
         require(precise_built["result"]["filter_bank_normalization"]["relative_branch_gain_preserved"], "precision mode did not use one common bank normalization")
 
         engine.save_current(precise_state)
@@ -666,7 +788,7 @@ def main() -> int:
         validate_result(engine, precise_full_range, phase=True)
         require(not precise_full_range["result"]["crossover"]["enabled"], "Crossover OFF unexpectedly embedded LR4 branches")
         require(precise_full_range["result"]["crossover"]["sum_guard_enabled"], "Crossover OFF disabled the mandatory full-system overlap guard")
-        require(precise_full_range["result"]["self_validation"]["crossover_sum"]["status"] == "pass_safe_sum_phase_limited", "Crossover OFF graded Front/Woofer independently instead of validating their sum")
+        require(precise_full_range["result"]["self_validation"]["crossover_sum"]["status"] == "pass_premeasured_complex_model", "Crossover OFF graded Front/Woofer independently instead of validating all six captures")
 
         engine.save_current(precise_state)
         engine.build_worker("harman", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 6, 18, crossover_enabled=True, crossover_frequency_hz=100)
@@ -738,15 +860,24 @@ def main() -> int:
         require(any(value < -0.1 for value in phase_state["result"]["graphs"]["woofer"]["decay_control_db"]), "long bass decay did not activate cut-only damping")
         require(phase_state["result"]["room_decay"]["policy"], "room decay policy metadata missing")
         alignment = phase_state["result"]["time_alignment"]
-        require(not alignment.get("enabled") and alignment.get("requested") and "clock" in str(alignment.get("reason", "")), "independent U7/UMIK clocks incorrectly enabled Front/Woofer delay alignment")
+        require(alignment.get("requested") and alignment.get("reliable") and alignment.get("aligned"), "same-recording L/R/W relative timing did not evaluate Front/Woofer alignment")
+        require("simultaneous" in str(alignment.get("reference", "")), "alignment falsely claimed an absolute shared U7/UMIK clock")
         crossover = phase_state["result"]["crossover"]
         require(crossover.get("enabled") and crossover.get("embedded_in_fir") and crossover.get("frequency_hz") == 100, "default digital crossover was not embedded in FIR")
         require(crossover.get("additional_runtime_filters") == 0 and crossover.get("additional_block_latency_samples") == 0, "embedded crossover incorrectly adds runtime/block latency")
         require(crossover.get("coherent_upper_guard_pass"), "joint Front+Woofer constructive-sum guard failed")
-        require(crossover.get("safe_deploy_pass") and crossover.get("complex_sum_target_pass") is None, "joint Front+Woofer clock-safe target guard failed")
+        require(crossover.get("safe_deploy_pass") and crossover.get("complex_sum_target_pass") is True, "joint Front+Woofer relative-phase target guard failed")
         bank_normalization = phase_state["result"]["filter_bank_normalization"]
         require(bank_normalization["relative_branch_gain_preserved"] and bank_normalization["channels"] == 4, "FIR bank did not use one common normalization gain")
         require(bank_normalization["peak_transfer_after_db"] <= 0.01, "common FIR bank normalization exceeded 0 dB")
+        require(bank_normalization["scope"] == "complete_l_r_woofer_bank" and bank_normalization["maximum_relative_level_error_db"] <= 1.0e-6, "common FIR normalization did not preserve L/R/W relative level")
+        require(bank_normalization["relative_compensation_limit_pass"], "common no-preamp attenuation exceeded the selected maximum relative compensation")
+        common_reference = phase_state["result"]["common_level_reference"]
+        require(common_reference["independent_channel_normalization"] is False and common_reference["scope"] == "L/R/Woofer complete bank", "automatic validation still uses per-channel 0 dB references")
+        for channel in ("left", "right", "woofer"):
+            require(phase_state["result"]["graphs"][channel]["common_reference"] == common_reference, f"{channel} graph does not share the bank level reference")
+        for key in ("one_common_level_reference", "one_common_bank_gain", "relative_branch_level_preserved", "relative_compensation_limit", "narrow_null_boost_guard"):
+            require(phase_state["result"]["self_validation"]["core_checks"].get(key), f"common-reference automatic validation failed: {key}")
         require(phase_state["result"]["graphs"]["left"]["crossover"]["role"] == "highpass", "Front crossover is not HPF")
         require(phase_state["result"]["graphs"]["woofer"]["crossover"]["role"] == "lowpass", "Woofer crossover is not LPF")
         effective_target = engine.effective_combined_target(phase_state["result"], frequencies)
@@ -854,7 +985,12 @@ def main() -> int:
         engine.build_worker("flat", "none", 0, "magnitude", 200, crossover_enabled=False)
         fast_result = engine.load_current()["result"]
         fast_seconds = round(time.monotonic() - fast_started, 3)
-        require(fast_result["self_validation"]["overall_pass"] and fast_result["self_validation"]["crossover_sum"]["status"] == "pass_safe_upper_phase_limited", "Fast standard SISO did not complete its one-position clock-safe sum validation")
+        fast_crossover = fast_result["self_validation"]["crossover_sum"]
+        require(
+            fast_result["self_validation"]["overall_pass"]
+            and fast_crossover["status"] in ("pass_independent_complex_model", "pass_safe_upper_phase_limited"),
+            f"Fast standard SISO did not complete its one-position sum validation: {json.dumps(fast_crossover, sort_keys=True)}",
+        )
         require(fast_result["measurement_coverage"]["mode"] == "fast_single_position", "Fast coverage metadata is wrong")
         require(fast_result["measurement_coverage"]["spatial_stability_applicable"] is False, "Fast mode falsely claims spatial stability")
         require(fast_result["self_validation"]["independent_positions"]["spatial_stability_applicable"] is False, "Fast independent-position check is mislabeled")
@@ -921,10 +1057,12 @@ def main() -> int:
             "session_id": "paused", "session_dir": str(paused), "state": "ready",
             "stage": "위치 2에서 이어가기", "positions_completed": 1,
             "measurements": [item for item in measurements_index if item["position"] == 1],
+            "phase_references": [item for item in phase_index if item["position"] == 1],
             "result": None, "applied_profile": None,
         })
         for item in paused_state["measurements"]:
             shutil.copyfile(session / item["response"], paused / item["response"])
+        shutil.copyfile(session / "p1_phase_reference.json", paused / "p1_phase_reference.json")
         engine.atomic_json(paused / "session.json", paused_state)
         (paused / "session-note.txt").write_text("소파 왼쪽 위치까지 완료\n", encoding="utf-8")
         loaded_paused = engine.load_session("paused")

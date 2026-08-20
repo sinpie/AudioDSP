@@ -52,7 +52,7 @@ def scenarios() -> list[tuple[str, dict[str, Any]]]:
         "phase_mode": "magnitude", "phase_cutoff": 200, "spatial_mode": "equal",
         "bass_tilt_db": 0, "treble_tilt_db": 0,
         "correction_low_hz": 20, "correction_high_hz": 20_000,
-        "max_boost_db": 6, "max_cut_db": 18,
+        "max_boost_db": 10, "max_cut_db": 18,
         "crossover_enabled": True, "crossover_frequency_hz": 100,
     }
     requests = [
@@ -61,7 +61,9 @@ def scenarios() -> list[tuple[str, dict[str, Any]]]:
         ("bass-phase", {"phase_mode": "bass"}),
         ("crossover-off", {"crossover_enabled": False}),
         ("crossover-60", {"crossover_frequency_hz": 60}),
+        ("crossover-70", {"crossover_frequency_hz": 70}),
         ("crossover-80", {"crossover_frequency_hz": 80}),
+        ("crossover-90", {"crossover_frequency_hz": 90}),
         ("crossover-120", {"crossover_frequency_hz": 120}),
         ("trim-minus-4", {"woofer_trim_db": -4}),
         ("trim-minus-9", {"woofer_trim_db": -9}),
@@ -87,6 +89,12 @@ def main() -> int:
         action="store_true",
         help="print the gate and one compact row per scenario instead of full diagnostics",
     )
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        default=[],
+        help="run only the named scenario; may be repeated",
+    )
     args = parser.parse_args()
     source_session = args.session.resolve()
     source_state = json.loads((source_session / "session.json").read_text(encoding="utf-8"))
@@ -111,14 +119,26 @@ def main() -> int:
                 if not source_path.is_file():
                     raise RuntimeError(f"missing response: {source_path}")
                 shutil.copy2(source_path, session / name)
+        # Phase references are optional, but when the saved session has them the
+        # silent replay must exercise the same time/polarity alignment path as a
+        # real build.  Only analyzed JSON is needed; no audio device is opened.
+        for source_path in source_session.glob("p*_phase_reference.json"):
+            shutil.copy2(source_path, session / source_path.name)
         template = copy.deepcopy(source_state)
         template.update({
             "session_dir": str(session), "state": "measured", "stage": "silent saved-session validation",
             "result": None, "post_filter_validation": None, "worker_pid": None,
             "active_pids": [], "preview_profile": None, "applied_profile": None,
         })
+        requested_scenarios = scenarios()
+        if args.scenario:
+            selected = set(args.scenario)
+            requested_scenarios = [item for item in requested_scenarios if item[0] in selected]
+            missing = selected.difference(name for name, _options in requested_scenarios)
+            if missing:
+                raise RuntimeError(f"unknown scenario(s): {', '.join(sorted(missing))}")
         reports = []
-        for name, options in scenarios():
+        for name, options in requested_scenarios:
             engine.save_current(copy.deepcopy(template))
             engine.build_worker(
                 options["target"], options["preset"], options["woofer_trim_db"],
@@ -136,28 +156,55 @@ def main() -> int:
                 "name": name, "options": options,
                 "overall_pass": validation.get("overall_pass"),
                 "core_pass": all((validation.get("core_checks") or {}).values()),
+                "core_checks": validation.get("core_checks") or {},
+                "failed_core_checks": [
+                    key for key, passed in (validation.get("core_checks") or {}).items()
+                    if not passed
+                ],
                 "independent_positions": validation.get("independent_positions"),
                 "target_fit": {key: target_fit.get(key) for key in ("left", "right", "woofer")},
+                "fir_implementation": validation.get("fir_implementation"),
                 "crossover_sum": validation.get("crossover_sum"),
                 "crossover_phase_reliable": built.get("crossover", {}).get("phase_alignment_reliable"),
+                "common_level_reference": built.get("common_level_reference"),
+                "filter_bank_normalization": built.get("filter_bank_normalization"),
                 "front_sha256": built.get("front_sha256"),
                 "rear_sha256": built.get("rear_sha256"),
             })
-        baseline = reports[0]
-        baseline_front_fit = baseline["target_fit"]
+        baseline = next((item for item in reports if item["name"] == "flat-baseline"), None)
+        if baseline is None and not args.scenario:
+            raise RuntimeError("flat-baseline scenario is required")
+        selected_report = baseline or reports[0]
+        baseline_front_fit = baseline["target_fit"] if baseline is not None else {}
         structural_pass = all(item["core_pass"] for item in reports)
-        target_baseline_pass = all(bool((baseline_front_fit.get(key) or {}).get("pass")) for key in ("left", "right"))
+        common_reference_pass = all(
+            (item.get("common_level_reference") or {}).get("scope") == "L/R/Woofer complete bank"
+            and not bool((item.get("common_level_reference") or {}).get("independent_channel_normalization"))
+            and bool((item.get("filter_bank_normalization") or {}).get("relative_branch_gain_preserved"))
+            and not bool((item.get("filter_bank_normalization") or {}).get("independent_channel_normalization"))
+            for item in reports
+        )
+        # A targeted diagnostic such as --scenario crossover-off is not the
+        # required Flat baseline. It must still prove FIR structure and common
+        # bank normalization, but must not be mislabeled as a failed baseline.
+        target_baseline_pass = (
+            all(bool((baseline_front_fit.get(key) or {}).get("pass")) for key in ("left", "right"))
+            if baseline is not None else None
+        )
+        result_pass = structural_pass and common_reference_pass and target_baseline_pass is not False
         output = {
-            "result": "PASS" if structural_pass and target_baseline_pass else "FAIL",
+            "result": "PASS" if result_pass else "FAIL",
             "audio_playback": False,
             "source_session": source_session.name,
             "algorithm_revision": engine.RESULT_ALGORITHM_REVISION,
             "scenario_count": len(reports),
+            "flat_baseline_tested": baseline is not None,
+            "one_common_l_r_woofer_reference_all_scenarios": common_reference_pass,
             "baseline_apply_gate": {
-                "overall_pass": baseline["overall_pass"],
-                "crossover_status": (baseline.get("crossover_sum") or {}).get("status"),
-                "independent_positions_pass": (baseline.get("independent_positions") or {}).get("pass"),
-                "phase_reliable": baseline["crossover_phase_reliable"],
+                "overall_pass": selected_report["overall_pass"],
+                "crossover_status": (selected_report.get("crossover_sum") or {}).get("status"),
+                "independent_positions_pass": (selected_report.get("independent_positions") or {}).get("pass"),
+                "phase_reliable": selected_report["crossover_phase_reliable"],
             },
             "scenarios": reports,
         }
@@ -174,6 +221,19 @@ def main() -> int:
                         "name": report["name"],
                         "overall_pass": report["overall_pass"],
                         "core_pass": report["core_pass"],
+                        "failed_core_checks": report["failed_core_checks"],
+                        "one_common_reference": (
+                            (report.get("common_level_reference") or {}).get("scope")
+                            == "L/R/Woofer complete bank"
+                            and not bool(
+                                (report.get("common_level_reference") or {}).get(
+                                    "independent_channel_normalization"
+                                )
+                            )
+                        ),
+                        "relative_branch_gain_preserved": (
+                            report.get("filter_bank_normalization") or {}
+                        ).get("relative_branch_gain_preserved"),
                         "independent_positions_pass": (
                             report.get("independent_positions") or {}
                         ).get("pass"),

@@ -79,7 +79,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--level-dbfs", type=float, default=-18.0)
     parser.add_argument("--sweep-seconds", type=float, default=3.0)
-    parser.add_argument("--limit", type=int, choices=range(1, 68), default=None, help="preflight only: build the first N variants")
+    parser.add_argument("--limit", type=int, choices=range(1, 69), default=None, help="preflight only: build the first N variants")
     parser.add_argument("--variant-id", action="append", default=[], help="build only this variant ID; may be repeated for selective acoustic retry")
     parser.add_argument("--include-unfiltered-reference", action="store_true", help="prepend direct L+Woofer and R+Woofer comparison sweeps")
     parser.add_argument("--unfiltered-attenuation-db", type=float, default=-6.0, help="extra safety attenuation for the louder direct comparison")

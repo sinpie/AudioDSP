@@ -99,11 +99,13 @@ sudo /usr/local/bin/audiodsp-measurement.py self-test-targets
 
 `test_measurement_engine.py`는 `lrw_sum` 정밀 fixture에서 위치당 L/R/W/L+W/R+W를 모두 준비한 뒤에만 FIR 계산이 열리는지 확인한다. L+W/R+W는 합산 closure에만 쓰이고 FIR 평균·정규화에는 들어가지 않아야 한다. 측정 level -9 dB를 reference와 함께 바꿔도 복원된 전달함수와 생성 FIR이 같아야 하며, combined response를 독립 normalize하거나 두 번 보정한 fixture는 실패해야 한다. Crossover ON/OFF 모두 `pass_premeasured_model`이면 추가 사후 sweep 없이 Apply 가능해야 한다.
 
-`test_target_option_matrix.py`는 6 target×3 preset 18개 조합과 Web에 노출된 target/crossover/trim/억제/phase/보정 범위/boost/cut/취향 값의 one-axis 및 대표 상호작용 94개를 실제 32768탭으로 계산한다. `Flat + 추가 억제 없음 + trim 0 dB` 기준 조합은 반드시 PASS하고, 비기준 조합은 안전 제한에 따라 FAIL할 수 있으나 형식·유한값·headroom 검사는 항상 통과해야 한다.
+`test_target_option_matrix.py`는 6 target×3 preset 18개 조합과 Web에 노출된 target/crossover/trim/억제/phase/보정 범위/최대 상대 보상/cut/취향 값의 one-axis 및 대표 상호작용 95개를 실제 32768탭으로 계산한다. `Flat + 추가 억제 없음 + trim 0 dB + 최대 상대 보상 10 dB` 기준 조합은 반드시 PASS하고, 비기준 조합은 안전 제한에 따라 FAIL할 수 있으나 형식·유한값·headroom 검사는 항상 통과해야 한다.
 
-실측 session의 UI SISO 값 전체를 확인할 때는 `diagnostics/run_full_option_matrix.py`로 기준값에서 한 축씩 바꾼 67개 32768탭 Front/Woofer FIR 쌍을 생성한다. `diagnostics/build_option_validation_sequence.py`는 같은 FIR을 정확히 offline convolution한 4채널 저음량 시퀀스와 감쇄한 무필터 전/후 기준을 만들고, `diagnostics/capture_option_validation.py`는 production DSP-bypass/U7-input-off 경로에서 상태를 보존하며 UMIK로 녹음한다. `diagnostics/analyze_option_validation.py`는 모든 L/R 합산 sweep의 SNR·peak·target-fit·생활소음 transient와 Woofer/Bass/Treble 단조성을 분석한다. 이 검사는 조합 폭발을 피하기 위한 one-factor-at-a-time 기능 검증이며 모든 값의 Cartesian product를 의미하지 않는다.
+같은 회귀는 L/R 500~2,000 Hz에서 얻은 하나의 측정·타깃 기준이 Woofer까지 전달되는지, 완성 4채널 bank에 common gain 한 번만 적용되는지, branch 간 상대 dB가 부동소수점 허용오차 안에서 유지되는지를 검사한다. 양쪽 Front의 넓은 10 kHz 이상 roll-off fixture는 1 dB 이상 상대 보상되어야 하고, 한 채널의 좁은 15 dB null은 3 dB를 넘게 boost하거나 common attenuation을 결정해서는 안 된다.
 
-엔진 변경이 특정 옵션 축에만 영향을 줄 때 `run_full_option_matrix.py --variant-id ...`로 해당 값을 선택 재생성할 수 있다. `merge_option_matrix.py`는 새 엔진으로 생성한 baseline FIR SHA가 기존과 동일한지 먼저 증명하고, 선택 결과만 덮어쓴 뒤 67개 모든 FIR SHA를 다시 검증해 재사용/재생성 provenance를 manifest에 남긴다.
+실측 session의 UI SISO 값 전체를 확인할 때는 `diagnostics/run_full_option_matrix.py`로 Flat/추가 억제 없음/trim 0 dB/최대 상대 보상 10 dB 기준에서 한 축씩 바꾼 68개 32768탭 Front/Woofer FIR 쌍을 생성한다. `diagnostics/build_option_validation_sequence.py`는 같은 FIR을 정확히 offline convolution한 4채널 저음량 시퀀스와 감쇄한 무필터 전/후 기준을 만들고, `diagnostics/capture_option_validation.py`는 production DSP-bypass/U7-input-off 경로에서 상태를 보존하며 UMIK로 녹음한다. `diagnostics/analyze_option_validation.py`는 모든 L/R 합산 sweep의 SNR·peak·target-fit·생활소음 transient와 Woofer/Bass/Treble 단조성을 분석한다. 이 검사는 조합 폭발을 피하기 위한 one-factor-at-a-time 기능 검증이며 모든 값의 Cartesian product를 의미하지 않는다.
+
+엔진 변경이 특정 옵션 축에만 영향을 줄 때 `run_full_option_matrix.py --variant-id ...`로 해당 값을 선택 재생성할 수 있다. `merge_option_matrix.py`는 새 엔진으로 생성한 baseline FIR SHA가 기존과 동일한지 먼저 증명하고, 선택 결과만 덮어쓴 뒤 68개 모든 FIR SHA를 다시 검증해 재사용/재생성 provenance를 manifest에 남긴다.
 
 Pi 2의 장시간 검증 녹음은 `capture_option_validation.py --record-via-tmpfs`로 `/dev/shm`에 먼저 기록해 SD 쓰기 stall을 피한다. 사용 전 예상 녹음 크기와 32 MiB 여유를 검사하며, 완료 뒤 지정 경로로 복사하고 임시파일을 회수한다. Production engine은 ALSA overrun을 fatal error로 처리한다.
 

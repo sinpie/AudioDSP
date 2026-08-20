@@ -470,7 +470,7 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     woofer_trim = int(options.get("woofer_trim_db", -9))
     phase_mode = str(options.get("phase_mode", "bass"))
     phase_cutoff = int(options.get("phase_cutoff", 200))
-    max_boost = int(options.get("max_boost_db", 6))
+    max_boost = int(options.get("max_boost_db", 10))
     max_cut = int(options.get("max_cut_db", 18))
     correction_low_hz = int(options.get("correction_low_hz", 20))
     crossover_requested = bool(options.get("crossover_enabled", True))
@@ -501,18 +501,54 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     fft = engine.FFTBackend()
     base_impulses = []
     base_graphs = []
-    base_averages = []
-    for source in ("front_left", "front_right"):
-        average = engine.load_average_response(Path(state["session_dir"]), source, spatial_mode)
+    base_averages = [
+        engine.load_average_response(Path(state["session_dir"]), source, spatial_mode)
+        for source in ("front_left", "front_right")
+    ]
+    shared_front_reference_db = statistics.median([
+        float(value)
+        for average in base_averages
+        for frequency, value in zip(average["frequencies"], average["average_db"])
+        if 500.0 <= float(frequency) <= 2_000.0
+    ])
+    target_f, target_db = engine.target_curve(target_name)
+    shared_target_reference_db = statistics.median([
+        engine.interpolate_log(target_f, target_db, float(frequency))
+        + engine.preference_modifier_db(float(frequency), bass_tilt, treble_tilt)
+        for frequency in base_averages[0]["frequencies"]
+        if 500.0 <= float(frequency) <= 2_000.0
+    ])
+    preferred_target_db = [
+        value + engine.preference_modifier_db(frequency, bass_tilt, treble_tilt)
+        for frequency, value in zip(target_f, target_db)
+    ]
+    (
+        left_confidence,
+        right_confidence,
+        left_rolloff_floor,
+        right_rolloff_floor,
+        stereo_rolloff_summary,
+    ) = engine.stereo_broad_rolloff_confidence(
+        base_averages[0]["frequencies"], base_averages[0]["average_db"], base_averages[0]["frequency_confidence"],
+        base_averages[1]["frequencies"], base_averages[1]["average_db"], base_averages[1]["frequency_confidence"],
+        target_f, preferred_target_db, shared_front_reference_db, shared_target_reference_db,
+    )
+    confidence_banks = (left_confidence, right_confidence)
+    rolloff_banks = (left_rolloff_floor, right_rolloff_floor)
+    for channel, average in enumerate(base_averages):
         impulse, graph = engine.design_channel(
             average["frequencies"], average["average_db"], average["spatial_std_db"],
             average["center_phase_rad"], fft=fft,
             decay_frequency_hz=average.get("decay_frequency_hz"),
-            decay_t20_rt60_s=average.get("decay_t20_rt60_s"), **common_arguments,
+            decay_t20_rt60_s=average.get("decay_t20_rt60_s"),
+            frequency_confidence=confidence_banks[channel],
+            corroborated_rolloff_confidence=rolloff_banks[channel],
+            shared_reference_measure_db=shared_front_reference_db,
+            shared_reference_target_db=shared_target_reference_db,
+            **common_arguments,
         )
         base_impulses.append(impulse)
         base_graphs.append(graph)
-        base_averages.append(average)
     if phase_mode == "bass":
         left, right, phase_details = engine.apply_common_lr_low_frequency_phase(
             base_impulses[0], base_impulses[1], base_averages[0]["frequencies"],
@@ -532,6 +568,7 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     base_impulses, base_normalization = engine.normalize_fir_bank(base_impulses, fft)
     base_graphs[0] = engine.finalize_graph_with_fir(base_graphs[0], base_impulses[0], fft)
     base_graphs[1] = engine.finalize_graph_with_fir(base_graphs[1], base_impulses[1], fft)
+    base_common_reference = engine.apply_common_graph_reference(base_graphs[0], base_graphs[1], None)
     base_spectra = [fft.rfft(impulse, FFT_LENGTH) for impulse in base_impulses]
     crossover_spectra: dict[str, list[complex]] = {}
     for role in ("highpass", "lowpass"):
@@ -540,6 +577,22 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             for index in range(FFT_LENGTH // 2 + 1)
         ]
         crossover_spectra[role] = fft.rfft(engine.minimum_phase_fir(gains, fft, FFT_LENGTH), FFT_LENGTH)
+
+    def baseline_physical_path(output: int, channel: int, bin_index: int) -> complex:
+        """Deployable SISO prior for one physical output/input path."""
+        if output == channel:
+            front_xover = crossover_spectra["highpass"][bin_index] if crossover_enabled else 1.0 + 0.0j
+            return base_spectra[channel][bin_index] * front_xover
+        if not crossover_enabled:
+            return 0j
+        lowpass = crossover_spectra["lowpass"][bin_index]
+        if topology == "mimo_one_sub" and output in (2, 3):
+            # One logical sub actuator is copied 0.5/0.5 to the physical Rear
+            # pair, exactly as the exported MIMO bank does.
+            return 0.5 * base_spectra[channel][bin_index] * lowpass
+        if topology == "mimo_dual_sub" and output == 2 + channel:
+            return base_spectra[channel][bin_index] * lowpass
+        return 0j
 
     # The room transfer functions are normalized to their measured 70-130 Hz
     # level. Anchor the selected target to the existing SISO output in the same
@@ -553,18 +606,31 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         target_level(engine, target_name, preset, frequency, bass_tilt, treble_tilt)
         for frequency in reference_frequencies
     )
-    target_offsets_db = []
     baseline_reference_db = []
     for channel, source in enumerate(("front_left", "front_right")):
         levels = []
         for frequency in reference_frequencies:
             bin_index = min(FFT_LENGTH // 2, round(frequency * FFT_LENGTH / RATE))
             for position in positions:
-                pressure = response_value(position[source], frequency, reference_db) * base_spectra[channel][bin_index]
+                h_physical = []
+                for output in range(4):
+                    if topology == "mimo_one_sub" and output >= 2:
+                        h_physical.append(response_value(position["sub_pair"], frequency, reference_db))
+                    elif topology == "mimo_stereo" and output >= 2:
+                        h_physical.append(0j)
+                    else:
+                        physical_source = ("front_left", "front_right", "sub_left", "sub_right")[output]
+                        h_physical.append(response_value(position[physical_source], frequency, reference_db))
+                pressure = sum(
+                    h_physical[output] * baseline_physical_path(output, channel, bin_index)
+                    for output in range(4)
+                )
                 levels.append(db(abs(pressure)))
         baseline = statistics.median(levels)
         baseline_reference_db.append(baseline)
-        target_offsets_db.append(baseline - target_reference_db)
+    common_baseline_reference_db = statistics.median(baseline_reference_db)
+    common_target_offset_db = common_baseline_reference_db - target_reference_db
+    target_offsets_db = [common_target_offset_db, common_target_offset_db]
 
     actuator_count = len(sources)
     path_spectra = [[0j] * (FFT_LENGTH // 2 + 1) for _ in range(actuator_count * 2)]
@@ -588,6 +654,14 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         # to the independently validated SISO solution.  Subwoofer topologies
         # retain the selected strength because they have extra control DOF.
         solution_blend *= 0.15
+    elif topology == "mimo_one_sub":
+        # One physical low-frequency actuator cannot independently flatten
+        # three seats.  With a 10 dB relative-compensation ceiling, the raw
+        # inverse can otherwise trade a small target improvement for a longer
+        # low-frequency impulse tail. Keep more of the validated common-level
+        # SISO prior; the model gate below still requires target/seat
+        # non-regression and a <=1.5 dB tail change.
+        solution_blend *= 0.65
     elif topology == "mimo_dual_sub":
         # Four actuators provide more freedom but also more opportunities for
         # a narrow solution to lengthen the synthetic low-frequency tail.
@@ -739,6 +813,7 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     graph_frequencies = [20.0 * (25.0 ** (index / 159.0)) for index in range(160)]
     prediction: dict[str, Any] = {}
     graphs: dict[str, Any] = {}
+    channel_response_samples: dict[str, list[dict[str, Any]]] = {}
     tail_before_values = {"left": [], "right": []}
     tail_after_values = {"left": [], "right": []}
     for channel, channel_name in enumerate(("left", "right")):
@@ -762,7 +837,10 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                     else:
                         source = ("front_left", "front_right", "sub_left", "sub_right")[output]
                         h_physical.append(response_value(position[source], frequency, reference_db))
-                before = h_physical[channel] * base_spectra[channel][bin_index]
+                before = sum(
+                    h_physical[output] * baseline_physical_path(output, channel, bin_index)
+                    for output in range(4)
+                )
                 after = sum(h_physical[output] * actual_spectra[output * 2 + channel][bin_index] for output in range(4))
                 before_values.append(before)
                 after_values.append(after)
@@ -832,7 +910,10 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                     else:
                         source = ("front_left", "front_right", "sub_left", "sub_right")[output]
                         h_physical.append(response_value(position[source], frequency, reference_db))
-                before_tail_spectra[position_index][bin_index] = h_physical[channel] * base_spectra[channel][bin_index]
+                before_tail_spectra[position_index][bin_index] = sum(
+                    h_physical[output] * baseline_physical_path(output, channel, bin_index)
+                    for output in range(4)
+                )
                 after_tail_spectra[position_index][bin_index] = sum(h_physical[output] * actual_spectra[output * 2 + channel][bin_index] for output in range(4))
         tail_before_values[channel_name] = [modal_tail_ratio(fft, spectrum) for spectrum in before_tail_spectra]
         tail_after_values[channel_name] = [modal_tail_ratio(fft, spectrum) for spectrum in after_tail_spectra]
@@ -861,6 +942,73 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                 "reference_band_hz": [round(alignment_low_hz, 1), round(alignment_high_hz, 1)],
             },
         }
+        channel_response_samples[channel_name] = response_samples
+
+    # Re-score both programme channels with one shared alignment scalar.  The
+    # per-channel values above are useful only as intermediate diagnostics;
+    # using them as the application gate would silently give L and R different
+    # 0 dB origins and could hide an inter-channel level error.
+    common_alignment_low_hz = max(float(correction_low_hz), 40.0)
+    common_alignment_high_hz = min(float(high_hz), 130.0)
+    if common_alignment_high_hz <= common_alignment_low_hz:
+        common_alignment_low_hz = float(correction_low_hz)
+        common_alignment_high_hz = float(high_hz)
+    common_alignment_samples = [
+        sample
+        for samples in channel_response_samples.values()
+        for sample in samples
+        if common_alignment_low_hz <= sample["frequency"] <= common_alignment_high_hz
+    ]
+    if not common_alignment_samples:
+        common_alignment_samples = [
+            sample
+            for samples in channel_response_samples.values()
+            for sample in samples
+            if correction_low_hz <= sample["frequency"] <= high_hz
+        ]
+    common_before_level_alignment_db = statistics.median([
+        sample["target_db"] - level
+        for sample in common_alignment_samples for level in sample["before_levels"]
+    ])
+    common_after_level_alignment_db = statistics.median([
+        sample["target_db"] - level
+        for sample in common_alignment_samples for level in sample["after_levels"]
+    ])
+    for channel_name in ("left", "right"):
+        samples = channel_response_samples[channel_name]
+        before_errors = [
+            abs(level + common_before_level_alignment_db - sample["target_db"])
+            for sample in samples if 20.0 <= sample["frequency"] <= high_hz
+            for level in sample["before_levels"]
+        ]
+        after_errors = [
+            abs(level + common_after_level_alignment_db - sample["target_db"])
+            for sample in samples if 20.0 <= sample["frequency"] <= high_hz
+            for level in sample["after_levels"]
+        ]
+        prediction[channel_name].update({
+            "before_target_mae_db": round(statistics.mean(before_errors), 3),
+            "after_target_mae_db": round(statistics.mean(after_errors), 3),
+            "shape_reference_band_hz": [round(common_alignment_low_hz, 1), round(common_alignment_high_hz, 1)],
+            "before_level_alignment_db": round(common_before_level_alignment_db, 3),
+            "after_level_alignment_db": round(common_after_level_alignment_db, 3),
+            "level_reference_scope": "one common Left/Right/MIMO-bank reference",
+        })
+        graphs[channel_name]["measured_db"] = [
+            round(value + common_before_level_alignment_db, 4)
+            for value in graphs[channel_name]["raw_measured_db"]
+        ]
+        graphs[channel_name]["predicted_db"] = [
+            round(value + common_after_level_alignment_db, 4)
+            for value in graphs[channel_name]["raw_predicted_db"]
+        ]
+        graphs[channel_name]["level_alignment_db"] = {
+            "measured": round(common_before_level_alignment_db, 3),
+            "predicted": round(common_after_level_alignment_db, 3),
+            "reference_band_hz": [round(common_alignment_low_hz, 1), round(common_alignment_high_hz, 1)],
+            "scope": "one common Left/Right/MIMO-bank reference",
+            "independent_channel_normalization": False,
+        }
 
     improvement_pass = all(
         prediction[channel]["after_target_mae_db"] <= prediction[channel]["before_target_mae_db"] + 0.25
@@ -874,6 +1022,21 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         prediction[channel]["after_modal_tail_db"] <= prediction[channel]["before_modal_tail_db"] + 1.5
         for channel in ("left", "right")
     )
+    common_reference_pass = bool(
+        abs(target_offsets_db[0] - target_offsets_db[1]) <= 1.0e-9
+        and all(
+            graphs[channel]["level_alignment_db"].get("independent_channel_normalization") is False
+            for channel in ("left", "right")
+        )
+        and abs(
+            float(graphs["left"]["level_alignment_db"]["predicted"])
+            - float(graphs["right"]["level_alignment_db"]["predicted"])
+        ) <= 1.0e-9
+    )
+    base_common_attenuation_db = max(0.0, -float(base_normalization.get("applied_common_gain_db", 0.0)))
+    mimo_common_attenuation_db = max(0.0, -db(scale))
+    total_common_attenuation_db = base_common_attenuation_db + mimo_common_attenuation_db
+    relative_compensation_limit_pass = total_common_attenuation_db <= float(max_boost) + 0.25
     warnings = []
     if diversity["independence_warning"]:
         warnings.append("일부 제어원의 공간 응답이 거의 같아 독립 MIMO 자유도가 낮습니다. 우퍼 위치/배선을 확인하세요.")
@@ -885,7 +1048,11 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         if prediction[channel]["after_modal_tail_db"] > prediction[channel]["before_modal_tail_db"] + 1.5:
             warnings.append(f"{channel.title()}의 평활 전달함수 기반 impulse-tail proxy가 1.5 dB 넘게 악화되었습니다. 적용을 차단하며 이를 실제 RT60/잔향 측정으로 해석하지 않습니다.")
 
-    model_pass = finite_pass and headroom_pass and causality_pass and improvement_pass and modal_tail_pass and independent_positions["pass"]
+    model_pass = (
+        finite_pass and headroom_pass and causality_pass and improvement_pass
+        and modal_tail_pass and independent_positions["pass"]
+        and common_reference_pass and relative_compensation_limit_pass
+    )
     # All actuator responses were captured against the same playback/capture
     # clock before design.  A successful multichannel complex prediction is an
     # application gate; a quieter post-filter sweep remains optional evidence,
@@ -935,9 +1102,13 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                     "left": round(target_offsets_db[0], 3),
                     "right": round(target_offsets_db[1], 3),
                 },
-                "policy": "preserve existing SISO bass anchor in the solver; score target shape after one common reference-band level alignment and report physical bank attenuation separately",
+                "common_baseline_reference_db": round(common_baseline_reference_db, 3),
+                "independent_channel_normalization": False,
+                "policy": "preserve one shared existing SISO bass anchor in the solver; score L/R target shape after one common reference-band alignment and report physical bank attenuation separately",
                 "siso_bank_normalization": base_normalization,
+                "siso_common_level_reference": base_common_reference,
             },
+            "stereo_broad_rolloff_corroboration": stereo_rolloff_summary,
             "usable_low_hz": {key: round(value, 2) for key, value in usable_lows.items()},
             "condition_surrogate": {"median": round(statistics.median(condition_values), 3), "p95": round(percentile(condition_values, 0.95), 3), "maximum": round(max(condition_values), 3)},
             "actuator_diversity": diversity,
@@ -945,6 +1116,10 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "headroom": {
                 "before_global_scale_row_sum": round(maximum_row_sum, 6),
                 "global_scale_db": round(db(scale), 3),
+                "base_common_attenuation_db": round(base_common_attenuation_db, 3),
+                "total_common_attenuation_db": round(total_common_attenuation_db, 3),
+                "max_relative_compensation_db": max_boost,
+                "relative_compensation_limit_pass": relative_compensation_limit_pass,
                 "maximum_correlated_input_row_sum": round(maximum_row_sum_after, 6),
                 "physical_output_row_sum_before": {label: round(value, 6) for label, value in zip(OUTPUT_LABELS, per_output_row_sum_before)},
                 "physical_output_row_sum_after": {label: round(value, 6) for label, value in zip(OUTPUT_LABELS, per_output_row_sum_after)},
@@ -959,7 +1134,16 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         "self_validation": {
             "overall_pass": application_pass,
             "model_pass": model_pass,
-            "core_checks": {"finite": finite_pass, "correlated_input_headroom": headroom_pass, "common_causality": causality_pass, "predicted_target_and_spatial_non_regression": improvement_pass, "predicted_modal_tail_non_regression": modal_tail_pass},
+            "core_checks": {
+                "finite": finite_pass,
+                "correlated_input_headroom": headroom_pass,
+                "common_causality": causality_pass,
+                "predicted_target_and_spatial_non_regression": improvement_pass,
+                "predicted_modal_tail_non_regression": modal_tail_pass,
+                "one_common_level_reference": common_reference_pass,
+                "one_common_bank_gain": True,
+                "relative_compensation_limit": relative_compensation_limit_pass,
+            },
             "independent_positions": independent_positions,
             "crossover_sum": {
                 "required": crossover_enabled,
@@ -977,6 +1161,25 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "stability": "Tikhonov control effort, adjacent-frequency continuity, primary prior, usable-band and per-frequency measurement-confidence weighting, actual sub-output trim bound, global worst-case row-sum headroom",
             "phase": "bulk-arrival-restored complex low-frequency optimization, common L/R base phase and one common causal delay",
             "crossover": "minimum-phase LR4 branch spectra are part of the transfer matrix and exported FIR bank; no extra runtime stage",
+        },
+        "common_level_reference": {
+            "scope": "complete 2x4 MIMO L/R/woofer bank",
+            "reference_band_hz": [round(common_alignment_low_hz, 1), round(common_alignment_high_hz, 1)],
+            "predicted_reference_db": round(common_after_level_alignment_db, 4),
+            "target_reference_db": 0.0,
+            "independent_channel_normalization": False,
+        },
+        "filter_bank_normalization": {
+            "method": "one common gain across the complete 2x4 MIMO bank",
+            "scope": "complete_mimo_l_r_woofer_bank",
+            "zero_db_reference": "single_common_bank_peak",
+            "independent_channel_normalization": False,
+            "applied_common_gain_db": round(db(scale), 4),
+            "base_common_gain_db": base_normalization.get("applied_common_gain_db"),
+            "common_attenuation_db": round(total_common_attenuation_db, 4),
+            "max_relative_compensation_db": max_boost,
+            "relative_compensation_limit_pass": relative_compensation_limit_pass,
+            "relative_branch_gain_preserved": True,
         },
     }
     result["crossover"] = result["mimo"]["crossover"] | {
@@ -1109,7 +1312,7 @@ def self_test(engine_path: Path) -> dict[str, Any]:
             "phase_mode": "bass", "phase_cutoff": 200, "spatial_mode": "equal",
             "bass_tilt_db": 0, "treble_tilt_db": 0,
             "correction_low_hz": 20, "correction_high_hz": 20_000,
-            "max_boost_db": 6, "max_cut_db": 18,
+        "max_boost_db": 10, "max_cut_db": 18,
             "mimo_high_hz": 150, "mimo_strength": "balanced",
             "mimo_support_penalty_db": 6,
             "crossover_enabled": True, "crossover_frequency_hz": 100,

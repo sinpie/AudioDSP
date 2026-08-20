@@ -61,7 +61,7 @@ Sub가 있는 topology는 기본 ON/100 Hz LR4 crossover의 complex minimum-phas
 
 추가 안전 처리:
 
-- MIMO 전에 L/R base FIR 두 개를 SISO와 같은 `normalize_fir_bank` 한 번으로 먼저 정규화한다. 정규화하지 않은 설계 중간값과 headroom 제한을 마친 MIMO bank를 비교해 false FAIL을 만들지 않는다.
+- MIMO 전에 L/R base FIR은 SISO와 같은 L/R 500~2,000 Hz 공통 측정·타깃 기준으로 설계하고 `normalize_fir_bank` common gain 한 번만 적용한다. MIMO target offset도 좌우에 하나만 사용하며, 최종 2×4 matrix는 설계된 출력 간 관계를 보존하는 global scale만 허용한다. 정규화하지 않은 중간값이나 Front-only 응답을 실제 Front+sub baseline과 비교해 false FAIL을 만들지 않는다.
 - MIMO 범위는 20–80/120/150 Hz 중 선택하며 끝에서 30 Hz raised-cosine으로 기존 SISO FIR에 전이한다.
 - 영위상 역필터를 요구하지 않고 기존 SISO 응답의 가중 도착 phase를 목표 phase로 유지한다.
 - 모든 경로에 하나의 공통 인과 지연을 적용하고 32768탭으로 절단·후단 taper한다.
@@ -130,11 +130,11 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 
 4 GB는 다른 서버·database·desktop을 함께 운영하거나 매우 큰 session archive를 동시에 다룰 때의 선택 여유다. RAM 증설 자체는 음질이나 latency를 개선하지 않는다. 현재 2×4 MIMO의 실제 병목도 CPU와 USB/XRUN 안정성이므로 새 Pi 5 2 GB에서 장시간 수락 시험으로 최종 확정한다.
 
-## 2026-08-19 무음 알고리즘 회귀 결과
+## 2026-08-21 무음 알고리즘 회귀 결과
 
-- `Flat / 추가 억제 없음 / Woofer trim 0 dB` 기준 합성 session은 MIMO Stereo, MIMO 2.1, MIMO 2.2 모두 finite/headroom/causality/타깃·공간 비악화/modal-tail 비악화 모델 검증을 PASS했다.
+- `Flat / 추가 억제 없음 / Woofer trim 0 dB / 최대 상대 보상 10 dB` 기준 합성 session은 MIMO Stereo, MIMO 2.1, MIMO 2.2 모두 finite/headroom/causality/타깃·공간 비악화/modal-tail 비악화 모델 검증을 PASS했다.
 - MIMO 전용 UI 값 19개를 실제 32768탭×8경로로 생성했다. 구조·형식·headroom 검사는 19/19 PASS했다.
-- 비기준 조합 중 crossover 60/70/80 Hz, Harman target, `Safe · 높은 안정성 + 지원 제어원 제한 12 dB`의 다섯 합성 조합은 평활 전달함수 impulse-tail proxy가 허용 비악화 범위를 넘어서 `fail_model`로 안전 차단됐다. 이는 프로그램 오류가 아니라 해당 합성 room에서 기준을 만족하지 못한 결과이며, Web은 `4 · FIR 계산`의 실제 항목명으로 강도·상한·지원 제한·crossover 조정 순서를 안내한다.
+- 2026-08-21 회귀에서 기존 다섯 `fail_model`은 비교 baseline이 Front-only인 반면 후보는 LR4 Front+sub였던 검증 오류로 확인했다. baseline도 실제 배포되는 crossover routing으로 수정한 뒤 19/19가 구조와 모델 비악화를 PASS했다. 실제 방에서 비기준 조합이 실패할 수 있다는 정책은 유지하며 Web은 `4 · FIR 계산`의 실제 항목명으로 조정 순서를 안내한다.
 - 합성 MIMO 기준 모델 PASS는 `AUDIODSP_PHASE_CLOCK_SHARED=1`인 공통-clock fixture의 수치 검증이다. 현재 U7+UMIK-1 독립 USB clock 실측에서는 복소 전달행렬의 절대 위상을 보장할 수 없어 production 생성과 활성화를 차단한다. 향후 loopback/reference channel 등 공통 timing reference가 추가된 뒤에도 선택적인 저레벨 acoustic audit와 Pi5 10분 CPU/XRUN 검증을 별도 수행해야 실제 하드웨어 성능을 수락할 수 있다.
 
 ## 의도적으로 하지 않는 것

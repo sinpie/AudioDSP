@@ -43,6 +43,8 @@
 - Target을 바꾸면 1 kHz 기준 곡선과 bass/treble preference를 즉시 SVG에 반영한다.
 - L/R/Woofer와 sub MIMO에서는 디지털 crossover를 주요 옵션으로 표시하고 기본 ON/100 Hz로 둔다. 설명은 Front LR4 HPF, Woofer LR4 LPF, 32768탭 WAV 내장, 추가 block latency 0을 함께 말한다. 합산 L/R 모드에서는 숨은 OFF 값과 독립 branch가 없다는 이유를 표시한다.
 - 결과 그래프는 각 채널의 측정 전 ±공간 편차, 적용 후 예상, target을 구분한다.
+- `최대 상대 보상`은 0/3/6/9/10 dB로 표시하고 기본 10 dB다. 도움말은 “신뢰되는 최고 보상을 0 dB로 두고 L/R/Woofer 전체를 같은 값만큼 낮춤”과 “좁은 deep은 최대 3 dB”를 함께 설명한다. `최대 부스트`나 채널별 0 dB처럼 실제 동작과 다른 용어를 사용하지 않는다.
+- 결과 요약은 `L/R/Woofer 공통 0 dB 기준`, 공통 FIR gain, 채널별 독립 정규화 없음, branch 상대레벨 보존을 한 카드에서 보여준다. 그래프도 L/R 500~2,000 Hz 하나의 기준을 사용했다는 설명을 legend 가까이에 둔다.
 - 결과의 `Woofer 최종 trim`은 FIR 계산 옵션을, `측정 시 Woofer 감쇄`는 sweep SNR 확보용 측정 조건을 별도 항목으로 표시한다.
 - 결과에 기록된 `algorithm_revision`이 현재 엔진과 다르면 측정 원본은 보존하되 이전 계산임을 경고하고 4단계 FIR 재계산 전 Preview/Apply를 차단한다.
 - 최신 결과라도 `self_validation.overall_pass=false`이면 다운로드와 A/B Preview는 허용하지만 정식 Apply는 UI와 엔진 양쪽에서 차단한다.

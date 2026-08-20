@@ -31,7 +31,7 @@ flowchart LR
 | HID 감시 | `/usr/local/bin/audiodsp-profile-monitor.py` | U7 Speaker/Headphones 실제 상태 읽기, 프로필 전환, 안내음 요청 |
 | 출력 전환 helper | `/usr/local/bin/audiodsp-output-profile` | manager 호출과 Front L/R 안내음 믹스 |
 | 웹 | `/usr/local/bin/audiodsp-profile-web.py` | 세 화면, HTTP API, staged upload/backup, client SVG, 실제 볼륨 polling |
-| 측정 엔진 | `/usr/local/bin/audiodsp-measurement.py` | 독점 측정, L/R/우퍼 및 선택적 합산 closure, ESS/SNR 분석, 독립-clock 안전 합산, FIR 계산, 진행 상태 |
+| 측정 엔진 | `/usr/local/bin/audiodsp-measurement.py` | 독점 측정, L/R/우퍼·합산 closure·동시 Walsh 위상, ESS/SNR 분석, 공통 레벨/공통 bank gain FIR 계산, 진행 상태 |
 | MIMO 엔진 | `/usr/local/bin/audiodsp-mimo.py` | Pi4/5와 공통 timing reference 조건의 2×4 robust pressure matching, 8-path FIR bank와 영구 한계 보고서 생성 |
 | 준비 안내 | `/usr/local/bin/audiodsp-dsp-ready` | CamillaDSP 준비 확인 후 `DSP ready` 재생 |
 
@@ -75,7 +75,8 @@ MIMO bank는 `/etc/camilladsp/profiles/mimo`의 manifest와 네 stereo float32 W
 
 - 관리자 CLI는 `/run/audiodsp-profile-manager.lock`의 `flock`으로 설정·FIR·config 변경을 직렬화한다.
 - 측정은 별도 measurement lock과 audio-exclusive lock을 쓴다.
-- 정밀 분리+합산 session은 L/R/W만 FIR 설계에 사용하고 L+W/R+W는 같은 위치의 절대 복소합 검증에만 사용한다. 검증 응답을 다시 평균하거나 normalize하지 않는다.
+- 정밀 분리+합산 session은 L/R/W magnitude로 branch를 설계하고 L+W/R+W의 절대 전달 closure와 same-recording L+R+W Walsh 상대위상을 cross-term 제약으로 사용한다. 합산 응답을 branch로 다시 평균하거나 normalize하지 않는다.
+- L/R의 500~2,000 Hz로 하나의 측정·타깃 0 dB 기준을 만든다. 완성된 Front L/R·Woofer L/R bank에는 한 common gain만 적용하며, 독립 branch normalization은 자동 core check와 matrix test가 차단한다.
 - JSON과 config는 임시 파일 작성 후 `os.replace`로 원자 교체한다.
 - Web은 thread-per-request지만 모든 변경은 관리자 CLI의 프로세스 lock을 통과한다.
 - status는 관련 파일 mtime/size signature로 cache한다.

@@ -84,23 +84,24 @@ Preset은 boost를 만들지 않으며 Front에는 350 Hz 이하, Woofer에는 �
 
 ## 정규화와 안전 제한
 
-- 타깃 레벨 정규화의 Front 기준 대역은 500~2,000 Hz, Woofer 기준 대역은 50~120 Hz median이다. 이는 위의 적응형 Woofer SNR 판정 대역과 별개다.
+- L/R의 500~2,000 Hz 측정·타깃 median으로 **하나의 공통 0 dB 기준**을 만든다. 이 기준을 L/R/Woofer의 설계, 결과 그래프, 자동 판정에 그대로 사용하며 Woofer나 좌우를 따로 0 dB로 맞추지 않는다. Woofer SNR의 50~120 Hz 계열 적응형 판정 대역은 측정 품질용일 뿐 레벨 정규화 기준이 아니다.
 - 반 octave median 응답이 기준보다 10 dB 내려간 지점으로 자연 usable band를 추정한다.
-- 자연 roll-off 밖에서는 positive correction을 금지한다.
+- 두 Front가 2~20 kHz에서 같은 방향으로 감쇄되고 서로 4 dB 안에서 일치하면 스피커/마이크의 공통 광대역 roll-off로 간주해 보상 신뢰도를 제한적으로 회복한다. 한 채널만의 딥이나 약 1/3 octave보다 좁은 null은 이 예외를 받지 않는다.
 - 공간 표준편차가 3 dB면 boost 신뢰도를 절반 수준으로 낮추는 soft regularization을 쓴다.
-- positive correction은 tanh soft limit와 사용자 최대 boost 0/3/6/9 dB를 적용한다. 500 Hz 이상은 최대 3 dB로 더 제한한다.
+- `최대 상대 보상`은 0/3/6/9/10 dB이며 기본 10 dB다. 신뢰되는 가장 큰 positive correction을 0 dB로 만들기 위해 전체 L/R/Woofer bank를 같은 값만큼 낮춘다. 따라서 디지털 preamp나 양의 FIR 전달 이득 없이 넓은 고역 roll-off도 상대 보상할 수 있다.
+- 좁고 깊은 null은 공간 평균과 양쪽 ±1/6 octave 이웃으로 판별하며 최대 3 dB만 허용한다. 한 deep을 채우려고 나머지 전 대역을 과도하게 낮추지 않는다.
 - cut은 사용자 최대 6/9/12/18/24 dB에서 제한한다.
 - Woofer correction은 20~180 Hz에서 cut-only다.
 - 보정 범위는 사용자가 20/30/40/60/80 Hz 하한과 300/500/1k/5k/20k Hz 상한을 선택한다.
-- 최종 FIR의 최대 전달 이득은 0 dB 이하가 되도록 정규화한다.
+- 완성된 Front L/R + Woofer L/R FIR bank의 최대 전달 이득을 한 번만 구하고 모든 branch에 동일한 common gain을 적용한다. 자동 검증은 공통 기준, 공통 gain, branch 간 상대레벨 보존, 최대 상대 보상, narrow-null guard를 각각 검사한다.
 
 ## 디지털 crossover와 실제 합산
 
 분리 SISO에서는 디지털 crossover가 기본 `ON`, 기본 주파수는 100 Hz다. 선택 범위는 60/70/80/90/100/120 Hz다. Front WAV에는 Linkwitz–Riley 4차 HPF, Rear/Woofer WAV에는 같은 주파수의 LR4 LPF magnitude와 그 minimum-phase 전달함수를 넣는다. 별도의 CamillaDSP biquad/filter stage를 추가하지 않고 기존 32768탭 WAV에 곱해 합치므로 convolution 수, chunksize, block latency는 늘지 않는다. FIR 자체의 group delay/phase는 결과에 계속 기록한다. `OFF`는 합산 검증을 끄는 뜻이 아니라 full-range 중첩을 선택하는 것이므로 합산 cut-only guard는 계속 동작한다.
 
-두 branch를 따로 target에 맞추는 것으로 끝내지 않는다. 공통 timing reference가 명시된 경우에만 생성 FIR energy delay와 측정 bulk delay를 합쳐 우퍼 극성 ±1과 프런트/우퍼 상대 지연을 복소합으로 탐색한다. 현재 U7 출력과 UMIK-1 입력의 기본 구성은 하드웨어 clock을 공유하지 않으므로 자동 branch 상대지연은 적용하지 않는다. 대신 위상 비의존 에너지 합산으로 타깃 MAE/P90을 평가하고, 최악의 `|Front|+|Woofer|` 동상 상한을 넘는 대역에 두 branch 공통 minimum-phase cut-only guard를 내장한다. clock drift로 생긴 가짜 복소 딥과 cancellation은 boost로 메우지 않는다.
+두 branch를 따로 target에 맞추는 것으로 끝내지 않는다. 위치마다 한 녹음 안에서 L/R/W를 네 개의 직교 Walsh 상태로 동시에 재생해 같은 주파수의 세 전달함수를 분리한다. 이 동일 녹음 상대위상으로 생성 FIR energy delay, Woofer 극성 ±1, 프런트/우퍼 상대 지연을 복소합 탐색한다. 별도 ESS끼리의 절대 위상은 U7 출력과 UMIK-1 입력의 독립 clock 때문에 사용하지 않는다. Walsh 기준이 불신이면 위상 비의존 에너지 합산과 최악 `|Front|+|Woofer|` 동상 상한에 공통 cut-only guard를 적용하고, clock drift가 만든 가짜 복소 딥은 boost로 메우지 않는다.
 
-정밀 모드는 같은 위치의 L/R/W와 L+W/R+W 실측 크기가 삼각 부등식 합산 범위 안에 있는지, 독립 정규화 없이 절대 전달비로 먼저 확인한다. 공통 clock이 없을 때 절대 위상은 `limited` 경고로 남지만 크기 closure와 SNR이 통과하고 최종 위상 비의존 타깃 MAE/P90·상한 guard가 통과하면 `pass_safe_sum_phase_limited`로 정식 적용할 수 있다. 표준 분리 SISO는 `pass_safe_upper_phase_limited`를 사용한다. 공통 timing reference가 명시된 구성에서만 정확한 복소 위상 PASS를 주장한다. 어떤 구성도 4단계 FIR 생성 뒤 필수 재측정을 만들지 않는다.
+정밀 모드는 같은 위치의 L/R/W와 L+W/R+W 실측 크기가 삼각 부등식 합산 범위 안에 있는지, 독립 정규화 없이 절대 전달비로 먼저 확인한다. 여기에 동일 녹음 Walsh L+R+W 기준이 신뢰되면 L+W/R+W의 dense cross-term과 결합한 복소 모델을 사용한다. Walsh 기준이 없거나 불신이면 `limited`를 숨기지 않고 크기 closure·SNR·위상 비의존 타깃·상한 guard로 안전 판정한다. 어떤 구성도 4단계 FIR 생성 뒤 필수 재측정을 새로 요구하지 않는다.
 
 MAE는 판정 대역의 log-frequency 지점마다 계산한 절대 Target 오차의 평균이다. P90은 오차의 90 percentile로, 지점 90%가 그 dB 이내라는 뜻이다. MAE가 낮아도 좁은 대역의 큰 봉우리/null이 남을 수 있으므로 P90을 함께 제한한다. 독립 Woofer LPF branch는 full-range Target과 직접 비교하지 않고 공통 Front 기준 저역 상대레벨만 진단하며, 최종 Target 판정은 L+Woofer/R+Woofer 전체 합산에 적용한다.
 
@@ -112,7 +113,7 @@ MAE는 판정 대역의 log-frequency 지점마다 계산한 절대 Target 오�
 
 기본 magnitude 설계는 minimum phase다. `bass` 모드는 중앙 위치의 측정 phase에서 minimum-phase 성분을 빼 excess phase를 구하고 지정 cutoff 80/120/160/200/250 Hz 아래에서만 보정한다. cutoff 전이는 cosine window이며 causality를 위한 shift는 최대 2048 samples로 제한한다. impulse 끝 10%는 fade한다.
 
-L/R/우퍼 모드의 프런트/우퍼 branch 상대 지연·극성 최적화는 공통 timing reference가 명시된 경우에만 사용한다. 기본 U7+UMIK-1 구성에서는 각 sweep의 clock drift를 실제 거리로 오인하지 않도록 자동 branch 정렬을 비활성화하고 이유를 결과에 기록한다. 한 응답 안에서 계산하는 채널별 minimum/excess phase와 FIR 인과성 제한은 계속 적용한다. 우퍼 한 개는 우퍼 L/R 두 채널에 같은 FIR로 복사하므로 T5S의 stereo 입력 케이블을 그대로 쓸 수 있다.
+L/R/우퍼 모드의 프런트/우퍼 branch 상대 지연·극성은 위치별 동일 녹음 Walsh L+R+W 기준이 신뢰될 때만 최적화한다. 이 방식은 별도 sweep의 clock drift를 거리로 오인하지 않으며, UI에는 주파수별 상대위상과 ms/degree 요약, 반복오차를 함께 표시한다. 하나의 delay로 위상곡선을 잘 설명하지 못하면 그 개발자용 요약값은 수동 거리 설정에 쓰지 않지만, 신뢰되는 주파수별 복소 데이터와 L+W/R+W cross-term은 계속 제한적으로 사용한다. 우퍼 한 개는 우퍼 L/R 두 채널에 같은 FIR로 복사하므로 T5S의 stereo 입력 케이블을 그대로 쓸 수 있다.
 
 Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니다. 위치별로 달라지는 고역 phase는 보정하지 않고, 시간적으로 비교적 일관된 저역과 source 정렬에만 제한한다.
 

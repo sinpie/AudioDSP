@@ -1,5 +1,16 @@
 # 변경 이력
 
+## 2026-08-21 · 공통 레벨 기준·광대역 roll-off·Walsh 위상
+
+- L/R 각각과 Woofer를 따로 0 dB로 맞추지 않고 L/R 500~2,000 Hz median으로 하나의 측정·타깃 기준을 만든 뒤 L/R/Woofer 전체 결과와 판정에 동일 적용
+- 완성된 4채널 FIR bank의 최대 전달값으로 common gain 한 번만 적용하고, branch별 적용 전/후 peak와 상대레벨 보존 오차를 영구 metadata 및 자동 core check로 추가
+- `최대 룸 부스트`를 실제 동작에 맞는 `최대 상대 보상`으로 바꾸고 0/3/6/9/10 dB, 기본 10 dB를 제공; 가장 큰 신뢰 보상을 0 dB로 두고 전체 bank를 같은 값만큼 감쇄해 양의 FIR 이득과 preamp를 만들지 않음
+- 양쪽 Front에서 공통으로 나타나는 2~20 kHz 광대역 감쇄만 제한적으로 보상하고, 한 채널의 좁은 deep/null은 양쪽 ±1/6 octave 형상과 공간 신뢰도로 억제해 최대 3 dB를 넘지 않도록 수정
+- 새 결과의 자동 검증에 `하나의 L/R/우퍼 레벨 기준`, `완성 bank common gain`, `branch 상대레벨 보존`, `최대 상대 보상`, `좁은 null boost 보호`를 추가하고 UI 오류 안내를 `4 · FIR 계산`의 실제 메뉴명과 조치 순서로 통일
+- L/R/W를 한 녹음에서 같은 주파수로 분리하는 4상태 Walsh 기준을 추가하고 각 상태의 시작·끝 guard를 제외한 4회 반복만 평균; 별도 ESS clock drift를 거리로 쓰지 않으면서 L/R/W 상대위상·극성·지연과 L+W/R+W cross-term을 결합
+- MIMO 비교 기준이 Front-only였던 오류를 찾아, 실제 배포되는 LR4 Front+sub SISO 경로를 baseline으로 사용하도록 수정; 한 우퍼 해의 안전 blend도 보수적으로 제한
+- 무음 회귀에서 target/preset 18조합, SISO 설정 95시나리오, MIMO 19시나리오, 4096 Web/Profile 상태, Pi5 FFTW·8-path Camilla parser·5.1 dual-sub 42경로 메모리 계획을 검증
+
 ## 2026-08-20 · 빠른 ESS·독립-clock 합산 안전성·UI 반응성
 
 - 모든 빠른 검사·본 측정·합산·사후 검증 sweep의 dBFS를 평상시 U7 볼륨과 독립된 DAC 기준으로 변경; 입력 OFF 후 PCM 0 dB read-back, sweep 프로세스 종료 후 원래 볼륨 read-back, 그 뒤에만 입력 복귀

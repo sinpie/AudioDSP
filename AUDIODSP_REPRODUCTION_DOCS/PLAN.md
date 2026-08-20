@@ -13,7 +13,7 @@
 - 브라우저 계산 SVG FIR 응답, 업로드 전/후 비교, 임시 A/B, 명시적 정식 적용
 - UMIK-1 0°/90° calibration 보관, 실제 측정은 90°만 허용
 - 본 측정과 같은 출력별 2초 ESS로 레벨·SNR·클리핑 사전 평가
-- L/R 합산, 표준 L/R/우퍼, 권장 L/R/우퍼/L+우퍼/R+우퍼 closure를 빠른 측정 1위치 또는 표준 측정 3위치로 측정하고 32768-tap FIR 생성
+- L/R 합산, 표준 L/R/우퍼, 권장 L/R/우퍼/L+우퍼/R+우퍼와 동일 녹음 L+R+우퍼 Walsh 위상 기준을 빠른 측정 1위치 또는 표준 측정 3위치로 측정하고 32768-tap FIR 생성
 - target, bass-control preset, 음색 tilt, 보정 대역, boost/cut, phase 옵션
 - 측정 중 DSP direct bypass와 U7 입력 mute, 완료/오류 시 원상 복구
 - 버전형 전체 백업 ZIP, staging 검증, 적용 직전 자동 rollback ZIP
@@ -25,7 +25,8 @@
 - `source/common` 단일 공통 원본, Pi2/3/4/5 플랫폼 overlay와 deterministic build materializer
 - 빠른 측정 1위치/표준 측정 3위치 세션 복구·주석·삭제, 독립-clock 합산 안전 상한 및 선택형 정밀 선측정 검증, Flat/0 dB 기준선
 - 정밀 측정의 필터 전 복소합 closure와 최종 합산 예측이 PASS하면 FIR 생성 후 중복 사후 sweep 없이 적용 가능
-- Flat/추가 억제 없음/trim 0 dB 기준 및 SISO 94개·MIMO 19개 UI 옵션 조합 무음 회귀, 실제 메뉴·버튼명을 사용하는 FAIL/PENDING/N/A 조치 안내
+- Flat/추가 억제 없음/trim 0 dB/최대 상대 보상 10 dB 기준 및 SISO 95개·MIMO 19개 UI 옵션 조합 무음 회귀, 실제 메뉴·버튼명을 사용하는 FAIL/PENDING/N/A 조치 안내
+- L/R 500~2,000 Hz 하나의 0 dB 기준과 완성 L/R/Woofer bank 한 번의 common gain, 양쪽 광대역 roll-off 보상, narrow-null 3 dB guard를 자동 검증
 - Pi 5 2 GB 메모리 worst-case 계획 및 5.1+dual-sub 42경로 64-bit allocation 검증
 - Pi 2 실제 Fast 1위치 정밀 5경로 측정, 저장 원본 무음 재계산, Flat/없음/0 dB/100 Hz 필수 기준과 Harman/없음/0 dB/120 Hz 대안 PASS, Profile/Web/CamillaDSP 전체 matrix 및 정식 FIR 불변 확인
 

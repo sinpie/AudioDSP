@@ -70,7 +70,9 @@ DEFAULT_WOOFER_MEASUREMENT_ATTENUATION_DB = -9
 MINIMUM_USABLE_SNR_DB = 6.0
 RECOMMENDED_SNR_DB = 15.0
 PREFLIGHT_TARGET_SNR_DB = MINIMUM_USABLE_SNR_DB
-RESULT_ALGORITHM_REVISION = "2026-08-20-source-band-sweep-simultaneous-phase-v13"
+FIR_IMPLEMENTATION_MAE_LIMIT_DB = 0.25
+FIR_IMPLEMENTATION_P95_LIMIT_DB = 0.80
+RESULT_ALGORITHM_REVISION = "2026-08-21-common-bank-relative-compensation-v18"
 PHASE_CLOCK_SHARED = environment("AUDIODSP_PHASE_CLOCK_SHARED", "0") == "1"
 WOOFER_MEASUREMENT_ATTENUATION_DB = float(environment(
     "WOOFER_MEASUREMENT_ATTENUATION_DB",
@@ -79,10 +81,27 @@ WOOFER_MEASUREMENT_ATTENUATION_DB = float(environment(
 if not -18.0 <= WOOFER_MEASUREMENT_ATTENUATION_DB <= 0.0:
     raise RuntimeError("WOOFER_MEASUREMENT_ATTENUATION_DB must be between -18 and 0 dB")
 WOOFER_MEASUREMENT_SCALE = 10.0 ** (WOOFER_MEASUREMENT_ATTENUATION_DB / 20.0)
-PHASE_REFERENCE_BLOCK = 32_768
+PHASE_REFERENCE_BLOCK = 16_384
+# Legacy disjoint-bin recordings carry their own 32768/6/4 values in JSON;
+# these defaults describe new Walsh-coded captures only.
 PHASE_REFERENCE_PERIODS = 6
 PHASE_REFERENCE_ANALYSIS_PERIODS = 4
-PHASE_REFERENCE_HEADROOM_DB = 6.0
+PHASE_REFERENCE_WALSH_CODES = (
+    (1.0, 1.0, 1.0),
+    (1.0, -1.0, -1.0),
+    (-1.0, 1.0, -1.0),
+    (-1.0, -1.0, 1.0),
+)
+# Keep one settling/guard period at both ends and average four complete
+# interior periods.  Compared with the previous two-period estimator this
+# improves random-noise rejection without changing the signal level or tone
+# set; the extra playback time is about 2.7 seconds at 48 kHz.
+PHASE_REFERENCE_STATE_PERIODS = 6
+PHASE_REFERENCE_STATE_ANALYSIS_INDICES = (1, 2, 3, 4)
+# Three same-frequency acoustic branches can add by 9.54 dB.  Ten dB of
+# per-branch headroom therefore keeps the coded reference no louder than the
+# configured ESS even in the all-positive Walsh state.
+PHASE_REFERENCE_HEADROOM_DB = 10.0
 PHASE_REFERENCE_MIN_CORRELATION = 0.65
 PHASE_REFERENCE_MAX_PHASE_P90_DEG = 45.0
 ALLOWED_NOISE_LEVELS = tuple(range(-54, -5))
@@ -147,7 +166,7 @@ DEFAULT_CORRECTION_PREFERENCES = {
     "treble_tilt_db": 0,
     "correction_low_hz": 20,
     "correction_high_hz": 20_000,
-    "max_boost_db": 6,
+    "max_boost_db": 10,
     "max_cut_db": 18,
     "crossover_enabled": True,
     "crossover_frequency_hz": 100,
@@ -450,6 +469,34 @@ def load_current() -> dict[str, Any]:
             "responses": responses,
             "can_reprocess_all": bool(expected) and len(raw) == len(expected),
         }
+        phase_expected = (
+            list(range(1, session_position_count(value) + 1))
+            if value.get("mode") in SEPARATE_WOOFER_MODES else []
+        )
+        phase_raw = [
+            {
+                "position": position,
+                "recording": f"p{position}_phase_reference_recorded.wav",
+                "signal": f"p{position}_phase_reference_signal.json",
+            }
+            for position in phase_expected
+            if (session_directory / f"p{position}_phase_reference_recorded.wav").is_file()
+            and (session_directory / f"p{position}_phase_reference_signal.json").is_file()
+        ]
+        phase_results = [
+            item for item in value.get("phase_references", [])
+            if isinstance(item, dict)
+            and (session_directory / str(item.get("result", ""))).is_file()
+        ]
+        value["phase_capture_inventory"] = {
+            "expected": len(phase_expected),
+            "raw_count": len(phase_raw),
+            "result_count": len(phase_results),
+            "reliable_count": sum(bool(item.get("reliable")) for item in phase_results),
+            "raw": phase_raw,
+            "results": phase_results,
+            "can_reprocess_all": len(phase_raw) == len(phase_expected),
+        }
     return value
 
 
@@ -464,7 +511,7 @@ def normalize_correction_preferences(value: dict[str, Any]) -> dict[str, Any]:
         "bass_tilt_db": tuple(range(-6, 7)), "treble_tilt_db": tuple(range(-6, 3)),
         "correction_low_hz": (20, 30, 40, 60, 80),
         "correction_high_hz": (300, 500, 1000, 5000, 20_000),
-        "max_boost_db": (0, 3, 6, 9), "max_cut_db": (6, 9, 12, 18, 24),
+        "max_boost_db": (0, 3, 6, 9, 10), "max_cut_db": (6, 9, 12, 18, 24),
         "crossover_enabled": (False, True),
         "crossover_frequency_hz": CROSSOVER_FREQUENCIES,
         "mimo_high_hz": (80, 120, 150),
@@ -575,7 +622,9 @@ def session_integrity(state: dict[str, Any], directory: Path) -> dict[str, Any]:
             for source in expected_sources:
                 if (position, str(source)) not in completed:
                     missing.append(f"p{position}_{source}_response.json")
-        if state.get("phase_reference_acquisition_revision") == "simultaneous-multisine-v1":
+        if state.get("phase_reference_acquisition_revision") in (
+            "simultaneous-multisine-v1", "simultaneous-walsh-v2",
+        ):
             references = {
                 int(item.get("position", 0)): item
                 for item in state.get("phase_references", [])
@@ -1470,15 +1519,14 @@ def write_sweep(
 
 
 def phase_reference_bins() -> dict[str, list[int]]:
-    """Build sparse, non-harmonic, disjoint bins for one simultaneous L/R/W capture."""
-    assigned: dict[str, list[int]] = {"left": [], "right": [], "woofer": []}
+    """Build common-bin sets that a four-state Walsh capture can separate."""
     used: set[int] = set()
 
-    def add_grid(low_hz: float, high_hz: float, divisions_per_octave: int, rotation: tuple[str, ...]) -> None:
+    def grid(low_hz: float, high_hz: float, divisions_per_octave: int) -> list[int]:
+        result: list[int] = []
         index = 0
         frequency = low_hz
         while frequency <= high_hz * 1.000001:
-            source = rotation[index % len(rotation)]
             ideal = frequency * PHASE_REFERENCE_BLOCK / RATE
             candidates = sorted(
                 range(max(2, round(ideal) - 5), min(PHASE_REFERENCE_BLOCK // 2 - 1, round(ideal) + 5) + 1),
@@ -1486,19 +1534,24 @@ def phase_reference_bins() -> dict[str, list[int]]:
             )
             chosen = next((item for item in candidates if all(abs(item - other) >= 2 for other in used)), None)
             if chosen is not None:
-                assigned[source].append(chosen)
+                result.append(chosen)
                 used.add(chosen)
             index += 1
             frequency = low_hz * (2.0 ** (index / divisions_per_octave))
+        return result
 
-    # Woofer-only low bins, three-way interleaving in the crossover region,
-    # then alternating Front bins high enough to identify L/R delay robustly.
-    add_grid(20.0, 44.0, 4, ("woofer",))
-    add_grid(45.0, 250.0, 12, ("woofer", "left", "right"))
-    add_grid(260.0, 800.0, 8, ("left", "right"))
-    for values in assigned.values():
-        values.sort()
-    return assigned
+    # L/R/W share the exact same crossover bins; the Walsh states separate
+    # their transfer functions.  Extra Front-only bins extend L/R timing high
+    # enough to stabilize the delay fit, while sub-only bins describe the
+    # bottom octave without pretending that the Front is observable there.
+    woofer_low = grid(20.0, 42.0, 4)
+    crossover_common = grid(45.0, 220.0, 6)
+    front_high = grid(240.0, 800.0, 6)
+    return {
+        "left": sorted(crossover_common + front_high),
+        "right": sorted(crossover_common + front_high),
+        "woofer": sorted(woofer_low + crossover_common),
+    }
 
 
 def synthesize_low_crest_multisine(
@@ -1536,7 +1589,7 @@ def write_phase_reference(
     level_dbfs: int,
     woofer_attenuation_db: float,
 ) -> dict[str, Any]:
-    """Write one quiet periodic 4-channel signal that identifies L/R/W together."""
+    """Write one quiet four-state Walsh signal that identifies L/R/W together."""
     if not -18.0 <= float(woofer_attenuation_db) <= 0.0:
         raise MeasurementError("우퍼 측정 감쇄는 -18~0 dB여야 합니다.")
     bins = phase_reference_bins()
@@ -1558,7 +1611,12 @@ def write_phase_reference(
 
     lead_frames = round(0.35 * RATE)
     tail_frames = round(0.75 * RATE)
-    active_frames = PHASE_REFERENCE_BLOCK * PHASE_REFERENCE_PERIODS
+    source_order = ("left", "right", "woofer")
+    active_frames = (
+        PHASE_REFERENCE_BLOCK
+        * PHASE_REFERENCE_STATE_PERIODS
+        * len(PHASE_REFERENCE_WALSH_CODES)
+    )
     frames = lead_frames + active_frames + tail_frames
     data_bytes = frames * 4 * 3
     zero = b"\x00\x00\x00"
@@ -1574,16 +1632,21 @@ def write_phase_reference(
                 frame = zero * 4
             else:
                 period = active_index // PHASE_REFERENCE_BLOCK
+                state_index = period // PHASE_REFERENCE_STATE_PERIODS
                 index = active_index % PHASE_REFERENCE_BLOCK
                 envelope = 1.0
                 if period == 0 and index < fade_frames:
                     envelope = 0.5 - 0.5 * math.cos(math.pi * index / max(1, fade_frames))
-                elif period == PHASE_REFERENCE_PERIODS - 1 and index >= PHASE_REFERENCE_BLOCK - fade_frames:
+                elif (
+                    period == PHASE_REFERENCE_STATE_PERIODS * len(PHASE_REFERENCE_WALSH_CODES) - 1
+                    and index >= PHASE_REFERENCE_BLOCK - fade_frames
+                ):
                     remaining = PHASE_REFERENCE_BLOCK - 1 - index
                     envelope = 0.5 - 0.5 * math.cos(math.pi * remaining / max(1, fade_frames))
-                left = generated["left"]["samples"][index] * envelope
-                right = generated["right"]["samples"][index] * envelope
-                woofer_half = generated["woofer"]["samples"][index] * 0.5 * envelope
+                codes = PHASE_REFERENCE_WALSH_CODES[state_index]
+                left = generated["left"]["samples"][index] * codes[0] * envelope
+                right = generated["right"]["samples"][index] * codes[1] * envelope
+                woofer_half = generated["woofer"]["samples"][index] * codes[2] * 0.5 * envelope
                 frame = pack_pcm24(left) + pack_pcm24(right) + pack_pcm24(woofer_half) + pack_pcm24(woofer_half)
             buffer.extend(frame)
             if len(buffer) >= 1024 * 1024:
@@ -1593,19 +1656,24 @@ def write_phase_reference(
             handle.write(buffer)
 
     return {
-        "version": 1,
-        "method": "simultaneous sparse disjoint-bin periodic multisine",
+        "version": 2,
+        "method": "simultaneous common-bin four-state Walsh periodic multisine",
         "sample_rate": RATE,
         "block_samples": PHASE_REFERENCE_BLOCK,
-        "periods": PHASE_REFERENCE_PERIODS,
-        "analysis_periods": PHASE_REFERENCE_ANALYSIS_PERIODS,
+        "periods": PHASE_REFERENCE_STATE_PERIODS * len(PHASE_REFERENCE_WALSH_CODES),
+        "state_periods": PHASE_REFERENCE_STATE_PERIODS,
+        "analysis_period_indices": list(PHASE_REFERENCE_STATE_ANALYSIS_INDICES),
+        "walsh_states": [
+            {"name": f"W{index + 1}", "codes": dict(zip(source_order, codes))}
+            for index, codes in enumerate(PHASE_REFERENCE_WALSH_CODES)
+        ],
         "lead_frames": lead_frames,
         "tail_frames": tail_frames,
         "configured_sweep_level_dbfs": int(level_dbfs),
         "phase_reference_headroom_db": PHASE_REFERENCE_HEADROOM_DB,
         "woofer_measurement_attenuation_db": float(woofer_attenuation_db),
         "source_levels_dbfs": source_levels,
-        "tone_policy": "sparse quarter-octave-equivalent coverage; exact octave/harmonic stacking avoided",
+        "tone_policy": "same-frequency 1/6-octave crossover coverage separated by orthogonal Walsh codes; exact octave/harmonic stacking avoided",
         "sources": {
             source: {
                 "crest_factor": round(float(generated[source]["crest"]), 5),
@@ -1656,7 +1724,7 @@ def interpolate_linear(frequencies: list[float], values: list[float], frequency:
     return values[lower] * (1.0 - fraction) + values[upper] * fraction
 
 
-def analyze_phase_reference_samples(
+def _analyze_disjoint_phase_reference_samples(
     samples: list[float],
     metadata: dict[str, Any],
     cal: dict[str, Any],
@@ -1817,6 +1885,281 @@ def analyze_phase_reference_samples(
         "timing_scope": "relative L/R/W timing inside this recording; not a shared absolute U7/UMIK clock",
         "normalization_applied": False,
     }
+
+
+def _phase_pair_results(source_results: dict[str, Any]) -> dict[str, Any]:
+    """Fit useful relative delays while retaining the measured phase curve."""
+    pair_results: dict[str, Any] = {}
+    for key, first_name, second_name, low_hz, high_hz in (
+        ("left_right", "left", "right", 70.0, 650.0),
+        ("left_woofer", "left", "woofer", 50.0, 220.0),
+        ("right_woofer", "right", "woofer", 50.0, 220.0),
+    ):
+        first = source_results[first_name]
+        second = source_results[second_name]
+        common = sorted(set(round(float(value), 6) for value in first["frequencies"]).intersection(
+            round(float(value), 6) for value in second["frequencies"]
+        ))
+        frequencies = [value for value in common if low_hz <= value <= high_hz]
+        if len(frequencies) < 3:
+            low = max(low_hz, float(first["frequencies"][0]), float(second["frequencies"][0]))
+            high = min(high_hz, float(first["frequencies"][-1]), float(second["frequencies"][-1]))
+            count = 28
+            frequencies = [low * ((high / low) ** (index / (count - 1))) for index in range(count)]
+        phase_difference = unwrap([
+            interpolate_linear(second["frequencies"], second["phase_rad"], frequency)
+            - interpolate_linear(first["frequencies"], first["phase_rad"], frequency)
+            for frequency in frequencies
+        ])
+        slopes = []
+        for left_index in range(len(frequencies)):
+            for right_index in range(left_index + 1, len(frequencies)):
+                if frequencies[right_index] - frequencies[left_index] >= max(20.0, 0.15 * frequencies[0]):
+                    slopes.append(
+                        (phase_difference[right_index] - phase_difference[left_index])
+                        / (frequencies[right_index] - frequencies[left_index])
+                    )
+        slope = statistics.median(slopes) if slopes else 0.0
+        delay_samples = -slope * RATE / (2.0 * math.pi)
+        intercepts = [
+            phase + 2.0 * math.pi * frequency * delay_samples / RATE
+            for frequency, phase in zip(frequencies, phase_difference)
+        ]
+        center = statistics.median(intercepts)
+        residuals = [
+            abs(math.degrees(math.atan2(math.sin(value - center), math.cos(value - center))))
+            for value in intercepts
+        ]
+        pair_results[key] = {
+            "first": first_name,
+            "second": second_name,
+            "frequency_hz": [round(value, 4) for value in frequencies],
+            "relative_phase_deg": [round(math.degrees(value), 4) for value in phase_difference],
+            "second_minus_first_delay_samples": round(delay_samples, 4),
+            "second_minus_first_delay_ms": round(delay_samples * 1000.0 / RATE, 5),
+            "delay_fit_residual_p90_deg": round(percentile(residuals, 0.90), 3),
+            "polarity_hint": (
+                "inverted" if math.cos(center) < -0.5 else
+                "normal" if math.cos(center) > 0.5 else "ambiguous"
+            ),
+            "same_frequency_bins": len(common) >= 3,
+        }
+    return pair_results
+
+
+def _phase_signal_onset(samples: list[float]) -> int:
+    """Find coded-reference onset coarsely; guard periods absorb the offset."""
+    window = max(256, round(0.012 * RATE))
+    stride = max(128, window // 2)
+    # Input switching can create one loud pulse at the start of arecord.  A
+    # whole-prefix RMS therefore overestimates the noise floor and hides a
+    # deliberately quiet reference.  Use the lower stable prefix blocks, as
+    # the ESS quality estimator does, and require a sustained rise.
+    noise_window = round(0.05 * RATE)
+    noise_powers = []
+    for start in range(round(0.12 * RATE), min(len(samples) - noise_window, round(0.70 * RATE)), noise_window):
+        values = samples[start:start + noise_window]
+        mean = sum(values) / len(values)
+        noise_powers.append(sum((value - mean) ** 2 for value in values) / len(values))
+    if not noise_powers:
+        raise MeasurementError("Walsh 위상 기준의 재생 전 배경 구간이 부족합니다.")
+    noise_rms = math.sqrt(percentile(noise_powers, 0.35))
+    threshold = max(noise_rms * 1.6, 1.0e-10)
+    search_end = min(len(samples) - window, round(2.5 * RATE))
+    consecutive = 0
+    first = 0
+    for start in range(round(0.20 * RATE), max(round(0.20 * RATE), search_end), stride):
+        values = samples[start:start + window]
+        mean = sum(values) / len(values)
+        rms = math.sqrt(sum((value - mean) ** 2 for value in values) / len(values))
+        if rms >= threshold:
+            if consecutive == 0:
+                first = start
+            consecutive += 1
+            if consecutive >= 3:
+                return first
+        else:
+            consecutive = 0
+    raise MeasurementError("Walsh 위상 기준 신호 시작점을 찾지 못했습니다. 측정 출력을 확인하세요.")
+
+
+def _pearson_correlation(first: list[float], second: list[float]) -> float:
+    count = min(len(first), len(second))
+    if count < 100:
+        return 0.0
+    first, second = first[:count], second[:count]
+    first_mean = sum(first) / count
+    second_mean = sum(second) / count
+    numerator = sum((a - first_mean) * (b - second_mean) for a, b in zip(first, second))
+    first_power = sum((value - first_mean) ** 2 for value in first)
+    second_power = sum((value - second_mean) ** 2 for value in second)
+    return numerator / max(math.sqrt(first_power * second_power), 1.0e-30)
+
+
+def _analyze_walsh_phase_reference_samples(
+    samples: list[float],
+    metadata: dict[str, Any],
+    cal: dict[str, Any],
+    fft: FFTBackend,
+) -> dict[str, Any]:
+    """Solve same-frequency L/R/W transfer functions from four Walsh states."""
+    block = int(metadata.get("block_samples", PHASE_REFERENCE_BLOCK))
+    state_periods = int(metadata.get("state_periods", PHASE_REFERENCE_STATE_PERIODS))
+    analysis_indices = [int(value) for value in metadata.get(
+        "analysis_period_indices", PHASE_REFERENCE_STATE_ANALYSIS_INDICES,
+    )]
+    states = metadata.get("walsh_states", [])
+    if len(states) != 4 or len(analysis_indices) < 2 or max(analysis_indices) >= state_periods - 1:
+        raise MeasurementError("Walsh 위상 기준 metadata의 상태/guard 구성이 잘못되었습니다.")
+    onset = _phase_signal_onset(samples)
+
+    # Estimate independent U7/UMIK clock drift inside the first Walsh state.
+    probe_start = onset + block // 4
+    probe_length = min(block + block // 2, len(samples) - probe_start - block - 8)
+    correlations: list[tuple[float, int]] = []
+    stride = 4
+    for lag in range(block - 8, block + 9):
+        first = samples[probe_start:probe_start + probe_length:stride]
+        second = samples[probe_start + lag:probe_start + lag + probe_length:stride]
+        correlations.append((_pearson_correlation(first, second), lag))
+    if not correlations:
+        raise MeasurementError("Walsh 위상 기준 반복 주기를 찾을 수 없습니다.")
+    _, recorded_period = max(correlations)
+
+    state_spectra: list[list[list[complex]]] = []
+    repeat_correlations: list[float] = []
+    for state_index in range(len(states)):
+        spectra: list[list[complex]] = []
+        time_blocks: list[list[float]] = []
+        state_start = onset + state_index * state_periods * recorded_period
+        for analysis_index in analysis_indices:
+            period_start = state_start + analysis_index * recorded_period
+            values = samples[period_start:period_start + recorded_period]
+            if len(values) != recorded_period:
+                raise MeasurementError("Walsh 위상 기준 녹음이 상태 중간에 끊겼습니다.")
+            resampled = linear_resample_period(values, block)
+            time_blocks.append(resampled)
+            spectra.append(fft.rfft(resampled, block))
+        for index in range(1, len(time_blocks)):
+            repeat_correlations.append(_pearson_correlation(time_blocks[0][::4], time_blocks[index][::4]))
+        state_spectra.append(spectra)
+
+    source_order = ("left", "right", "woofer")
+    code_columns = {
+        source: [float(state["codes"][source]) for state in states]
+        for source in source_order
+    }
+    for first_index, first_source in enumerate(source_order):
+        for second_source in source_order[first_index + 1:]:
+            dot = sum(a * b for a, b in zip(code_columns[first_source], code_columns[second_source]))
+            if abs(dot) > 1.0e-9:
+                raise MeasurementError("Walsh 위상 기준 code가 직교하지 않습니다.")
+
+    used_bins = {
+        int(item["bin"])
+        for source in metadata["sources"].values()
+        for item in source["bins"]
+    }
+    cal_f, cal_db = cal["frequencies"], cal["corrections"]
+    source_results: dict[str, Any] = {}
+    all_phase_errors: list[float] = []
+    repeats = len(analysis_indices)
+    for source in source_order:
+        frequencies: list[float] = []
+        levels: list[float] = []
+        phases: list[float] = []
+        snrs: list[float] = []
+        phase_errors: list[float] = []
+        codes = code_columns[source]
+        code_power = sum(value * value for value in codes)
+        for item in metadata["sources"][source]["bins"]:
+            bin_index = int(item["bin"])
+            reference = complex(float(item["real"]), float(item["imag"]))
+            numerators = [
+                sum(codes[state_index] * state_spectra[state_index][repeat_index][bin_index]
+                    for state_index in range(len(states))) / code_power
+                for repeat_index in range(repeats)
+            ]
+            transfers = [value / reference for value in numerators]
+            transfer = sum(transfers) / len(transfers)
+            frequency = bin_index * RATE / block
+            frequencies.append(frequency)
+            levels.append(
+                20.0 * math.log10(max(abs(transfer), 1.0e-15))
+                + interpolate_log(cal_f, cal_db, frequency)
+            )
+            phases.append(math.atan2(transfer.imag, transfer.real))
+            local_noise = []
+            for offset in (-6, -5, -4, 4, 5, 6):
+                candidate = bin_index + offset
+                if not 1 <= candidate < len(state_spectra[0][0]) or candidate in used_bins:
+                    continue
+                for repeat_index in range(repeats):
+                    local_noise.append(abs(sum(
+                        codes[state_index] * state_spectra[state_index][repeat_index][candidate]
+                        for state_index in range(len(states))
+                    ) / code_power))
+            noise = statistics.median(local_noise) if local_noise else 1.0e-15
+            signal = abs(sum(numerators) / len(numerators))
+            snrs.append(20.0 * math.log10(max(signal, 1.0e-15) / max(noise, 1.0e-15)))
+            for value in transfers:
+                difference = math.atan2(value.imag, value.real) - math.atan2(transfer.imag, transfer.real)
+                phase_errors.append(abs(math.degrees(math.atan2(math.sin(difference), math.cos(difference)))))
+        phases = unwrap(phases)
+        source_snr = statistics.median(snrs) if snrs else float("-inf")
+        phase_p90 = percentile(phase_errors, 0.90)
+        all_phase_errors.extend(phase_errors)
+        source_results[source] = {
+            "frequencies": [round(value, 6) for value in frequencies],
+            "db": [round(value, 5) for value in levels],
+            "phase_rad": [round(value, 9) for value in phases],
+            "median_snr_db": round(source_snr, 3),
+            "phase_repeatability_p90_deg": round(phase_p90, 3),
+            "tone_count": len(frequencies),
+            "same_frequency_walsh_separation": True,
+        }
+
+    minimum_snr = min(float(value["median_snr_db"]) for value in source_results.values())
+    phase_p90 = percentile(all_phase_errors, 0.90)
+    period_correlation = min(repeat_correlations) if repeat_correlations else 0.0
+    reliable = (
+        period_correlation >= PHASE_REFERENCE_MIN_CORRELATION
+        and minimum_snr >= MINIMUM_USABLE_SNR_DB
+        and phase_p90 <= PHASE_REFERENCE_MAX_PHASE_P90_DEG
+    )
+    return {
+        "version": 2,
+        "method": metadata["method"],
+        "reliable": reliable,
+        "recommended": reliable and minimum_snr >= RECOMMENDED_SNR_DB and phase_p90 <= 20.0,
+        "recorded_period_samples": recorded_period,
+        "sample_clock_offset_ppm": round((recorded_period / block - 1.0) * 1_000_000.0, 3),
+        "signal_onset_sample": onset,
+        "period_correlation": round(period_correlation, 6),
+        "minimum_median_snr_db": round(minimum_snr, 3),
+        "phase_repeatability_p90_deg": round(phase_p90, 3),
+        "thresholds": {
+            "minimum_period_correlation": PHASE_REFERENCE_MIN_CORRELATION,
+            "minimum_snr_db": MINIMUM_USABLE_SNR_DB,
+            "maximum_phase_repeatability_p90_deg": PHASE_REFERENCE_MAX_PHASE_P90_DEG,
+        },
+        "sources": source_results,
+        "pairs": _phase_pair_results(source_results),
+        "timing_scope": "same-frequency relative L/R/W timing from one Walsh-coded recording; not an absolute U7/UMIK clock",
+        "separation": "four orthogonal sign states; four analyzed repeats with guard periods per state",
+        "normalization_applied": False,
+    }
+
+
+def analyze_phase_reference_samples(
+    samples: list[float],
+    metadata: dict[str, Any],
+    cal: dict[str, Any],
+    fft: FFTBackend,
+) -> dict[str, Any]:
+    if int(metadata.get("version", 1)) >= 2 and metadata.get("walsh_states"):
+        return _analyze_walsh_phase_reference_samples(samples, metadata, cal, fft)
+    return _analyze_disjoint_phase_reference_samples(samples, metadata, cal, fft)
 
 
 def phase_reference_from_recording(recorded: Path, metadata: dict[str, Any], cal: dict[str, Any]) -> dict[str, Any]:
@@ -3141,7 +3484,7 @@ def inspect_saved_recording(
 
 
 def reprocess_saved_recordings_worker() -> None:
-    """Rebuild every available response from raw WAVs without playback."""
+    """Rebuild every ESS and simultaneous phase result without playback."""
     state = load_current()
     if state.get("state") == "idle" or not state.get("session_dir"):
         raise MeasurementError("재계산할 측정 Session이 없습니다.")
@@ -3161,16 +3504,86 @@ def reprocess_saved_recordings_worker() -> None:
     if missing:
         names = ", ".join(f"P{position} {SOURCE_LABELS.get(source, source)}" for position, source in missing)
         raise MeasurementError(f"저장 원본이 부족합니다: {names}. 3 · 위치 측정에서 해당 위치를 측정하세요.")
+    phase_positions = (
+        list(range(1, session_position_count(state) + 1))
+        if state.get("mode") in SEPARATE_WOOFER_MODES else []
+    )
+    missing_phase = [
+        position for position in phase_positions
+        if not (directory / f"p{position}_phase_reference_recorded.wav").is_file()
+        or not (directory / f"p{position}_phase_reference_signal.json").is_file()
+    ]
+    if missing_phase:
+        names = ", ".join(f"P{position} L/R/우퍼 동시 위상 기준" for position in missing_phase)
+        raise MeasurementError(f"저장된 위상 원본이 부족합니다: {names}. 3 · 위치 측정에서 해당 위치를 다시 측정하세요.")
+    total_items = len(available) + len(phase_positions)
     for index, (position, source) in enumerate(available):
         update_current(
             state="processing",
-            stage=f"저장 원본 재계산 {index + 1}/{len(available)} · P{position} {SOURCE_LABELS.get(source, source)}",
-            progress=100.0 * index / len(available),
-            eta_seconds=round((len(available) - index) * platform_capabilities()["offline_estimates_seconds"]["response_per_channel"]),
+            stage=f"저장 원본 재계산 {index + 1}/{total_items} · P{position} {SOURCE_LABELS.get(source, source)}",
+            progress=100.0 * index / total_items,
+            eta_seconds=round((total_items - index) * platform_capabilities()["offline_estimates_seconds"]["response_per_channel"]),
             last_measurement_quality=None,
         )
         inspect_saved_recording(position, source, reprocess=True, batch_reprocess=True)
-    update_current(worker_pid=None, eta_seconds=None, progress=100.0)
+    calibration = calibration_for(state["orientation"])
+    phase_references: list[dict[str, Any]] = []
+    for offset, position in enumerate(phase_positions):
+        item_index = len(available) + offset
+        update_current(
+            state="processing",
+            stage=f"저장 원본 재계산 {item_index + 1}/{total_items} · P{position} L/R/우퍼 상대 위상",
+            progress=100.0 * item_index / total_items,
+            eta_seconds=round((total_items - item_index) * platform_capabilities()["offline_estimates_seconds"]["response_per_channel"] * 0.4),
+        )
+        metadata_path = directory / f"p{position}_phase_reference_signal.json"
+        recorded_path = directory / f"p{position}_phase_reference_recorded.wav"
+        result_path = directory / f"p{position}_phase_reference.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        phase_result = phase_reference_from_recording(recorded_path, metadata, calibration)
+        atomic_json(result_path, phase_result)
+        phase_references.append({
+            "position": position,
+            "recording": recorded_path.name,
+            "signal": metadata_path.name,
+            "result": result_path.name,
+            "reliable": bool(phase_result["reliable"]),
+            "minimum_median_snr_db": phase_result["minimum_median_snr_db"],
+            "phase_repeatability_p90_deg": phase_result["phase_repeatability_p90_deg"],
+        })
+    final_state = load_current()
+    completion_fields: dict[str, Any] = {"phase_references": phase_references}
+    sum_model = None
+    if final_state.get("mode") in PREMEASURED_SUM_MODES:
+        preferences = load_correction_preferences()
+        sum_model = evaluate_premeasured_sum_model(
+            directory,
+            session_position_count(final_state),
+            float(final_state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB)),
+            int(preferences.get("crossover_frequency_hz", 100)),
+        )
+        completion_fields["premeasured_sum_validation"] = sum_model
+    phase_pass = not phase_positions or (
+        len(phase_references) == len(phase_positions)
+        and all(bool(item.get("reliable")) for item in phase_references)
+    )
+    sum_pass = sum_model is None or bool(sum_model.get("pass"))
+    stage = (
+        "저장된 ESS·동시 위상 원본 무음 재계산 완료 · 합산·위상 PASS · FIR 계산 가능"
+        if phase_pass and sum_pass else
+        "저장된 ESS·동시 위상 원본 무음 재계산 완료 · 3단계 진단을 확인하세요"
+    )
+    final_state = update_current(
+        state="measured",
+        worker_pid=None,
+        active_pids=[],
+        error=None,
+        eta_seconds=None,
+        progress=100.0,
+        stage=stage,
+        **completion_fields,
+    )
+    atomic_json(directory / "session.json", final_state)
 
 
 def validate_measurement_output_levels(
@@ -3248,7 +3661,7 @@ def new_session(
         "measurements": [],
         "phase_references": [],
         "phase_reference_acquisition_revision": (
-            "simultaneous-multisine-v1" if mode in SEPARATE_WOOFER_MODES else None
+            "simultaneous-walsh-v2" if mode in SEPARATE_WOOFER_MODES else None
         ),
         "result": None,
         "validation": None,
@@ -3302,6 +3715,7 @@ def invalidate_from_step(state: dict[str, Any], step: int, reason: str) -> dict[
             "positions_completed": 0,
             "validation": None,
             "premeasured_sum_validation": None,
+            "last_measurement_quality": None,
         })
     if step <= 2:
         state.update({
@@ -3388,7 +3802,7 @@ def reconfigure_session(
         mode=mode,
         sources=list(SOURCES[mode]),
         phase_reference_acquisition_revision=(
-            "simultaneous-multisine-v1" if mode in SEPARATE_WOOFER_MODES else None
+            "simultaneous-walsh-v2" if mode in SEPARATE_WOOFER_MODES else None
         ),
         positions_total=position_count,
         level_dbfs=level_dbfs,
@@ -3427,6 +3841,23 @@ def prepare_position_restart() -> dict[str, Any]:
     ensure_measurement_output_path(state)
     count = session_position_count(state)
     state = invalidate_from_step(state, 3, f"{count}위치 재측정 실행")
+    save_current(state)
+    return state
+
+
+def prepare_phase_reference_remeasurement() -> dict[str, Any]:
+    """Invalidate FIR results but preserve all five ESS measurements."""
+    state = load_current()
+    positions_total = session_position_count(state)
+    if state.get("mode") not in SEPARATE_WOOFER_MODES:
+        raise MeasurementError("L/R/우퍼 동시 위상 기준은 분리 우퍼 측정 구성에서만 사용합니다.")
+    if int(state.get("positions_completed", 0)) != positions_total:
+        raise MeasurementError(f"3 · 위치 측정에서 {positions_total}위치 ESS 측정을 먼저 완료하세요.")
+    state = invalidate_from_step(state, 4, "L/R/우퍼 동시 위상 기준만 재측정")
+    state.update(
+        stage="3 · 위치 측정 · 기존 L/R/W/L+W/R+W 보존 · L+R+W 위상 기준 재측정 준비",
+        last_measurement_quality=None,
+    )
     save_current(state)
     return state
 
@@ -3484,6 +3915,11 @@ def spawn_worker(action: str, *arguments: str) -> dict[str, Any]:
         return state
 
 
+def position_measurement_source_order(state: dict[str, Any]) -> list[str]:
+    """Return the stable audible ESS order used at every mic position."""
+    return list(state.get("sources", ()))
+
+
 def measure_position_worker() -> None:
     state = load_current()
     if not (state.get("level_check") or {}).get("ok"):
@@ -3498,13 +3934,11 @@ def measure_position_worker() -> None:
         raise MeasurementError(f"선택한 {positions_total}위치 측정이 이미 완료되었습니다.")
     directory = Path(state["session_dir"])
     cal = calibration_for(state["orientation"])
-    sources = list(state["sources"])
-    # At the first position Front L and Woofer provide the two useful level
-    # checks first. Front R follows without stopping the direct-capture window.
-    if position == 0 and all(source in sources for source in ("left", "right", "woofer")):
-        sources = ["left", "woofer", "right"] + [
-            source for source in sources if source not in ("left", "right", "woofer")
-        ]
+    sources = position_measurement_source_order(state)
+    # Main measurements use one predictable order at every position.  The
+    # short level preflight remains free to prioritize Front L and Woofer, but
+    # carrying that special order into position 1 made the Standard workflow
+    # disagree with positions 2 and 3 without improving acquisition quality.
     phase_reference_required = state.get("mode") in SEPARATE_WOOFER_MODES
     acquisitions_per_position = len(sources) + (1 if phase_reference_required else 0)
     total_items = positions_total * acquisitions_per_position
@@ -3660,8 +4094,14 @@ def measure_position_worker() -> None:
                 int(preferences.get("crossover_frequency_hz", 100)),
             )
             completion_fields["premeasured_sum_validation"] = sum_model
-            if sum_model["pass"]:
-                stage = f"{positions_total}위치 정밀 측정 완료 · L/R/우퍼 복소 합산 모델 PASS · FIR 계산 가능"
+            phase_pass = (
+                len(phase_references) == positions_total
+                and all(bool(item.get("reliable")) for item in phase_references)
+            )
+            if sum_model["pass"] and phase_pass:
+                stage = f"{positions_total}위치 여섯 측정 완료 · 합산·상대 위상 PASS · FIR 계산 가능"
+            elif not phase_pass:
+                stage = f"{positions_total}위치 측정 완료 · 동시 위상 기준 FAIL · 3단계에서 해당 위치 다시 측정"
             else:
                 stage = f"{positions_total}위치 정밀 측정 완료 · L+우퍼/R+우퍼 모델 FAIL · 3단계 조치 확인"
         else:
@@ -3678,6 +4118,161 @@ def measure_position_worker() -> None:
         **completion_fields,
     )
     atomic_json(directory / "session.json", state)
+
+
+def _install_phase_reference_capture(
+    state: dict[str, Any],
+    pending_sweep: Path,
+    pending_recording: Path,
+    pending_signal: Path,
+    pending_result: Path,
+    phase_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Back up the previous phase capture and atomically install a new one."""
+    directory = Path(state["session_dir"])
+    positions_total = session_position_count(state)
+    canonical = {
+        pending_sweep: directory / "p1_phase_reference_sweep.wav",
+        pending_recording: directory / "p1_phase_reference_recorded.wav",
+        pending_signal: directory / "p1_phase_reference_signal.json",
+        pending_result: directory / "p1_phase_reference.json",
+    }
+    backup_token = time.strftime("%Y%m%d_%H%M%S")
+    backups = []
+    for destination in canonical.values():
+        if destination.is_file():
+            backup = destination.with_name(f"{destination.name}.backup-{backup_token}")
+            shutil.copy2(destination, backup)
+            backups.append(backup.name)
+    for source, destination in canonical.items():
+        os.replace(source, destination)
+
+    phase_references = [{
+        "position": 1,
+        "recording": "p1_phase_reference_recorded.wav",
+        "signal": "p1_phase_reference_signal.json",
+        "result": "p1_phase_reference.json",
+        "reliable": bool(phase_result["reliable"]),
+        "minimum_median_snr_db": phase_result["minimum_median_snr_db"],
+        "phase_repeatability_p90_deg": phase_result["phase_repeatability_p90_deg"],
+        "method": phase_result["method"],
+    }]
+    preferences = load_correction_preferences()
+    sum_model = (
+        evaluate_premeasured_sum_model(
+            directory,
+            positions_total,
+            float(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB)),
+            int(preferences.get("crossover_frequency_hz", 100)),
+        )
+        if state.get("mode") in PREMEASURED_SUM_MODES else None
+    )
+    phase_pass = bool(phase_result["reliable"])
+    sum_pass = sum_model is None or bool(sum_model.get("pass"))
+    stage = (
+        "Walsh L+R+W 재측정 완료 · 동일 주파수 위상 및 물리 합산 PASS · FIR 계산 가능"
+        if phase_pass and sum_pass else
+        "Walsh L+R+W 재측정 완료 · 진단 항목을 확인하세요"
+    )
+    updated = update_current(
+        state="measured",
+        stage=stage,
+        progress=100.0,
+        eta_seconds=None,
+        worker_pid=None,
+        active_pids=[],
+        error=None,
+        phase_references=phase_references,
+        phase_reference_acquisition_revision="simultaneous-walsh-v2",
+        premeasured_sum_validation=sum_model,
+        last_measurement_quality=None,
+        phase_reference_backup_files=backups,
+    )
+    atomic_json(directory / "session.json", updated)
+    return updated
+
+
+def measure_phase_reference_worker() -> None:
+    """Remeasure only the simultaneous phase reference; preserve ESS WAVs."""
+    state = load_current()
+    if state.get("mode") not in SEPARATE_WOOFER_MODES:
+        raise MeasurementError("현재 측정 구성에는 L/R/우퍼 동시 위상 기준이 없습니다.")
+    positions_total = session_position_count(state)
+    if positions_total != 1:
+        raise MeasurementError(
+            "개별 위상 기준 재측정은 현재 1위치 세션에서만 지원합니다. "
+            "3위치 세션은 각 위치의 마이크 좌표가 필요하므로 해당 위치를 다시 측정하세요."
+        )
+    directory = Path(state["session_dir"])
+    calibration = calibration_for(state["orientation"])
+    token = f"walsh-v2-pending-{os.getpid()}"
+    pending_sweep = directory / f".{token}-sweep.wav"
+    pending_recording = directory / f".{token}-recorded.wav"
+    pending_signal = directory / f".{token}-signal.json"
+    pending_result = directory / f".{token}-result.json"
+    metadata = write_phase_reference(
+        pending_sweep,
+        int(state["level_dbfs"]),
+        float(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB)),
+    )
+    atomic_json(pending_signal, metadata)
+    update_current(
+        state="running",
+        stage="3 · 위치 측정 · 기존 5개 ESS 보존 · Walsh L+R+W 1회 재생 준비",
+        progress=0.0,
+        last_measurement_quality=None,
+    )
+    run_direct_capture_batch(
+        [(pending_sweep, pending_recording, "L/R/우퍼 Walsh 동시 위상 기준")],
+        0.0,
+        70.0,
+    )
+    update_current(
+        state="processing",
+        stage="Walsh L+R+W 녹음 완료 · 동일 주파수 L/R/W 직교 분리 계산",
+        progress=75.0,
+    )
+    phase_result = phase_reference_from_recording(pending_recording, metadata, calibration)
+    atomic_json(pending_result, phase_result)
+    _install_phase_reference_capture(
+        state, pending_sweep, pending_recording, pending_signal, pending_result, phase_result,
+    )
+
+
+def recover_pending_phase_reference() -> dict[str, Any]:
+    """Analyze and install the newest saved Walsh capture without playback."""
+    state = load_current()
+    directory = Path(state.get("session_dir", ""))
+    if not directory.is_dir():
+        raise MeasurementError("복구할 측정 Session이 없습니다.")
+    candidates = sorted(
+        directory.glob(".walsh-v2-pending-*-signal.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for pending_signal in candidates:
+        prefix = pending_signal.name[:-len("-signal.json")]
+        pending_sweep = directory / f"{prefix}-sweep.wav"
+        pending_recording = directory / f"{prefix}-recorded.wav"
+        pending_result = directory / f"{prefix}-result.json"
+        if not pending_sweep.is_file() or not pending_recording.is_file():
+            continue
+        metadata = json.loads(pending_signal.read_text(encoding="utf-8"))
+        calibration = calibration_for(state["orientation"])
+        update_current(
+            state="processing",
+            stage="저장된 Walsh L+R+W 원본 무음 재계산",
+            progress=75.0,
+            worker_pid=None,
+            active_pids=[],
+            error=None,
+        )
+        phase_result = phase_reference_from_recording(pending_recording, metadata, calibration)
+        atomic_json(pending_result, phase_result)
+        return _install_phase_reference_capture(
+            state, pending_sweep, pending_recording, pending_signal, pending_result, phase_result,
+        )
+    raise MeasurementError("무음 복구할 Walsh L+R+W 원본 녹음을 찾지 못했습니다.")
 
 
 def evaluate_level_samples(silence_samples: list[float], active_samples: list[float], bits: int) -> dict[str, Any]:
@@ -3947,8 +4542,9 @@ def evaluate_premeasured_sum_model(
 
     The combined captures retain their absolute playback/reference scale.  No
     per-channel normalization is permitted here because it would hide routing,
-    polarity, level or timing errors.  These two extra responses are diagnostic
-    constraints only; L/R/W remain the sole room-correction design inputs.
+    polarity, level or timing errors.  L/R/W remain the branch magnitude
+    inputs; after this closure gate passes, L+W/R+W provide dense cross-term
+    constraints for the joint FIR synthesis rather than being averaged in.
     """
     woofer_scale = 10.0 ** (float(woofer_attenuation_db) / 20.0)
     low_hz = max(30.0, float(crossover_frequency_hz) * 0.45)
@@ -3956,8 +4552,7 @@ def evaluate_premeasured_sum_model(
     thresholds = {
         "magnitude_mae_db": 2.0,
         "magnitude_p90_db": 4.0,
-        "phase_median_deg": 30.0,
-        "phase_p90_deg": 75.0,
+        "phase_repeatability_p90_deg": PHASE_REFERENCE_MAX_PHASE_P90_DEG,
         # Keep this acquisition gate identical to the quick sweep and normal
         # response path.  15 dB is a recommendation, not a hidden later gate.
         "minimum_snr_db": MINIMUM_USABLE_SNR_DB,
@@ -3971,7 +4566,8 @@ def evaluate_premeasured_sum_model(
     all_snrs: list[float] = []
     for side, combined_source in (("left", "left_woofer"), ("right", "right_woofer")):
         magnitude_errors: list[float] = []
-        phase_errors: list[float] = []
+        phase_linearity_residuals: list[float] = []
+        phase_repeatability_values: list[float] = []
         graph_frequency: list[float] = []
         graph_measured: list[float] = []
         graph_predicted: list[float] = []
@@ -4013,9 +4609,17 @@ def evaluate_premeasured_sum_model(
                         pair_key = f"{side}_woofer"
                         residual = phase_reference.get("pairs", {}).get(pair_key, {}).get("delay_fit_residual_p90_deg")
                         if isinstance(residual, (int, float)):
-                            phase_errors.append(float(residual))
+                            phase_linearity_residuals.append(float(residual))
+                        for source_name in (side, "woofer"):
+                            repeatability = phase_reference.get("sources", {}).get(source_name, {}).get(
+                                "phase_repeatability_p90_deg"
+                            )
+                            if isinstance(repeatability, (int, float)):
+                                phase_repeatability_values.append(float(repeatability))
                     else:
-                        phase_errors.append(wrapped_phase_error_degrees(predicted, measured))
+                        # Only a shared hardware clock makes the absolute phase
+                        # origins of separate ESS recordings comparable.
+                        phase_linearity_residuals.append(wrapped_phase_error_degrees(predicted, measured))
                 else:
                     # Separate USB playback/capture clocks cannot preserve an
                     # absolute phase origin between independent sweeps. Check
@@ -4035,11 +4639,21 @@ def evaluate_premeasured_sum_model(
                     graph_predicted.append(round(predicted_db, 3))
         magnitude_mae = sum(magnitude_errors) / len(magnitude_errors) if magnitude_errors else float("inf")
         magnitude_p90 = percentile(magnitude_errors, 0.90) if magnitude_errors else float("inf")
-        phase_median = statistics.median(phase_errors) if phase_errors else float("inf")
-        phase_p90 = percentile(phase_errors, 0.90) if phase_errors else float("inf")
+        phase_repeatability_p90 = (
+            percentile(phase_repeatability_values, 0.90)
+            if phase_repeatability_values else None
+        )
+        delay_fit_residual_p90 = (
+            percentile(phase_linearity_residuals, 0.90)
+            if phase_linearity_residuals else None
+        )
         minimum_snr = min(side_snrs) if side_snrs else None
         magnitude_pass = bool(magnitude_errors) and magnitude_mae <= thresholds["magnitude_mae_db"] and magnitude_p90 <= thresholds["magnitude_p90_db"]
-        phase_pass = side_phase_reliable and bool(phase_errors) and phase_median <= thresholds["phase_median_deg"] and phase_p90 <= thresholds["phase_p90_deg"]
+        phase_pass = bool(
+            side_phase_reliable
+            and phase_repeatability_p90 is not None
+            and phase_repeatability_p90 <= thresholds["phase_repeatability_p90_deg"]
+        )
         snr_pass = minimum_snr is not None and minimum_snr >= thresholds["minimum_snr_db"]
         # U7 playback and UMIK capture do not share a hardware clock.  Accept
         # magnitude closure with usable SNR, while reporting absolute phase as
@@ -4055,8 +4669,30 @@ def evaluate_premeasured_sum_model(
             "snr_pass": snr_pass,
             "magnitude_mae_db": round(magnitude_mae, 3),
             "magnitude_p90_abs_error_db": round(magnitude_p90, 3),
-            "phase_median_abs_error_deg": round(phase_median, 2),
-            "phase_p90_abs_error_deg": round(phase_p90, 2),
+            # A large delay-fit residual is often real room/excess phase, not
+            # measurement error.  Report it as phase linearity evidence while
+            # judging acquisition quality by same-recording repeatability.
+            "phase_median_abs_error_deg": None,
+            "phase_p90_abs_error_deg": None,
+            "phase_repeatability_p90_deg": (
+                round(phase_repeatability_p90, 2)
+                if phase_repeatability_p90 is not None else None
+            ),
+            "delay_fit_residual_p90_deg": (
+                round(delay_fit_residual_p90, 2)
+                if delay_fit_residual_p90 is not None else None
+            ),
+            "phase_evidence": (
+                "same-frequency Walsh separation"
+                if simultaneous_phase_reliable and all(
+                    bool(value.get("same_frequency_walsh_separation"))
+                    for value in phase_reference.get("sources", {}).values()
+                ) else
+                "same-recording sparse-frequency interpolation"
+                if simultaneous_phase_reliable else
+                "shared-clock absolute ESS phase"
+                if PHASE_CLOCK_SHARED else "not available"
+            ),
             "minimum_snr_db": round(minimum_snr, 2) if minimum_snr is not None else None,
             "frequency": graph_frequency,
             "measured_combined_db": graph_measured,
@@ -4097,7 +4733,7 @@ def evaluate_premeasured_sum_model(
         "phase_clock_shared": PHASE_CLOCK_SHARED,
         "simultaneous_phase_reference": simultaneous_phase_reliable,
         "limited_phase_method": None if all_phase_reliable else "measured physical sum must remain inside |Front|-|Woofer| .. |Front|+|Woofer| magnitude bounds",
-        "design_usage": "L/R/W ESS magnitudes drive FIR design; simultaneous phase references drive relative timing; combined captures validate magnitude/routing only and are never averaged into L/R/W",
+        "design_usage": "L/R/W ESS magnitudes define the branches; simultaneous L/R/W supplies phase sign/timing; passing L+W/R+W supplies dense acoustic cross-term constraints. Combined captures are never normalized or averaged into a branch.",
         "phase_reference_reliable": all_phase_reliable,
         "phase_verification_status": "pass" if all_phase_reliable and all(
             bool(item.get("phase_pass")) for item in channels.values()
@@ -4510,15 +5146,20 @@ def build_room_tuning_audit(directory: Path, state: dict[str, Any], *, mimo: boo
 
 
 def write_room_tuning_report(path: Path, state: dict[str, Any], result: dict[str, Any]) -> None:
+    normalization = result.get("filter_bank_normalization") or {}
+    common_reference = result.get("common_level_reference") or {}
     lines = [
         "# AudioDSP 룸 튜닝 보고서", "",
         f"- 모드: `{state.get('mode')}`", f"- 타깃: `{result.get('target')}`", f"- FIR: {result.get('sample_rate')} Hz / {result.get('taps')} taps",
-        f"- 자체 검증: {'PASS' if result.get('self_validation', {}).get('overall_pass') else 'FAIL'}", "",
+        f"- 자체 검증: {'PASS' if result.get('self_validation', {}).get('overall_pass') else 'FAIL'}",
+        f"- 공통 0 dB 기준: `{common_reference.get('scope', 'unknown')}` / 채널별 정규화 `{common_reference.get('independent_channel_normalization')}`",
+        f"- FIR 묶음 공통 gain: {normalization.get('applied_common_gain_db', '?')} dB / 최대 상대 보상 {normalization.get('max_relative_compensation_db', result.get('correction_limits', {}).get('max_relative_compensation_db', '?'))} dB",
+        f"- 상대레벨 보존: `{normalization.get('relative_branch_gain_preserved')}`", "",
         "## 보정 가능성 분류", "",
     ]
     for item in result.get("room_tuning_audit", []):
         lines.append(f"- **{item['label']}** — `{item['classification']}` / `{item['status']}`: {item['action']}")
-    lines += ["", "## 해석 원칙", "", "`fir_correctable`도 측정한 위치와 선형·시간불변 범위에서만 유효하다. `limited_*`는 부분 개선이며, `physical_treatment`, `not_measured`, `not_certified`는 FIR 성공으로 표시하지 않는다.", ""]
+    lines += ["", "## 해석 원칙", "", "L/R/우퍼는 서로 다른 0 dB로 재정렬하지 않는다. 하나의 공통 측정 기준과 FIR 묶음 공통 gain을 사용해 상대레벨과 crossover 합산을 보존한다. 좁고 깊은 null은 최대 상대 보상보다 우선하는 과보정 보호 대상이다.", "", "`fir_correctable`도 측정한 위치와 선형·시간불변 범위에서만 유효하다. `limited_*`는 부분 개선이며, `physical_treatment`, `not_measured`, `not_certified`는 FIR 성공으로 표시하지 않는다.", ""]
     path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
 
 
@@ -4624,17 +5265,119 @@ def natural_usable_band(frequencies: list[float], levels_db: list[float], refere
 
 
 def correction_window(frequency: float, low_hz: int, high_hz: int) -> float:
-    if frequency < low_hz or frequency > high_hz:
+    # A user-selected 20 kHz upper edge means full audible-band correction,
+    # not a fade that has already reached zero at 20 kHz.  Keep full weight to
+    # 20 kHz and taper only in the inaudible guard band so the FIR remains
+    # smooth near Nyquist.
+    full_band = high_hz >= 20_000
+    upper_stop = 22_000.0 if full_band else float(high_hz)
+    if frequency < low_hz or frequency > upper_stop:
         return 0.0
     lower_end = min(high_hz, low_hz * math.sqrt(2.0))
-    upper_start = max(low_hz, high_hz / math.sqrt(2.0))
+    upper_start = 20_000.0 if full_band else max(low_hz, high_hz / math.sqrt(2.0))
     if frequency < lower_end and lower_end > low_hz:
         position = math.log(frequency / low_hz) / math.log(lower_end / low_hz)
         return 0.5 - 0.5 * math.cos(math.pi * position)
-    if frequency > upper_start and high_hz > upper_start:
-        position = math.log(frequency / upper_start) / math.log(high_hz / upper_start)
+    if frequency > upper_start and upper_stop > upper_start:
+        position = math.log(frequency / upper_start) / math.log(upper_stop / upper_start)
         return 0.5 + 0.5 * math.cos(math.pi * position)
     return 1.0
+
+
+def narrow_notch_reliability(frequencies: list[float], levels_db: list[float]) -> list[float]:
+    """Down-weight narrow dips without treating a broad edge roll-off as a null.
+
+    Both one-sixth-octave neighbours must exist.  That intentionally leaves a
+    monotonic response near either measurement edge alone, while a local dip
+    between two supported shoulders gets progressively less boost authority.
+    """
+    if len(frequencies) != len(levels_db) or not frequencies:
+        raise MeasurementError("notch 보호용 주파수 응답 길이가 일치하지 않습니다.")
+    ratio = 2.0 ** (1.0 / 6.0)
+    result: list[float] = []
+    for frequency, level in zip(frequencies, levels_db):
+        lower_frequency = frequency / ratio
+        upper_frequency = frequency * ratio
+        if lower_frequency < frequencies[0] or upper_frequency > frequencies[-1]:
+            result.append(1.0)
+            continue
+        lower = interpolate_log(frequencies, levels_db, lower_frequency)
+        upper = interpolate_log(frequencies, levels_db, upper_frequency)
+        local_trend = 0.5 * (lower + upper)
+        notch_depth = max(0.0, local_trend - level)
+        result.append(1.0 / (1.0 + (notch_depth / 3.0) ** 2))
+    return result
+
+
+def stereo_broad_rolloff_confidence(
+    left_f: list[float],
+    left_db: list[float],
+    left_confidence: list[float],
+    right_f: list[float],
+    right_db: list[float],
+    right_confidence: list[float],
+    target_f: list[float],
+    target_db: list[float],
+    shared_measure_reference_db: float,
+    shared_target_reference_db: float,
+) -> tuple[list[float], list[float], list[float], list[float], dict[str, Any]]:
+    """Corroborate broad upper-band roll-off seen by both front channels.
+
+    A single in-room high-frequency dip is not enough evidence for boost.  A
+    smooth deficit present in both independently measured channels can,
+    however, raise a low raw SNR confidence floor.  Narrow-notch protection is
+    applied later and remains authoritative.
+    """
+    def enhanced(
+        frequencies: list[float],
+        confidence: list[float],
+        other_f: list[float],
+        own_db: list[float],
+        other_db: list[float],
+    ) -> tuple[list[float], list[float], int, float]:
+        values: list[float] = []
+        floors: list[float] = []
+        raised = 0
+        largest_floor = 0.0
+        for frequency, raw_confidence, own_level in zip(frequencies, confidence, own_db):
+            base = max(0.0, min(1.0, float(raw_confidence)))
+            if not 2_000.0 <= frequency <= 20_000.0:
+                values.append(base)
+                floors.append(0.0)
+                continue
+            other_level = interpolate_log(other_f, other_db, frequency)
+            target_level = interpolate_log(target_f, target_db, frequency) - shared_target_reference_db
+            own_relative = own_level - shared_measure_reference_db
+            other_relative = other_level - shared_measure_reference_db
+            own_deficit = target_level - own_relative
+            other_deficit = target_level - other_relative
+            common_deficit = min(own_deficit, other_deficit)
+            disagreement = abs(own_deficit - other_deficit)
+            floor = 0.0
+            if common_deficit >= 1.5 and disagreement <= 4.0:
+                agreement_weight = max(0.0, 1.0 - disagreement / 4.0)
+                floor = min(0.65, 0.18 + 0.04 * min(common_deficit, 10.0)) * agreement_weight
+            value = max(base, floor)
+            if value > base + 1.0e-9:
+                raised += 1
+                largest_floor = max(largest_floor, floor)
+            values.append(value)
+            floors.append(floor)
+        return values, floors, raised, largest_floor
+
+    left_values, left_floors, left_raised, left_floor = enhanced(
+        left_f, left_confidence, right_f, left_db, right_db
+    )
+    right_values, right_floors, right_raised, right_floor = enhanced(
+        right_f, right_confidence, left_f, right_db, left_db
+    )
+    return left_values, right_values, left_floors, right_floors, {
+        "method": "independent L/R agreement floor for broad 2-20 kHz roll-off",
+        "left_bins_raised": left_raised,
+        "right_bins_raised": right_raised,
+        "maximum_confidence_floor": round(max(left_floor, right_floor), 4),
+        "narrow_null_guard_remains_enabled": True,
+    }
 
 
 def tone_preference_window(frequency: float) -> float:
@@ -4772,7 +5515,14 @@ def apply_low_frequency_phase(
             fraction = (frequency - cutoff_hz * 0.70) / (cutoff_hz * 0.30)
             weight = 0.5 + 0.5 * math.cos(math.pi * fraction)
         if weight:
-            measured = interpolate_log(measure_f, measured_phase, max(measure_f[0], min(measure_f[-1], frequency)))
+            # Unwrapped phase is approximately linear with frequency for a
+            # delay.  Log-frequency interpolation is appropriate for dB
+            # curves, but bends phase slopes and therefore invents delay.
+            measured = interpolate_linear(
+                measure_f,
+                measured_phase,
+                max(measure_f[0], min(measure_f[-1], frequency)),
+            )
             excess = measured - minimum_phase[index]
             rotations.append(-excess * weight)
         else:
@@ -5110,12 +5860,21 @@ def finalize_graph_with_fir(graph: dict[str, Any], impulse: list[float], fft: FF
     # Woofer error impossible to fix by changing trim.
     graph["system_relative_predicted_db"] = [round(value, 3) for value in raw_predicted]
     graph["system_relative_effective_target_db"] = [round(value, 3) for value in raw_effective]
+    implementation_mae = sum(implementation_residual) / len(implementation_residual)
+    implementation_p95 = percentile(implementation_residual, 0.95)
     graph["fir_implementation"] = {
         "evaluation_band_hz": [round(implementation_low, 1), round(implementation_high, 1)],
         "normalization_offset_db": round(normalization_offset, 3),
-        "residual_mae_db": round(sum(implementation_residual) / len(implementation_residual), 4),
-        "residual_p95_db": round(percentile(implementation_residual, 0.95), 4),
-        "pass": percentile(implementation_residual, 0.95) <= 0.75,
+        "residual_mae_db": round(implementation_mae, 4),
+        "residual_p95_db": round(implementation_p95, 4),
+        "limits_db": {
+            "mae": FIR_IMPLEMENTATION_MAE_LIMIT_DB,
+            "p95": FIR_IMPLEMENTATION_P95_LIMIT_DB,
+        },
+        "pass": (
+            implementation_mae <= FIR_IMPLEMENTATION_MAE_LIMIT_DB
+            and implementation_p95 <= FIR_IMPLEMENTATION_P95_LIMIT_DB
+        ),
     }
     if graph["woofer"]:
         crossover_hz = float(crossover.get("frequency_hz") or 100.0)
@@ -5166,7 +5925,150 @@ def finalize_graph_with_fir(graph: dict[str, Any], impulse: list[float], fft: FF
     return graph
 
 
-def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_db: list[float], measured_phase: list[float] | None, target_name: str, preset: str, *, woofer: bool, woofer_trim_db: int, phase_mode: str, phase_cutoff: int, spatial_mode: str = "equal", bass_tilt_db: int = 0, treble_tilt_db: int = 0, correction_low_hz: int = 20, correction_high_hz: int = 20_000, max_boost_db: int = 6, max_cut_db: int = 18, crossover_role: str | None = None, crossover_frequency_hz: int = 100, decay_frequency_hz: list[float] | None = None, decay_t20_rt60_s: list[float] | None = None, shared_reference_measure_db: float | None = None, shared_reference_target_db: float | None = None, frequency_confidence: list[float] | None = None, fft: FFTBackend) -> tuple[list[float], dict[str, Any]]:
+def apply_common_graph_reference(
+    left_graph: dict[str, Any],
+    right_graph: dict[str, Any],
+    woofer_graph: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Grade and display every branch against one shared L/R/W level origin.
+
+    ``finalize_graph_with_fir`` must be usable while intermediate phase and
+    delay stages are still being built, so it records raw system-relative
+    curves.  Once the complete bank has received its one common no-preamp
+    gain, this function chooses exactly one front reference and applies it to
+    L, R and Woofer together.  No channel gets an independent 0 dB reset.
+    """
+    front_graphs = (left_graph, right_graph)
+    predicted_reference_values = [
+        float(value)
+        for graph in front_graphs
+        for frequency, value in zip(graph["frequency"], graph["system_relative_predicted_db"])
+        if 500.0 <= float(frequency) <= 2_000.0
+    ]
+    target_reference_values = [
+        float(value)
+        for graph in front_graphs
+        for frequency, value in zip(graph["frequency"], graph["system_relative_effective_target_db"])
+        if 500.0 <= float(frequency) <= 2_000.0
+    ]
+    if not predicted_reference_values or not target_reference_values:
+        raise MeasurementError("L/R/우퍼 공통 0 dB 기준 대역을 계산할 수 없습니다.")
+    predicted_reference = statistics.median(predicted_reference_values)
+    target_reference = statistics.median(target_reference_values)
+
+    def update(graph: dict[str, Any]) -> None:
+        predicted = [
+            float(value) - predicted_reference
+            for value in graph["system_relative_predicted_db"]
+        ]
+        effective = [
+            float(value) - target_reference
+            for value in graph["system_relative_effective_target_db"]
+        ]
+        graph["predicted_db"] = [round(value, 3) for value in predicted]
+        graph["effective_target_db"] = [round(value, 3) for value in effective]
+        graph["common_reference"] = {
+            "scope": "L/R/Woofer complete bank" if woofer_graph is not None else "L/R complete bank",
+            "reference_band_hz": [500, 2_000],
+            "predicted_reference_db": round(predicted_reference, 4),
+            "target_reference_db": round(target_reference, 4),
+            "independent_channel_normalization": False,
+        }
+        crossover = graph.get("crossover", {})
+        if graph.get("woofer"):
+            crossover_hz = float(crossover.get("frequency_hz") or 100.0)
+            branch_low = max(40.0, float(graph["correction_band_hz"][0]))
+            branch_high = min(
+                80.0 if crossover.get("enabled") else 120.0,
+                crossover_hz * 0.8 if crossover.get("enabled") else 120.0,
+                float(graph["correction_band_hz"][1]),
+            )
+            signed_errors = [
+                after - target
+                for frequency, after, target in zip(graph["frequency"], predicted, effective)
+                if branch_low <= float(frequency) <= branch_high
+            ]
+            median_error = statistics.median(signed_errors) if signed_errors else None
+            graph["branch_level_diagnostic"] = {
+                "evaluation_band_hz": [round(branch_low, 1), round(branch_high, 1)],
+                "requested_woofer_trim_db": int(graph.get("woofer_trim_db", 0)),
+                "median_error_db": round(median_error, 3) if median_error is not None else None,
+                "absolute_median_error_db": round(abs(median_error), 3) if median_error is not None else None,
+                "status": (
+                    "on_target" if median_error is not None and abs(median_error) <= 2.0
+                    else "too_high" if median_error is not None and median_error > 0.0
+                    else "too_low" if median_error is not None
+                    else "insufficient_data"
+                ),
+                "pass": median_error is not None and abs(median_error) <= 2.0,
+                "note": "L/R과 동일한 하나의 500-2000 Hz 0 dB 기준을 유지한 우퍼 유효 저역 상대레벨입니다. 우퍼만 따로 정규화하지 않습니다.",
+            }
+            graph["target_fit"] = {
+                "applicable": False,
+                "evaluation_band_hz": None,
+                "mae_db": None,
+                "p90_abs_error_db": None,
+                "pass": None,
+                "reason": "독립 우퍼 분기는 전체 L+우퍼/R+우퍼 시스템 타깃의 판정 대상이 아닙니다.",
+                "note": "우퍼 상대레벨은 공통 기준으로 진단하고 최종 타깃은 실제 L+우퍼/R+우퍼 합산으로 판정합니다.",
+            }
+            return
+
+        low_hz, high_hz = graph["correction_band_hz"]
+        natural_low, natural_high = graph["natural_usable_band_hz"]
+        fit_low = max(float(low_hz), float(natural_low), 20.0)
+        # Corroborated full-band roll-off is deliberately eligible to 20 kHz;
+        # otherwise keep the natural-band protection in the score as before.
+        rolloff = graph.get("stereo_rolloff_confidence") or []
+        has_corroborated_edge = any(
+            float(frequency) >= float(natural_high) and float(confidence) >= 0.25
+            for frequency, confidence in zip(graph["frequency"], rolloff)
+        )
+        fit_high = min(
+            float(high_hz),
+            20_000.0 if has_corroborated_edge else float(natural_high),
+        )
+        if woofer_graph is not None:
+            crossover = graph.get("crossover", {})
+            crossover_hz = float(crossover.get("frequency_hz") or 100.0)
+            # The acoustic target belongs to Front+Woofer.  Grade an
+            # individual Front branch only above the shared bass region even
+            # when crossover is explicitly OFF; low-frequency success/failure
+            # is decided by the actual combined model below.
+            fit_low = max(fit_low, crossover_hz * 2.0 if crossover.get("enabled") else 200.0)
+        if crossover.get("enabled"):
+            fit_low = max(fit_low, float(crossover["frequency_hz"]) * 2.0)
+        errors = [
+            abs(after - target)
+            for frequency, after, target in zip(graph["frequency"], predicted, effective)
+            if fit_low <= float(frequency) <= fit_high
+        ]
+        mae = sum(errors) / len(errors) if errors else 0.0
+        p90 = percentile(errors, 0.90)
+        graph["target_fit"] = {
+            "applicable": True,
+            "evaluation_band_hz": [round(fit_low, 1), round(fit_high, 1)],
+            "mae_db": round(mae, 3),
+            "p90_abs_error_db": round(p90, 3),
+            "pass": bool(errors) and mae <= 3.5 and p90 <= 7.0,
+            "reference_scope": "one common L/R/Woofer level reference",
+            "note": "채널별 재정규화 없이 실제 공통 FIR gain 뒤의 응답을 하나의 L/R/우퍼 기준으로 평가합니다.",
+        }
+
+    update(left_graph)
+    update(right_graph)
+    if woofer_graph is not None:
+        update(woofer_graph)
+    return {
+        "scope": "L/R/Woofer complete bank" if woofer_graph is not None else "L/R complete bank",
+        "reference_band_hz": [500, 2_000],
+        "predicted_reference_db": round(predicted_reference, 4),
+        "target_reference_db": round(target_reference, 4),
+        "independent_channel_normalization": False,
+    }
+
+
+def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_db: list[float], measured_phase: list[float] | None, target_name: str, preset: str, *, woofer: bool, woofer_trim_db: int, phase_mode: str, phase_cutoff: int, spatial_mode: str = "equal", bass_tilt_db: int = 0, treble_tilt_db: int = 0, correction_low_hz: int = 20, correction_high_hz: int = 20_000, max_boost_db: int = 10, max_cut_db: int = 18, crossover_role: str | None = None, crossover_frequency_hz: int = 100, decay_frequency_hz: list[float] | None = None, decay_t20_rt60_s: list[float] | None = None, shared_reference_measure_db: float | None = None, shared_reference_target_db: float | None = None, frequency_confidence: list[float] | None = None, corroborated_rolloff_confidence: list[float] | None = None, fft: FFTBackend) -> tuple[list[float], dict[str, Any]]:
     target_f, target_db = target_curve(target_name)
     reference_band = (50, 120) if woofer else (500, 2000)
     target_reference_band = (500, 2000) if shared_reference_target_db is not None else reference_band
@@ -5194,6 +6096,8 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
     graph_after: list[float] = []
     graph_variation: list[float] = []
     graph_confidence: list[float] = []
+    graph_rolloff_confidence: list[float] = []
+    graph_notch_reliability: list[float] = []
     graph_target: list[float] = []
     graph_effective_target: list[float] = []
     graph_correction: list[float] = []
@@ -5204,6 +6108,9 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
     graph_decay_cut: list[float] = []
     woofer_target_cut: list[float] = []
     guarded_boost_bins = 0
+    narrow_notch_guarded_bins = 0
+    maximum_narrow_notch_boost_db = 0.0
+    notch_reliability_values = narrow_notch_reliability(measure_f, measure_db)
     for index in range(fft_length // 2 + 1):
         frequency = index * RATE / fft_length
         safe_frequency = max(3.0, frequency)
@@ -5211,6 +6118,10 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         variation = interpolate_log(measure_f, spatial_std_db, max(measure_f[0], min(measure_f[-1], safe_frequency)))
         noise_confidence = interpolate_log(measure_f, frequency_confidence, max(measure_f[0], min(measure_f[-1], safe_frequency))) if frequency_confidence else 1.0
         noise_confidence = max(0.0, min(1.0, noise_confidence))
+        rolloff_confidence = interpolate_log(measure_f, corroborated_rolloff_confidence, max(measure_f[0], min(measure_f[-1], safe_frequency))) if corroborated_rolloff_confidence else 0.0
+        rolloff_confidence = max(0.0, min(1.0, rolloff_confidence))
+        notch_reliability = interpolate_log(measure_f, notch_reliability_values, max(measure_f[0], min(measure_f[-1], safe_frequency)))
+        notch_reliability = max(0.0, min(1.0, notch_reliability))
         target_without_preference = interpolate_log(target_f, target_db, max(target_f[0], min(target_f[-1], safe_frequency))) - reference_target_without_preference
         window = correction_window(safe_frequency, correction_low_hz, correction_high_hz)
         # Keep explicit user tone controls outside the automatic room-EQ
@@ -5232,10 +6143,18 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
             if raw_correction > 0.0:
                 # Deep, position-dependent nulls are not safely invertible. This is the
                 # spatial regularization term: a 3 dB position spread halves the boost.
-                raw_correction *= spatial_reliability
-                boost_limit = float(max_boost_db if frequency < 500.0 else min(max_boost_db, 3))
+                # A second, local-shape term prevents one narrow dip from forcing
+                # the complete no-preamp bank downward. Broad L/R-correlated
+                # roll-off can retain authority even near a natural band edge.
+                raw_correction *= spatial_reliability * notch_reliability
+                boost_limit = float(max_boost_db)
                 correction = boost_limit * math.tanh(raw_correction / max(boost_limit, 1.0e-9)) if boost_limit else 0.0
-                if frequency < natural_low or frequency > natural_high:
+                if notch_reliability < 0.5:
+                    correction = min(correction, 3.0)
+                    narrow_notch_guarded_bins += 1
+                    maximum_narrow_notch_boost_db = max(maximum_narrow_notch_boost_db, correction)
+                corroborated_edge = rolloff_confidence >= 0.25 and notch_reliability >= 0.6
+                if (frequency < natural_low or frequency > natural_high) and not corroborated_edge:
                     correction = 0.0
                     guarded_boost_bins += 1
             else:
@@ -5252,7 +6171,8 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
                 else:
                     cut_limit = float(max_cut_db)
                 correction = max(-cut_limit, raw_correction)
-            if not 20.0 <= frequency <= 20_000.0:
+            audible_guard_high = 22_000.0 if correction_high_hz >= 20_000 else 20_000.0
+            if not 20.0 <= frequency <= audible_guard_high:
                 correction = 0.0
         modifier = bass_modifier_db(max(1.0, frequency), preset)
         decay_value = None
@@ -5270,6 +6190,11 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         if woofer:
             correction += woofer_trim_db
             correction = min(0.0, correction)
+        # This is a total relative compensation ceiling, not permission to
+        # fill every measured dip.  Because the completed L/R/W bank is later
+        # attenuated by one common amount, this also bounds how far a positive
+        # design peak can lower the rest of the system in no-preamp mode.
+        correction = min(float(max_boost_db), correction)
         crossover_db = crossover_transfer_db(safe_frequency, crossover_frequency_hz, crossover_role)
         correction += crossover_db
         gains.append(correction)
@@ -5279,6 +6204,8 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
             graph_after.append(round(measured + correction, 3))
             graph_variation.append(round(variation, 3))
             graph_confidence.append(round(noise_confidence, 4))
+            graph_rolloff_confidence.append(round(rolloff_confidence, 4))
+            graph_notch_reliability.append(round(notch_reliability, 4))
             graph_target.append(round(target_value, 3))
             graph_effective_target.append(round(target_value + (modifier if woofer or frequency <= 350.0 else 0.0) - decay_cut + (woofer_trim_db if woofer else 0), 3))
             graph_decay.append(round(decay_value, 3) if decay_value is not None else None)
@@ -5297,6 +6224,8 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         "predicted_db": graph_after,
         "spatial_std_db": graph_variation,
         "measurement_confidence": graph_confidence,
+        "stereo_rolloff_confidence": graph_rolloff_confidence,
+        "narrow_notch_reliability": graph_notch_reliability,
         "target_db": graph_target,
         "effective_target_db": graph_effective_target,
         "automatic_room_correction_db": graph_automatic_room_correction,
@@ -5306,7 +6235,7 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         "decay_t20_rt60_s": graph_decay,
         "decay_control_db": graph_decay_cut,
         "phase": phase_details,
-        "regularization": "1/3-position weighted dB prototype; pre/post noise confidence; variable perceptual smoothing; variance-weighted soft boost; natural-rolloff boost guard; explicit broad tone preference independent of the automatic room-EQ band",
+        "regularization": "1/3-position weighted dB prototype; pre/post noise confidence; variable perceptual smoothing; spatial variance plus narrow-notch soft boost guard; L/R-corroborated broad roll-off confidence; explicit broad tone preference independent of the automatic room-EQ band",
         "reference_band_hz": list(reference_band),
         "level_reference": "shared Front L/R 500-2000 Hz" if shared_reference_measure_db is not None else f"local {reference_band[0]}-{reference_band[1]} Hz",
         "reference_measure_db": round(reference_measure, 3),
@@ -5317,7 +6246,10 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         "natural_usable_band_hz": [round(natural_low, 1), round(natural_high, 1)],
         "correction_band_hz": [correction_low_hz, correction_high_hz],
         "guarded_boost_bins": guarded_boost_bins,
+        "narrow_notch_guarded_bins": narrow_notch_guarded_bins,
+        "maximum_narrow_notch_boost_db": round(maximum_narrow_notch_boost_db, 3),
         "max_room_boost_db": max_boost_db,
+        "max_relative_compensation_db": max_boost_db,
         "max_room_cut_db": max_cut_db,
         "preference": {"bass_db_at_20_hz": bass_tilt_db, "treble_db_at_20_khz": treble_tilt_db},
         "woofer": woofer,
@@ -5399,7 +6331,11 @@ def fir_value(spectrum: list[complex], frequency: float) -> complex:
 
 def response_complex(response: dict[str, Any], frequency: float) -> complex:
     magnitude_db = interpolate_log(response["frequencies"], response["db"], frequency)
-    phase = interpolate_log(response["frequencies"], response.get("phase_rad", [0.0] * len(response["frequencies"])), frequency)
+    phase = interpolate_linear(
+        [float(value) for value in response["frequencies"]],
+        [float(value) for value in response.get("phase_rad", [0.0] * len(response["frequencies"]))],
+        frequency,
+    )
     phase -= 2.0 * math.pi * frequency * float(response.get("bulk_delay_samples", 0.0)) / RATE
     magnitude = 10.0 ** (magnitude_db / 20.0)
     return magnitude * complex(math.cos(phase), math.sin(phase))
@@ -5460,6 +6396,118 @@ def phase_reference_coverage(results: list[dict[str, Any]], sources: tuple[str, 
     return (low, high) if low < high else None
 
 
+def closure_constrained_acoustic_pair(
+    front_response: dict[str, Any],
+    woofer_response: dict[str, Any],
+    combined_response: dict[str, Any] | None,
+    phase_reference: dict[str, Any] | None,
+    side: str,
+    frequency: float,
+    woofer_measurement_scale: float,
+) -> tuple[complex, complex, dict[str, Any]]:
+    """Fuse all independent and summed captures without double-counting.
+
+    The individual ESS responses provide |F| and |W|.  The simultaneous
+    L/R/W multisine supplies the sign and unwrap of the relative phase.  The
+    separately measured |F + aW| supplies the dense acoustic cross term
+
+        cos(delta) = (|S|^2 - |F|^2 - |aW|^2) / (2 |F| |aW|).
+
+    Because a magnitude-only sum has a +/- phase ambiguity, it is never used
+    alone.  It softly constrains the same-recording phase according to branch
+    balance and capture SNR.  This makes L+W/R+W genuine FIR-design evidence
+    while avoiding normalization, response averaging, or counting W twice.
+    """
+    front = phase_referenced_response_complex(front_response, phase_reference, side, frequency)
+    woofer = phase_referenced_response_complex(woofer_response, phase_reference, "woofer", frequency)
+    details: dict[str, Any] = {
+        "used": False,
+        "reason": "physical sum or simultaneous phase reference unavailable",
+    }
+    if combined_response is None or phase_reference is None:
+        return front, woofer, details
+
+    side_phase = phase_reference.get("sources", {}).get(side, {})
+    woofer_phase = phase_reference.get("sources", {}).get("woofer", {})
+    side_frequencies = side_phase.get("frequencies", [])
+    woofer_frequencies = woofer_phase.get("frequencies", [])
+    if (
+        len(side_frequencies) < 2
+        or len(woofer_frequencies) < 2
+        or not max(float(side_frequencies[0]), float(woofer_frequencies[0])) <= frequency
+        <= min(float(side_frequencies[-1]), float(woofer_frequencies[-1]))
+    ):
+        details["reason"] = "frequency outside simultaneous phase coverage"
+        return front, woofer, details
+
+    front_magnitude = abs(front)
+    scaled_woofer_magnitude = abs(woofer) * float(woofer_measurement_scale)
+    larger = max(front_magnitude, scaled_woofer_magnitude)
+    smaller = min(front_magnitude, scaled_woofer_magnitude)
+    branch_balance = smaller / max(larger, 1.0e-15)
+    denominator = 2.0 * front_magnitude * scaled_woofer_magnitude
+    if branch_balance < 0.08 or denominator <= 1.0e-24:
+        details.update({"reason": "one branch dominates the sum", "branch_balance": round(branch_balance, 5)})
+        return front, woofer, details
+
+    measured_sum_db = interpolate_log(
+        [float(value) for value in combined_response["frequencies"]],
+        [float(value) for value in combined_response["db"]],
+        frequency,
+    )
+    measured_sum_magnitude = 10.0 ** (measured_sum_db / 20.0)
+    observed_cosine_raw = (
+        measured_sum_magnitude * measured_sum_magnitude
+        - front_magnitude * front_magnitude
+        - scaled_woofer_magnitude * scaled_woofer_magnitude
+    ) / denominator
+    # A value far outside [-1, 1] proves that the independently captured
+    # levels/routing are inconsistent.  The pre-build closure gate reports
+    # that failure; do not force an impossible phase into the FIR model.
+    if observed_cosine_raw < -1.35 or observed_cosine_raw > 1.35:
+        details.update({
+            "reason": "physical sum cross term is inconsistent",
+            "observed_cosine_raw": round(observed_cosine_raw, 5),
+            "branch_balance": round(branch_balance, 5),
+        })
+        return front, woofer, details
+
+    observed_cosine = max(-1.0, min(1.0, observed_cosine_raw))
+    reference_delta = math.atan2(woofer.imag, woofer.real) - math.atan2(front.imag, front.real)
+    reference_delta = math.atan2(math.sin(reference_delta), math.cos(reference_delta))
+    reference_cosine = math.cos(reference_delta)
+    capture_snr = combined_response.get("measurement_quality", {}).get("snr_db", MINIMUM_USABLE_SNR_DB)
+    snr_confidence = max(0.20, min(1.0, (float(capture_snr) - MINIMUM_USABLE_SNR_DB) / max(1.0, RECOMMENDED_SNR_DB - MINIMUM_USABLE_SNR_DB)))
+    observability = max(0.0, min(1.0, (branch_balance - 0.08) / 0.32))
+    physical_weight = 0.80 * snr_confidence * observability
+    fused_cosine = max(-1.0, min(1.0, (1.0 - physical_weight) * reference_cosine + physical_weight * observed_cosine))
+    principal = math.acos(fused_cosine)
+    candidates = [
+        sign * principal + turns * 2.0 * math.pi
+        for sign in (-1.0, 1.0)
+        for turns in (-1, 0, 1)
+    ]
+    fused_delta = min(candidates, key=lambda value: abs(value - reference_delta))
+    front_phase_value = math.atan2(front.imag, front.real)
+    woofer_magnitude = abs(woofer)
+    constrained_woofer = woofer_magnitude * complex(
+        math.cos(front_phase_value + fused_delta),
+        math.sin(front_phase_value + fused_delta),
+    )
+    details.update({
+        "used": physical_weight > 0.0,
+        "reason": None,
+        "physical_weight": round(physical_weight, 5),
+        "branch_balance": round(branch_balance, 5),
+        "capture_snr_db": round(float(capture_snr), 3),
+        "observed_cosine_raw": round(observed_cosine_raw, 5),
+        "observed_cosine": round(observed_cosine, 5),
+        "reference_relative_phase_deg": round(math.degrees(reference_delta), 3),
+        "fused_relative_phase_deg": round(math.degrees(fused_delta), 3),
+    })
+    return front, constrained_woofer, details
+
+
 def multiply_firs(first: list[float], second: list[float], fft: FFTBackend) -> list[float]:
     fft_length = TAPS * 2
     first_spectrum = fft.rfft(first, fft_length)
@@ -5485,15 +6533,29 @@ def normalize_fir_bank(
     peak = max(channel_peaks)
     scale = 1.0 / peak if peak > 1.0 else 1.0
     normalized = [[sample * scale for sample in channel] for channel in channels]
+    normalized_peaks = [value * scale for value in channel_peaks]
+    before_db = [20.0 * math.log10(max(value, 1.0e-15)) for value in channel_peaks]
+    after_db = [20.0 * math.log10(max(value, 1.0e-15)) for value in normalized_peaks]
+    relative_delta_errors = [
+        abs((after_db[left] - after_db[right]) - (before_db[left] - before_db[right]))
+        for left in range(len(channels))
+        for right in range(left + 1, len(channels))
+    ]
     gain_db = 20.0 * math.log10(max(scale, 1.0e-15))
     return normalized, {
         "method": "one common gain across the complete FIR bank",
         "reason": "preserve Front/Woofer and L/R relative levels while enforcing NoPreamp transfer <= 0 dB",
+        "scope": "complete_l_r_woofer_bank" if len(channels) == 4 else "complete_l_r_bank",
+        "zero_db_reference": "single_common_bank_peak",
+        "independent_channel_normalization": False,
         "channels": len(channels),
+        "channel_peak_transfer_before_db": [round(value, 4) for value in before_db],
+        "channel_peak_transfer_after_db": [round(value, 4) for value in after_db],
         "peak_transfer_before_db": round(20.0 * math.log10(max(peak, 1.0e-15)), 4),
         "applied_common_gain_db": round(gain_db, 4),
         "peak_transfer_after_db": round(20.0 * math.log10(max(peak * scale, 1.0e-15)), 4),
         "relative_branch_gain_preserved": True,
+        "maximum_relative_level_error_db": round(max(relative_delta_errors, default=0.0), 9),
     }
 
 
@@ -5512,6 +6574,8 @@ def apply_joint_crossover_guard(
     max_cut_db: int,
     shared_front_reference_db: float,
     shared_target_reference_db: float,
+    woofer_measurement_attenuation_db: float,
+    physical_sum_constraints_enabled: bool,
     time_alignment_reliable: bool,
     optimize_relative_phase: bool,
     positions_total: int,
@@ -5528,6 +6592,10 @@ def apply_joint_crossover_guard(
         row = {}
         for source in ("left", "right", "woofer"):
             row[source] = json.loads((directory / f"p{position}_{source}_response.json").read_text(encoding="utf-8"))
+        for source in ("left_woofer", "right_woofer"):
+            path = directory / f"p{position}_{source}_response.json"
+            if path.is_file():
+                row[source] = json.loads(path.read_text(encoding="utf-8"))
         positions.append(row)
     phase_references = load_phase_reference_results(directory, positions_total)
     simultaneous_phase_coverage = phase_reference_coverage(
@@ -5542,16 +6610,58 @@ def apply_joint_crossover_guard(
             return simultaneous_phase_coverage[0] <= frequency <= simultaneous_phase_coverage[1]
         return bool(time_alignment_reliable)
 
-    def acoustic_value(position_index: int, source: str, frequency: float) -> complex:
-        reference = phase_references[position_index] if simultaneous_phase_reliable else None
-        return phase_referenced_response_complex(
-            positions[position_index][source], reference, source, frequency,
+    physical_sum_constraints_available = bool(
+        physical_sum_constraints_enabled
+        and simultaneous_phase_reliable
+        and all(
+            source in position
+            for position in positions
+            for source in ("left_woofer", "right_woofer")
         )
+    )
+    woofer_measurement_scale = 10.0 ** (float(woofer_measurement_attenuation_db) / 20.0)
+    acoustic_pair_cache: dict[tuple[int, str, float], tuple[complex, complex, dict[str, Any]]] = {}
+    sum_constraint_weights: list[float] = []
+    sum_constraint_phase_adjustments: list[float] = []
+    sum_constraint_rejections: dict[str, int] = {}
+
+    def acoustic_pair(position_index: int, side: str, frequency: float) -> tuple[complex, complex]:
+        key = (position_index, side, float(frequency))
+        cached = acoustic_pair_cache.get(key)
+        if cached is None:
+            reference = phase_references[position_index] if simultaneous_phase_reliable else None
+            combined = (
+                positions[position_index].get(f"{side}_woofer")
+                if physical_sum_constraints_available else None
+            )
+            front, woofer, details = closure_constrained_acoustic_pair(
+                positions[position_index][side],
+                positions[position_index]["woofer"],
+                combined,
+                reference,
+                side,
+                frequency,
+                woofer_measurement_scale,
+            )
+            acoustic_pair_cache[key] = (front, woofer, details)
+            if details.get("used"):
+                sum_constraint_weights.append(float(details.get("physical_weight", 0.0)))
+                sum_constraint_phase_adjustments.append(abs(
+                    float(details.get("fused_relative_phase_deg", 0.0))
+                    - float(details.get("reference_relative_phase_deg", 0.0))
+                ))
+            elif physical_sum_constraints_available:
+                reason = str(details.get("reason") or "not used")
+                sum_constraint_rejections[reason] = sum_constraint_rejections.get(reason, 0) + 1
+            cached = acoustic_pair_cache[key]
+        return cached[0], cached[1]
     frequency_grid = [float(value) for value in positions[0]["left"]["frequencies"]]
     target_f, target_db = target_curve(target_name)
     fft_length = TAPS * 2
     phase_optimization: dict[str, Any] = {
         "requested": bool(optimize_relative_phase),
+        "evaluated": False,
+        "reliable": False,
         "enabled": False,
         "polarity": 1,
         "relative_delay_samples": 0,
@@ -5595,13 +6705,14 @@ def apply_joint_crossover_guard(
                     )
                     position_errors = []
                     for position_index, position in enumerate(positions):
+                        front_acoustic, woofer_acoustic = acoustic_pair(position_index, source, frequency)
                         main = (
-                            acoustic_value(position_index, source, frequency)
+                            front_acoustic
                             * fir_value(initial_front_spectra[channel], frequency)
                             * front_rotation
                         )
                         woofer = (
-                            acoustic_value(position_index, "woofer", frequency)
+                            woofer_acoustic
                             * fir_value(initial_rear_spectra[channel], frequency)
                             * rear_rotation
                         )
@@ -5682,6 +6793,8 @@ def apply_joint_crossover_guard(
             best_mae, best_p90 = baseline_mae, baseline_p90
         phase_optimization = {
             "requested": True,
+            "evaluated": len(phase_frequencies) >= 3,
+            "reliable": len(phase_frequencies) >= 3,
             "enabled": apply_alignment,
             "method": "same-recording relative-phase constrained robust search across L/R and all positions" if simultaneous_phase_reliable else "measured complex-sum robust search across both L/R and all positions",
             "evaluation_band_hz": [round(phase_low, 1), round(phase_high, 1)],
@@ -5694,7 +6807,12 @@ def apply_joint_crossover_guard(
             "baseline_mae_db": round(baseline_mae, 3),
             "baseline_p90_db": round(baseline_p90, 3),
             "score_improvement": round(max(0.0, improvement), 4),
-            "reason": None if apply_alignment else "0.25 dB 이상의 안정적인 합산 개선이 없어 지연·극성을 변경하지 않았습니다.",
+            "reason": (
+                None if apply_alignment else
+                "0.25 dB 이상의 안정적인 합산 개선이 없어 현재 지연·극성을 유지했습니다. 측정 실패가 아니라 변경 불필요 판정입니다."
+                if len(phase_frequencies) >= 3 else
+                "동시 위상 기준의 crossover 공통 tone이 3개 미만이라 상대 지연을 평가하지 못했습니다."
+            ),
             "search_limit_samples": search_limit,
             "search_center_samples": search_center,
             "search_radius_samples": search_radius,
@@ -5736,8 +6854,9 @@ def apply_joint_crossover_guard(
             upper_values = []
             complex_values = []
             for position_index, position in enumerate(positions):
-                main = acoustic_value(position_index, source, frequency) * fir_value(front_spectra[channel], frequency)
-                woofer = acoustic_value(position_index, "woofer", frequency) * fir_value(rear_spectra[channel], frequency)
+                front_acoustic, woofer_acoustic = acoustic_pair(position_index, source, frequency)
+                main = front_acoustic * fir_value(front_spectra[channel], frequency)
+                woofer = woofer_acoustic * fir_value(rear_spectra[channel], frequency)
                 upper_values.append(20.0 * math.log10(max(abs(main) + abs(woofer), 1.0e-15)) - target_absolute)
                 complex_values.append(20.0 * math.log10(max(abs(main + woofer), 1.0e-15)) - target_absolute)
             # Reliable complex measurements let us guard the maximum actually
@@ -5796,8 +6915,9 @@ def apply_joint_crossover_guard(
             )
             complex_levels, energy_levels, upper_levels = [], [], []
             for position_index, position in enumerate(positions):
-                main = acoustic_value(position_index, source, frequency) * fir_value(final_front_spectra[channel], frequency)
-                woofer = acoustic_value(position_index, "woofer", frequency) * fir_value(final_rear_spectra[channel], frequency)
+                front_acoustic, woofer_acoustic = acoustic_pair(position_index, source, frequency)
+                main = front_acoustic * fir_value(final_front_spectra[channel], frequency)
+                woofer = woofer_acoustic * fir_value(final_rear_spectra[channel], frequency)
                 complex_levels.append(20.0 * math.log10(max(abs(main + woofer), 1.0e-15)))
                 energy_levels.append(10.0 * math.log10(max(abs(main) ** 2 + abs(woofer) ** 2, 1.0e-30)))
                 upper_levels.append(20.0 * math.log10(max(abs(main) + abs(woofer), 1.0e-15)))
@@ -5844,11 +6964,11 @@ def apply_joint_crossover_guard(
             "overlap_guard_db": graph_guard,
             "coherent_upper_excess_p95_db": round(upper_p95, 3),
             "guarded_upper_excess_p95_db": round(upper_p95, 3),
-            "guard_basis": "same-recording complex sum inside phase coverage; phase-agnostic upper bound outside" if simultaneous_phase_reliable else "maximum measured complex sum" if phase_reliable else "phase-agnostic |Front|+|Woofer| upper bound",
+            "guard_basis": "six-capture closure-constrained complex sum inside phase coverage; phase-agnostic upper bound outside" if physical_sum_constraints_available else "same-recording complex sum inside phase coverage; phase-agnostic upper bound outside" if simultaneous_phase_reliable else "maximum measured complex sum" if phase_reliable else "phase-agnostic |Front|+|Woofer| upper bound",
             "complex_target_mae_db": round(complex_mae, 3),
             "complex_target_p90_db": round(complex_p90, 3),
             "complex_target_median_error_db": round(statistics.median(complex_signed_errors), 3) if phase_reliable and complex_signed_errors else None,
-            "target_estimate_basis": "same-recording complex sum inside phase coverage; energy sum outside" if simultaneous_phase_reliable else "measured complex sum" if phase_reliable else "phase-agnostic energy sum",
+            "target_estimate_basis": "L/R/W magnitudes + L+W/R+W cross-term + simultaneous L/R/W phase; energy sum outside phase coverage" if physical_sum_constraints_available else "same-recording complex sum inside phase coverage; energy sum outside" if simultaneous_phase_reliable else "measured complex sum" if phase_reliable else "phase-agnostic energy sum",
             "target_estimate_mae_db": round(complex_mae, 3),
             "target_estimate_p90_db": round(complex_p90, 3),
             "target_estimate_median_error_db": round(statistics.median(complex_signed_errors), 3) if complex_signed_errors else None,
@@ -5885,8 +7005,19 @@ def apply_joint_crossover_guard(
             [round(simultaneous_phase_coverage[0], 3), round(simultaneous_phase_coverage[1], 3)]
             if simultaneous_phase_coverage is not None else None
         ),
+        "physical_sum_constraints": {
+            "requested": bool(physical_sum_constraints_enabled),
+            "available": physical_sum_constraints_available,
+            "used": bool(sum_constraint_weights),
+            "method": "dense cross-term from L+W/R+W fused with simultaneous L/R/W relative phase; no branch normalization or response averaging",
+            "unique_points_used": len(sum_constraint_weights),
+            "median_weight": round(statistics.median(sum_constraint_weights), 4) if sum_constraint_weights else 0.0,
+            "phase_adjustment_p90_deg": round(percentile(sum_constraint_phase_adjustments, 0.90), 3) if sum_constraint_phase_adjustments else 0.0,
+            "rejections": sum_constraint_rejections,
+            "woofer_measurement_attenuation_db": float(woofer_measurement_attenuation_db),
+        },
         "relative_phase_optimization": phase_optimization,
-        "sum_guard_basis": "same-recording L/R/W phase in crossover coverage plus conservative upper bound outside" if simultaneous_phase_reliable else "maximum measured complex sum" if phase_reliable else "phase-agnostic coherent upper bound",
+        "sum_guard_basis": "all six captures: L/R/W magnitudes, L+W/R+W cross-terms and simultaneous L/R/W phase" if physical_sum_constraints_available else "same-recording L/R/W phase in crossover coverage plus conservative upper bound outside" if simultaneous_phase_reliable else "maximum measured complex sum" if phase_reliable else "phase-agnostic coherent upper bound",
         "coherent_upper_guard_pass": all_upper_pass,
         "complex_sum_target_pass": all_complex_pass if phase_reliable else None,
         "phase_agnostic_target_pass": all_target_estimate_pass if not phase_reliable else None,
@@ -5934,7 +7065,9 @@ def build_mimo_worker(state: dict[str, Any], options: dict[str, Any]) -> None:
         "low_hz": options["correction_low_hz"],
         "high_hz": options["correction_high_hz"],
         "max_room_boost_db": options["max_boost_db"],
+        "max_relative_compensation_db": options["max_boost_db"],
         "max_room_cut_db": options["max_cut_db"],
+        "semantics": "one common 0 dB reference across the complete MIMO L/R/Woofer bank",
     }
     updated = update_current(
         state="built", stage="2×4 MIMO 32768탭 bank 생성 완료 · 보고서와 예측을 확인하세요.",
@@ -5943,7 +7076,7 @@ def build_mimo_worker(state: dict[str, Any], options: dict[str, Any]) -> None:
     atomic_json(session_path, updated)
 
 
-def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode: str, phase_cutoff: int, spatial_mode: str = "equal", bass_tilt_db: int = 0, treble_tilt_db: int = 0, correction_low_hz: int = 20, correction_high_hz: int = 20_000, max_boost_db: int = 6, max_cut_db: int = 18, mimo_high_hz: int = 150, mimo_strength: str = "balanced", mimo_support_penalty_db: int = 6, crossover_enabled: bool = True, crossover_frequency_hz: int = 100) -> None:
+def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode: str, phase_cutoff: int, spatial_mode: str = "equal", bass_tilt_db: int = 0, treble_tilt_db: int = 0, correction_low_hz: int = 20, correction_high_hz: int = 20_000, max_boost_db: int = 10, max_cut_db: int = 18, mimo_high_hz: int = 150, mimo_strength: str = "balanced", mimo_support_penalty_db: int = 6, crossover_enabled: bool = True, crossover_frequency_hz: int = 100) -> None:
     state = load_current()
     positions_total = session_position_count(state)
     if int(state.get("positions_completed", 0)) != positions_total:
@@ -5952,8 +7085,8 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         raise MeasurementError("공간 평균 또는 음색 선호값이 범위를 벗어났습니다.")
     if correction_low_hz not in (20, 30, 40, 60, 80) or correction_high_hz not in (300, 500, 1000, 5000, 20_000) or correction_low_hz >= correction_high_hz:
         raise MeasurementError("보정 주파수 범위가 잘못되었습니다.")
-    if max_boost_db not in (0, 3, 6, 9) or max_cut_db not in (6, 9, 12, 18, 24):
-        raise MeasurementError("최대 boost/cut 값이 잘못되었습니다.")
+    if max_boost_db not in (0, 3, 6, 9, 10) or max_cut_db not in (6, 9, 12, 18, 24):
+        raise MeasurementError("최대 상대 보상/감쇄 값이 잘못되었습니다.")
     if mimo_high_hz not in (80, 120, 150) or mimo_strength not in ("safe", "balanced", "maximum") or mimo_support_penalty_db not in (3, 6, 9, 12):
         raise MeasurementError("MIMO 보정 범위·강도·지원 제어원 제한값이 잘못되었습니다.")
     if not isinstance(crossover_enabled, bool) or crossover_frequency_hz not in CROSSOVER_FREQUENCIES:
@@ -5990,6 +7123,24 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         len(phase_reference_results) == positions_total
         and phase_reference_coverage(phase_reference_results, ("left", "right", "woofer"))
     )
+    premeasured_sum_model = None
+    if state.get("mode") in PREMEASURED_SUM_MODES:
+        premeasured_sum_model = evaluate_premeasured_sum_model(
+            directory,
+            positions_total,
+            measured_woofer_attenuation_db,
+            crossover_frequency_hz,
+        )
+        if not phase_reference_reliable:
+            raise MeasurementError(
+                "여섯 측정 공동 FIR 계산에 필요한 L+R+우퍼 동시 위상 기준이 없거나 신뢰도 기준을 통과하지 못했습니다. "
+                "3 · 위치 측정에서 표시된 위치의 ‘다시 측정’을 실행하세요. 위상 기준은 위치마다 한 번씩 자동 포함됩니다."
+            )
+        if not premeasured_sum_model.get("pass"):
+            raise MeasurementError(
+                "L+우퍼/R+우퍼 합산 측정이 개별 L/R/우퍼와 일치하지 않아 공동 FIR 계산을 중단했습니다. "
+                + str(premeasured_sum_model.get("action") or "3 · 위치 측정에서 해당 위치를 다시 측정하세요.")
+            )
     update_current(state="processing", stage="공간 평균 응답 계산", progress=5.0, eta_seconds=build_eta)
     fft = FFTBackend()
     left_source, right_source = (
@@ -6013,13 +7164,35 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         for frequency in left_f
         if 500.0 <= frequency <= 2000.0
     )
+    preferred_target_db = [
+        value + preference_modifier_db(frequency, bass_tilt_db, treble_tilt_db)
+        for frequency, value in zip(target_f, target_db)
+    ]
+    (
+        left_confidence,
+        right_confidence,
+        left_rolloff_floor,
+        right_rolloff_floor,
+        stereo_rolloff_summary,
+    ) = stereo_broad_rolloff_confidence(
+        left_f,
+        left_db,
+        left_response["frequency_confidence"],
+        right_f,
+        right_db,
+        right_response["frequency_confidence"],
+        target_f,
+        preferred_target_db,
+        shared_front_reference_db,
+        shared_target_reference_db,
+    )
     update_current(stage="Left 32768탭 최소위상 FIR 계산", progress=22.0, eta_seconds=round(build_eta * 0.80))
     common = {"spatial_mode": spatial_mode, "bass_tilt_db": bass_tilt_db, "treble_tilt_db": treble_tilt_db, "correction_low_hz": correction_low_hz, "correction_high_hz": correction_high_hz, "max_boost_db": max_boost_db, "max_cut_db": max_cut_db, "fft": fft}
     front_design_phase_mode = "magnitude" if phase_mode == "bass" else phase_mode
     crossover_role = "highpass" if state.get("mode") in SEPARATE_WOOFER_MODES and crossover_enabled else None
-    left_ir, left_graph = design_channel(left_f, left_db, left_response["spatial_std_db"], left_response["center_phase_rad"], target_name, preset, woofer=False, woofer_trim_db=0, phase_mode=front_design_phase_mode, phase_cutoff=phase_cutoff, crossover_role=crossover_role, crossover_frequency_hz=crossover_frequency_hz, decay_frequency_hz=left_response["decay_frequency_hz"], decay_t20_rt60_s=left_response["decay_t20_rt60_s"], frequency_confidence=left_response["frequency_confidence"], **common)
+    left_ir, left_graph = design_channel(left_f, left_db, left_response["spatial_std_db"], left_response["center_phase_rad"], target_name, preset, woofer=False, woofer_trim_db=0, phase_mode=front_design_phase_mode, phase_cutoff=phase_cutoff, crossover_role=crossover_role, crossover_frequency_hz=crossover_frequency_hz, decay_frequency_hz=left_response["decay_frequency_hz"], decay_t20_rt60_s=left_response["decay_t20_rt60_s"], frequency_confidence=left_confidence, corroborated_rolloff_confidence=left_rolloff_floor, shared_reference_measure_db=shared_front_reference_db, shared_reference_target_db=shared_target_reference_db, **common)
     update_current(stage="Right 32768탭 최소위상 FIR 계산", progress=50.0, eta_seconds=round(build_eta * 0.52))
-    right_ir, right_graph = design_channel(right_f, right_db, right_response["spatial_std_db"], right_response["center_phase_rad"], target_name, preset, woofer=False, woofer_trim_db=0, phase_mode=front_design_phase_mode, phase_cutoff=phase_cutoff, crossover_role=crossover_role, crossover_frequency_hz=crossover_frequency_hz, decay_frequency_hz=right_response["decay_frequency_hz"], decay_t20_rt60_s=right_response["decay_t20_rt60_s"], frequency_confidence=right_response["frequency_confidence"], **common)
+    right_ir, right_graph = design_channel(right_f, right_db, right_response["spatial_std_db"], right_response["center_phase_rad"], target_name, preset, woofer=False, woofer_trim_db=0, phase_mode=front_design_phase_mode, phase_cutoff=phase_cutoff, crossover_role=crossover_role, crossover_frequency_hz=crossover_frequency_hz, decay_frequency_hz=right_response["decay_frequency_hz"], decay_t20_rt60_s=right_response["decay_t20_rt60_s"], frequency_confidence=right_confidence, corroborated_rolloff_confidence=right_rolloff_floor, shared_reference_measure_db=shared_front_reference_db, shared_reference_target_db=shared_target_reference_db, **common)
     front_phase_reliable = bool(
         left_response.get("center_bulk_delay_reliable", True)
         and right_response.get("center_bulk_delay_reliable", True)
@@ -6190,9 +7363,12 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             max_cut_db=max_cut_db,
             shared_front_reference_db=shared_front_reference_db,
             shared_target_reference_db=shared_target_reference_db,
-            # A reliable absolute impulse reference is sufficient for complex
-            # prediction even when the user selected magnitude-only phase and
-            # therefore requested no relative-delay correction.
+            woofer_measurement_attenuation_db=measured_woofer_attenuation_db,
+            physical_sum_constraints_enabled=bool(
+                premeasured_sum_model and premeasured_sum_model.get("pass")
+            ),
+            # Same-recording relative timing is sufficient for crossover
+            # complex prediction. It does not claim a shared absolute clock.
             time_alignment_reliable=bool(
                 phase_reference_reliable
                 or (PHASE_CLOCK_SHARED and front_phase_reliable and woofer_phase_reliable)
@@ -6202,19 +7378,23 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             fft=fft,
         )
         phase_optimization = crossover_summary.get("relative_phase_optimization", {})
-        if phase_optimization.get("enabled"):
+        if phase_optimization.get("requested") and phase_optimization.get("reliable"):
             relative_delay = int(phase_optimization.get("relative_delay_samples", 0))
+            alignment_applied = bool(phase_optimization.get("enabled"))
             time_alignment = {
                 "requested": phase_mode == "bass",
-                "enabled": True,
+                "enabled": alignment_applied,
                 "reliable": True,
                 "aligned": True,
+                "evaluated": True,
+                "no_change_needed": not alignment_applied,
                 "front_delay_samples": max(0, -relative_delay),
                 "rear_delay_samples": max(0, relative_delay),
                 "relative_delay_samples": relative_delay,
                 "relative_delay_ms": round(relative_delay * 1000.0 / RATE, 4),
                 "woofer_polarity": int(phase_optimization.get("polarity", 1)),
                 "method": phase_optimization.get("method"),
+                "reason": phase_optimization.get("reason"),
                 "reference": (
                     "simultaneous L/R/W multisine at every microphone position"
                     if phase_reference_reliable else
@@ -6239,6 +7419,12 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     if rear_channels is not None:
         bank_channels.extend(rear_channels)
     normalized_bank, bank_normalization = normalize_fir_bank(bank_channels, fft)
+    common_attenuation_db = max(0.0, -float(bank_normalization["applied_common_gain_db"]))
+    bank_normalization.update({
+        "max_relative_compensation_db": max_boost_db,
+        "common_attenuation_db": round(common_attenuation_db, 4),
+        "relative_compensation_limit_pass": common_attenuation_db <= float(max_boost_db) + 0.25,
+    })
     left_ir, right_ir = normalized_bank[:2]
     if rear_channels is not None:
         rear_channels = normalized_bank[2:4]
@@ -6246,6 +7432,11 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     right_graph = finalize_graph_with_fir(right_graph, right_ir, fft)
     if state["mode"] in SEPARATE_WOOFER_MODES and isinstance(rear_graph, dict) and rear_channels is not None:
         rear_graph = finalize_graph_with_fir(rear_graph, rear_channels[0], fft)
+    common_level_reference = apply_common_graph_reference(
+        left_graph,
+        right_graph,
+        rear_graph if state["mode"] in SEPARATE_WOOFER_MODES and isinstance(rear_graph, dict) else None,
+    )
     if state["mode"] == "lr":
         # The shared-filter topology convolves once, then copies to Rear with a
         # mixer trim. Creating a scaled Rear WAV here would waste two Conv paths
@@ -6320,14 +7511,6 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         key: value for key, value in target_fit.items()
         if not (state["mode"] in SEPARATE_WOOFER_MODES and key == "woofer")
     }
-    premeasured_sum_model = None
-    if state.get("mode") in PREMEASURED_SUM_MODES:
-        premeasured_sum_model = evaluate_premeasured_sum_model(
-            directory,
-            positions_total,
-            measured_woofer_attenuation_db,
-            crossover_frequency_hz,
-        )
     implementation = {
         "left": left_graph["fir_implementation"],
         "right": right_graph["fir_implementation"],
@@ -6336,6 +7519,22 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     channel_metrics = [front_metrics["left"], front_metrics["right"]]
     if rear_metrics:
         channel_metrics += [rear_metrics["left"], rear_metrics["right"]]
+    common_reference_graphs = [
+        graph
+        for graph in (
+            left_graph,
+            right_graph,
+            rear_graph if state["mode"] in SEPARATE_WOOFER_MODES else None,
+        )
+        if isinstance(graph, dict)
+    ]
+    common_reference_signature = (
+        common_level_reference.get("scope"),
+        tuple(common_level_reference.get("reference_band_hz") or ()),
+        common_level_reference.get("predicted_reference_db"),
+        common_level_reference.get("target_reference_db"),
+        common_level_reference.get("independent_channel_normalization"),
+    )
     core_checks = {
         "exact_32768_taps": all(item["taps"] == TAPS for item in channel_metrics),
         "finite_samples": all(item["finite"] for item in channel_metrics),
@@ -6345,6 +7544,40 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             item is None or item["pass"] for item in implementation.values()
         ),
         "time_alignment_safe": not time_alignment.get("enabled") or bool(time_alignment.get("aligned")),
+        "one_common_level_reference": (
+            len(common_reference_graphs) == (3 if state["mode"] in SEPARATE_WOOFER_MODES else 2)
+            and common_reference_signature[-1] is False
+            and all(
+                (
+                    reference.get("scope"),
+                    tuple(reference.get("reference_band_hz") or ()),
+                    reference.get("predicted_reference_db"),
+                    reference.get("target_reference_db"),
+                    reference.get("independent_channel_normalization"),
+                ) == common_reference_signature
+                for reference in (
+                    graph.get("common_reference") or {}
+                    for graph in common_reference_graphs
+                )
+            )
+        ),
+        "one_common_bank_gain": (
+            bank_normalization.get("independent_channel_normalization") is False
+            and bank_normalization.get("zero_db_reference") == "single_common_bank_peak"
+            and bank_normalization.get("scope") == (
+                "complete_l_r_woofer_bank"
+                if state["mode"] in SEPARATE_WOOFER_MODES else "complete_l_r_bank"
+            )
+        ),
+        "relative_branch_level_preserved": (
+            bool(bank_normalization.get("relative_branch_gain_preserved"))
+            and float(bank_normalization.get("maximum_relative_level_error_db", 999.0)) <= 1.0e-6
+        ),
+        "relative_compensation_limit": bool(bank_normalization.get("relative_compensation_limit_pass")),
+        "narrow_null_boost_guard": all(
+            float(graph.get("maximum_narrow_notch_boost_db", 0.0)) <= 3.01
+            for graph in (left_graph, right_graph)
+        ),
     }
     core_target_pass = (
         all(core_checks.values())
@@ -6411,7 +7644,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         diagnostics["warnings"].append("빠른 측정 1위치 결과입니다. 기준 청취점은 보정하지만 위치 이동에 따른 공간 안정성은 검증하지 않았습니다.")
     if not all(item is None or item.get("applicable") is False or item.get("pass") for item in target_fit.values()):
         diagnostics["warnings"].append("안전 제한 때문에 일부 채널이 선택 타겟을 허용 오차 안에서 완전히 달성하지 못했습니다.")
-    if time_alignment.get("requested") and not time_alignment.get("enabled"):
+    if time_alignment.get("requested") and not time_alignment.get("enabled") and not time_alignment.get("reliable"):
         diagnostics["warnings"].append(f"프런트/우퍼 시간 정렬 미적용: {time_alignment.get('reason', '신뢰도 부족')}")
     if state["mode"] == "lrw":
         diagnostics["warnings"].append(
@@ -6474,7 +7707,14 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         "position_weights": left_response["position_weights"],
         "smoothing": left_response["smoothing"],
         "preference": {"bass_db_at_20_hz": bass_tilt_db, "treble_db_at_20_khz": treble_tilt_db},
-        "correction_limits": {"low_hz": correction_low_hz, "high_hz": correction_high_hz, "max_room_boost_db": max_boost_db, "max_room_cut_db": max_cut_db},
+        "correction_limits": {
+            "low_hz": correction_low_hz,
+            "high_hz": correction_high_hz,
+            "max_room_boost_db": max_boost_db,
+            "max_relative_compensation_db": max_boost_db,
+            "max_room_cut_db": max_cut_db,
+            "semantics": "highest trusted correction becomes 0 dB; one common attenuation is applied to the complete L/R/Woofer bank",
+        },
         "front": front.name,
         "rear": rear.name if rear else None,
         "taps": TAPS,
@@ -6486,6 +7726,8 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         "rear_metrics": rear_metrics,
         "time_alignment": time_alignment,
         "filter_bank_normalization": bank_normalization,
+        "common_level_reference": common_level_reference,
+        "stereo_broad_rolloff_corroboration": stereo_rolloff_summary,
         "integration": premeasured_sum_model or integration_summary(
             directory,
             state.get("validation"),
@@ -6550,11 +7792,11 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         },
         "algorithm": {
             "prototype": "multi-position weighted power-response prototype",
-            "regularization": "frequency-dependent spatial-variance reliability and soft boost bound",
-            "rolloff_guard": "half-octave median -10 dB natural usable-band estimator",
+            "regularization": "frequency-dependent spatial variance, narrow-null reliability, stereo broad-rolloff corroboration and bounded relative compensation",
+            "rolloff_guard": "half-octave median -10 dB natural usable-band estimator; only L/R-corroborated broad roll-off may extend through the edge",
             "phase": "minimum phase; optional low-frequency excess phase with acausality limit",
             "target": "named target plus optional bass/treble house-curve preference",
-            "verification": "actual 32768-tap FIR FFT, normalized full-system target-fit error, absolute non-normalized premeasured complex-sum closure, transfer/causality/SNR invariants",
+            "verification": "actual 32768-tap FIR FFT, one common L/R/Woofer reference target-fit error, relative-level preservation, narrow-null and relative-compensation limits, absolute non-normalized premeasured complex-sum closure, transfer/causality/SNR invariants",
             "reverberation": "octave-band noise-compensated Schroeder EDT/T20; reliable low-frequency decay controls cut-only damping",
             "crossover": "embedded LR4 Front HPF/Woofer LPF plus measured-position coherent upper-envelope cut guard; precision mode validates H(L/R)+H(W) against premeasured physical sums; no extra runtime filter stage or block latency",
         },
@@ -6787,7 +8029,9 @@ def target_matrix_self_test() -> dict[str, Any]:
             front, front_graph = design_channel(
                 frequencies, measured, variation, phase, target_name, preset,
                 woofer=False, woofer_trim_db=0, phase_mode="magnitude", phase_cutoff=200,
-                crossover_role="highpass", crossover_frequency_hz=100, fft=fft,
+                crossover_role="highpass", crossover_frequency_hz=100,
+                shared_reference_measure_db=shared_measure_reference,
+                shared_reference_target_db=shared_target_reference, fft=fft,
             )
             woofer, woofer_graph = design_channel(
                 frequencies, measured, variation, phase, target_name, preset,
@@ -6801,6 +8045,7 @@ def target_matrix_self_test() -> dict[str, Any]:
             front, woofer = bank[0], bank[2]
             front_graph = finalize_graph_with_fir(front_graph, front, fft)
             woofer_graph = finalize_graph_with_fir(woofer_graph, woofer, fft)
+            apply_common_graph_reference(front_graph, front_graph, woofer_graph)
             front_metrics = fir_metrics([front, front], fft)["left"]
             woofer_metrics = fir_metrics([woofer, woofer], fft)["left"]
             front_pass = bool(
@@ -6914,7 +8159,7 @@ def target_matrix_self_test() -> dict[str, Any]:
         "treble_tilt_db": tuple(range(-6, 3)),
         "correction_low_hz": (20, 30, 40, 60, 80),
         "correction_high_hz": (300, 500, 1000, 5000, 20_000),
-        "max_boost_db": (0, 3, 6, 9),
+        "max_boost_db": (0, 3, 6, 9, 10),
         "max_cut_db": (6, 9, 12, 18, 24),
         "crossover_enabled": (False, True),
         "crossover_frequency_hz": CROSSOVER_FREQUENCIES,
@@ -6924,7 +8169,7 @@ def target_matrix_self_test() -> dict[str, Any]:
         "phase_mode": "magnitude", "phase_cutoff": 200, "spatial_mode": "equal",
         "bass_tilt_db": 0, "treble_tilt_db": 0,
         "correction_low_hz": 20, "correction_high_hz": 20_000,
-        "max_boost_db": 6, "max_cut_db": 18,
+        "max_boost_db": 10, "max_cut_db": 18,
         "crossover_enabled": True, "crossover_frequency_hz": 100,
     }
     scenario_requests: list[tuple[str, str, Any, dict[str, Any]]] = []
@@ -6977,7 +8222,10 @@ def target_matrix_self_test() -> dict[str, Any]:
             frequencies, measured, variation, phase, settings["target"], settings["preset"],
             woofer=False, woofer_trim_db=0, phase_mode=settings["phase_mode"],
             phase_cutoff=settings["phase_cutoff"], crossover_role=front_role,
-            crossover_frequency_hz=settings["crossover_frequency_hz"], fft=fft, **design_common,
+            crossover_frequency_hz=settings["crossover_frequency_hz"],
+            shared_reference_measure_db=shared_measure_reference,
+            shared_reference_target_db=shared_target_reference,
+            fft=fft, **design_common,
         )
         woofer_ir, woofer_graph = design_channel(
             frequencies, measured, variation, phase, settings["target"], settings["preset"],
@@ -6992,6 +8240,7 @@ def target_matrix_self_test() -> dict[str, Any]:
         front_ir, woofer_ir = bank[0], bank[2]
         front_graph = finalize_graph_with_fir(front_graph, front_ir, fft)
         woofer_graph = finalize_graph_with_fir(woofer_graph, woofer_ir, fft)
+        apply_common_graph_reference(front_graph, front_graph, woofer_graph)
         front_metrics = fir_metrics([front_ir, front_ir], fft)["left"]
         woofer_metrics = fir_metrics([woofer_ir, woofer_ir], fft)["left"]
         core_pass = bool(
@@ -7065,6 +8314,7 @@ def target_matrix_self_test() -> dict[str, Any]:
     phase_bank, phase_normalization = normalize_fir_bank([phase_impulse, phase_impulse], fft)
     phase_impulse = phase_bank[0]
     phase_graph = finalize_graph_with_fir(phase_graph, phase_impulse, fft)
+    apply_common_graph_reference(phase_graph, phase_graph, None)
     phase_metrics = fir_metrics([phase_impulse, phase_impulse], fft)["left"]
     phase_pass = bool(
         phase_metrics["finite"]
@@ -7170,6 +8420,8 @@ def main() -> int:
     sub.add_parser("start-level-reprocess")
     sub.add_parser("start-position")
     sub.add_parser("restart-positions")
+    sub.add_parser("start-phase-reference")
+    sub.add_parser("recover-phase-reference")
     sub.add_parser("start-validation")
     post_validation = sub.add_parser("start-post-validation")
     post_validation.add_argument("level_dbfs", type=int, choices=range(-54, -11))
@@ -7193,7 +8445,7 @@ def main() -> int:
     build.add_argument("treble_tilt_db", type=int, choices=range(-6, 3), nargs="?", default=0)
     build.add_argument("correction_low_hz", type=int, choices=(20, 30, 40, 60, 80), nargs="?", default=20)
     build.add_argument("correction_high_hz", type=int, choices=(300, 500, 1000, 5000, 20_000), nargs="?", default=20_000)
-    build.add_argument("max_boost_db", type=int, choices=(0, 3, 6, 9), nargs="?", default=6)
+    build.add_argument("max_boost_db", type=int, choices=(0, 3, 6, 9, 10), nargs="?", default=10)
     build.add_argument("max_cut_db", type=int, choices=(6, 9, 12, 18, 24), nargs="?", default=18)
     build.add_argument("mimo_high_hz", type=int, choices=(80, 120, 150), nargs="?", default=150)
     build.add_argument("mimo_strength", choices=("safe", "balanced", "maximum"), nargs="?", default="balanced")
@@ -7209,6 +8461,7 @@ def main() -> int:
     sub.add_parser("_worker-level")
     sub.add_parser("_worker-level-reprocess")
     sub.add_parser("_worker-position")
+    sub.add_parser("_worker-phase-reference")
     sub.add_parser("_worker-validation")
     post_validation_worker_parser = sub.add_parser("_worker-post-validation")
     post_validation_worker_parser.add_argument("level_dbfs", type=int)
@@ -7223,7 +8476,7 @@ def main() -> int:
     worker_build.add_argument("treble_tilt_db", type=int, nargs="?", default=0)
     worker_build.add_argument("correction_low_hz", type=int, nargs="?", default=20)
     worker_build.add_argument("correction_high_hz", type=int, nargs="?", default=20_000)
-    worker_build.add_argument("max_boost_db", type=int, nargs="?", default=6)
+    worker_build.add_argument("max_boost_db", type=int, nargs="?", default=10)
     worker_build.add_argument("max_cut_db", type=int, nargs="?", default=18)
     worker_build.add_argument("mimo_high_hz", type=int, nargs="?", default=150)
     worker_build.add_argument("mimo_strength", nargs="?", default="balanced")
@@ -7293,6 +8546,11 @@ def main() -> int:
         elif args.command == "restart-positions":
             prepare_position_restart()
             result = spawn_worker("_worker-position")
+        elif args.command == "start-phase-reference":
+            prepare_phase_reference_remeasurement()
+            result = spawn_worker("_worker-phase-reference")
+        elif args.command == "recover-phase-reference":
+            result = recover_pending_phase_reference()
         elif args.command == "start-validation":
             result = spawn_worker("_worker-validation")
         elif args.command == "start-post-validation":
@@ -7341,6 +8599,8 @@ def main() -> int:
             return worker_guard(level_check_reprocess_worker)
         elif args.command == "_worker-position":
             return worker_guard(measure_position_worker)
+        elif args.command == "_worker-phase-reference":
+            return worker_guard(measure_phase_reference_worker)
         elif args.command == "_worker-reprocess-saved":
             return worker_guard(reprocess_saved_recordings_worker)
         elif args.command == "_worker-validation":

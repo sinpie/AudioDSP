@@ -79,7 +79,7 @@ DEFAULT_CORRECTION_PREFERENCES = {
     "target": "flat", "preset": "none", "woofer_trim_db": 0,
     "phase_mode": "bass", "phase_cutoff": 200, "spatial_mode": "equal",
     "bass_tilt_db": 0, "treble_tilt_db": 0, "correction_low_hz": 20,
-    "correction_high_hz": 20_000, "max_boost_db": 6, "max_cut_db": 18,
+    "correction_high_hz": 20_000, "max_boost_db": 10, "max_cut_db": 18,
     "mimo_high_hz": 150, "mimo_strength": "balanced", "mimo_support_penalty_db": 6,
     "crossover_enabled": True, "crossover_frequency_hz": 100,
 }
@@ -406,6 +406,49 @@ def measurement_status() -> dict:
                 "response_count": len(responses),
                 "can_reprocess_all": len(raw) == len(expected),
             }
+            phase_expected = (
+                list(range(1, int(value.get("positions_total", 0)) + 1))
+                if value.get("mode") in ("lrw", "lrw_sum") else []
+            )
+            phase_raw = [
+                position for position in phase_expected
+                if (session_dir / f"p{position}_phase_reference_recorded.wav").is_file()
+                and (session_dir / f"p{position}_phase_reference_signal.json").is_file()
+            ]
+            phase_results = [
+                item for item in value.get("phase_references", [])
+                if isinstance(item, dict)
+                and (session_dir / str(item.get("result", ""))).is_file()
+            ]
+            phase_details = []
+            for position in phase_expected:
+                result_path = session_dir / f"p{position}_phase_reference.json"
+                if not result_path.is_file():
+                    continue
+                try:
+                    detail = json.loads(result_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(detail, dict):
+                    phase_details.append({
+                        "position": position,
+                        "version": detail.get("version"),
+                        "method": detail.get("method"),
+                        "reliable": bool(detail.get("reliable")),
+                        "recommended": bool(detail.get("recommended")),
+                        "minimum_median_snr_db": detail.get("minimum_median_snr_db"),
+                        "phase_repeatability_p90_deg": detail.get("phase_repeatability_p90_deg"),
+                        "period_correlation": detail.get("period_correlation"),
+                        "pairs": detail.get("pairs") or {},
+                    })
+            value["phase_capture_inventory"] = {
+                "expected": len(phase_expected),
+                "raw_count": len(phase_raw),
+                "result_count": len(phase_results),
+                "reliable_count": sum(bool(item.get("reliable")) for item in phase_results),
+                "can_reprocess_all": len(phase_raw) == len(phase_expected),
+            }
+            value["phase_details"] = phase_details
         result = value.get("result")
         if isinstance(result, dict):
             actual_revision = result.get("algorithm_revision")
@@ -1120,8 +1163,8 @@ MEASUREMENT_MODE_OPTIONS = (
 )
 MEASUREMENT_MODE_HELP = {
     "lr": "각 스윕에서 프런트 L+우퍼, 프런트 R+우퍼가 함께 재생됩니다. 공통 FIR을 프런트에 한 번 처리한 뒤 우퍼로 복사합니다.",
-    "lrw_sum": "L/R/우퍼를 설계용으로 따로 측정하고 같은 마이크 위치에서 L+우퍼/R+우퍼도 측정합니다. 추가 두 응답은 보정에 중복 사용하지 않고 합산 크기·극성 의심·상대 레벨을 FIR 계산 전에 검증합니다.",
-    "lrw": "프런트 L, 프런트 R, 우퍼를 각각 측정합니다. 위상 기준이 제한되면 보수적인 합산 상한과 에너지 합으로 FIR·레벨·크로스오버를 검증합니다. 실제 물리 합산까지 확인하려면 ‘정밀 분리+합산’을 선택하세요.",
+    "lrw_sum": "위치마다 프런트 L → 프런트 R → 우퍼 → L+우퍼 → R+우퍼 → L+R+우퍼 동시 위상 순서로 측정합니다. 여섯 응답이 음압·교차항·상대 위상 제약으로 공동 FIR 합성에 사용되며, 어느 응답도 중복 평균하거나 개별 정규화하지 않습니다.",
+    "lrw": "위치마다 프런트 L/R/우퍼 ESS 3회와 L+R+우퍼 동시 위상 기준 1회를 측정합니다. 물리 L+우퍼/R+우퍼 교차항이 없으므로 합산은 위상 기준과 보수적인 상한으로 계산합니다.",
     "mimo_stereo": "프런트 L/R을 각각 독립 측정해 두 스피커를 공동 최적화합니다. 우퍼 상대 레벨은 사용하지 않습니다.",
     "mimo_one_sub": "프런트 L, 프런트 R, T5S 한 대를 세 독립 물리 제어원으로 측정합니다. T5S 스테레오 입력은 한 우퍼로 취급합니다.",
     "mimo_dual_sub": "프런트 L/R과 서로 다른 위치·배선의 우퍼 두 대를 네 독립 제어원으로 측정합니다.",
@@ -1304,6 +1347,9 @@ def measurement_panel(job: dict, preview: dict) -> str:
         saved_sessions = []
     positions = int(job.get("positions_completed", 0))
     total = int(job.get("positions_total", 3))
+    panel_mode = str(job.get("mode", "lrw_sum"))
+    panel_source_count = len(job.get("sources") or ())
+    panel_acquisition_count = panel_source_count + (1 if panel_mode in ("lrw", "lrw_sum") and panel_source_count else 0)
     position_count_options = ''.join(
         f'<option value="{value}" {"selected" if value == total else ""}>{label}</option>'
         for value, label in ((1, "빠른 측정 · 기준점 1위치"), (3, "표준 측정 · 중앙+좌우 3위치 · 권장"))
@@ -1321,9 +1367,13 @@ def measurement_panel(job: dict, preview: dict) -> str:
     level = job.get("level_check") or {}
     level_recording_inventory = job.get("level_recording_inventory") or {}
     capture_inventory = job.get("capture_inventory") or {}
+    phase_capture_inventory = job.get("phase_capture_inventory") or {}
     raw_capture_count = int(capture_inventory.get("raw_count", 0))
     response_count = int(capture_inventory.get("response_count", 0))
     expected_capture_count = int(capture_inventory.get("expected", total * len(job.get("sources") or ())))
+    phase_expected_count = int(phase_capture_inventory.get("expected", total if job.get("mode") in ("lrw", "lrw_sum") else 0))
+    phase_result_count = int(phase_capture_inventory.get("result_count", len(job.get("phase_references") or ())))
+    phase_reliable_count = int(phase_capture_inventory.get("reliable_count", sum(bool(item.get("reliable")) for item in (job.get("phase_references") or ()) if isinstance(item, dict))))
     preferences = job.get("correction_preferences") or {}
     installed = job.get("installed_calibrations") or {}
     capabilities = job.get("capabilities") or {}
@@ -1358,11 +1408,16 @@ def measurement_panel(job: dict, preview: dict) -> str:
         and positions == total
         and premeasurement_sum.get("pass") is False
     )
+    phase_validation_failed = (
+        str(job.get("mode")) == "lrw_sum"
+        and positions == total
+        and (phase_result_count < phase_expected_count or phase_reliable_count < phase_expected_count)
+    )
     if job.get("applied_profile"):
         current_step = 6
     elif result and not stale_result:
         current_step = 5
-    elif premeasurement_validation_failed:
+    elif premeasurement_validation_failed or phase_validation_failed:
         current_step = 3
     elif positions == total:
         current_step = 4
@@ -1380,7 +1435,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
     step_labels = ((1, "출력 설정"), (2, "레벨 확인"), (3, "위치 측정"), (4, "FIR 계산"), (5, "A/B 검토"), (6, "정식 적용"))
     for number, label in step_labels:
         classes = "current" if number == current_step else "done" if number < current_step else "future"
-        step_has_failure = (result_validation_failed and number == 5) or (premeasurement_validation_failed and not result and number == 3)
+        step_has_failure = (result_validation_failed and number == 5) or ((premeasurement_validation_failed or phase_validation_failed) and not result and number == 3)
         if step_has_failure:
             classes += " validation-error"
         content = f'<span>{number}</span><b>{label}</b>{"<em>FAIL</em>" if step_has_failure else ""}'
@@ -1498,13 +1553,15 @@ def measurement_panel(job: dict, preview: dict) -> str:
         mode = str(job.get("mode", "lrw"))
         source_sequence = {
             "lr": "L+우퍼 → R+우퍼",
-            "lrw": "프런트 L → 우퍼 → 프런트 R",
-            "lrw_sum": "프런트 L → 우퍼 → 프런트 R → L+우퍼 → R+우퍼",
+            "lrw": "프런트 L → 프런트 R → 우퍼 → L+R+우퍼 동시 위상",
+            "lrw_sum": "프런트 L → 프런트 R → 우퍼 → L+우퍼 → R+우퍼 → L+R+우퍼 동시 위상",
             "mimo_stereo": "프런트 L → 프런트 R",
             "mimo_one_sub": "프런트 L → 우퍼 → 프런트 R",
             "mimo_dual_sub": "프런트 L → 우퍼 1 → 프런트 R → 우퍼 2",
         }.get(mode, "선택한 출력 순서")
         source_count = len(job.get("sources") or ())
+        phase_reference_included = mode in ("lrw", "lrw_sum")
+        acquisition_count = source_count + (1 if phase_reference_included else 0)
         mode_options = measurement_mode_options(mode, mimo_supported)
         level_dbfs = int(job.get("level_dbfs", -42))
         noise_level_dbfs = int(job.get("noise_level_dbfs", job.get("level_dbfs", -42)))
@@ -1555,8 +1612,9 @@ def measurement_panel(job: dict, preview: dict) -> str:
         <div class="session-new-action" data-measurement-step-content="1"><div><b>새 세션</b><p class="muted">현재 세션은 자동 저장되어 다시 불러올 수 있습니다.</p></div><form method="post" action="/measurement/new" onsubmit="return confirm('현재 세션을 저장하고 같은 설정으로 새 측정을 시작할까요?')"><input type="hidden" name="mode" value="{mode}"><input type="hidden" name="orientation" value="90"><input type="hidden" name="level_dbfs" value="{level_dbfs}"><input type="hidden" name="noise_level_dbfs" value="{noise_level_dbfs}"><input type="hidden" name="woofer_measurement_attenuation_db" value="{woofer_measurement_attenuation_db}"><input type="hidden" name="sweep_seconds" value="{sweep_seconds}"><input type="hidden" name="position_count" value="{total}"><button class="secondary"{' disabled' if busy else ''}>새 세션</button></form></div><div class="step-nav-bar" style="margin-top:14px" data-measurement-step-content="1"><button type="button" class="validation-jump primary-jump" data-measurement-jump="2">레벨 확인으로</button></div>"""
 
         if positions >= total:
+            build_blocked = premeasurement_validation_failed or phase_validation_failed
             position_control = f'''<form method="post" action="/measurement/restart-positions" id="measurement-step-3" onsubmit="return confirm(\'{total}곳 측정을 처음부터 다시 시작합니다. 기존 측정·검증·생성 FIR 결과를 초기화할까요?\')"><button{position_disabled}>{total}곳 처음부터 재측정</button></form>
-            <div class="step-nav-bar"><button type="button" class="validation-jump primary-jump" data-measurement-jump="4">FIR 계산으로</button></div>'''
+            <div class="step-nav-bar"><button type="button" class="validation-jump primary-jump" data-measurement-jump="4"{' disabled' if build_blocked else ''}>FIR 계산으로</button></div>'''
         else:
             woofer_effective = level_dbfs + woofer_measurement_attenuation_db
             pos_num = positions + 1
@@ -1573,7 +1631,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 else:
                     pos_guide = "3/3 위치: 마이크를 [중앙에서 우측으로 약 15~20cm] 이동하여 천장 방향(90°)으로 두고 시작하세요."
                     pos_button_text = "위치 3/3 측정"
-            pos_confirm_msg = f"{pos_guide}\n\n[재생 정보]\n{source_count}개 조합 순차 재생 ({source_sequence})\nDAC 기준: {level_dbfs} dBFS (우퍼 실효 {woofer_effective} dBFS)\nU7 청취 볼륨은 자동으로 무시하고 종료 후 복원합니다.\n\n준비되셨으면 확인을 누르세요."
+            pos_confirm_msg = f"{pos_guide}\n\n[재생 정보]\n{acquisition_count}회 순차 재생 ({source_sequence})\nDAC 기준: {level_dbfs} dBFS (우퍼 실효 {woofer_effective} dBFS)\n동시 위상 기준은 같은 주파수 L/R/W 합산 headroom을 위해 스윕보다 10 dB 낮게 재생됩니다.\nU7 청취 볼륨은 자동으로 무시하고 종료 후 복원합니다.\n\n준비되셨으면 확인을 누르세요."
             pos_confirm_escaped = html.escape(json.dumps(pos_confirm_msg, ensure_ascii=False), quote=True)
             position_control = f'<form method="post" action="/measurement/position" id="measurement-step-3" onsubmit="return confirm({pos_confirm_escaped})"><button{position_disabled}>{pos_button_text}</button></form>'
             if positions > 0:
@@ -1585,18 +1643,81 @@ def measurement_panel(job: dict, preview: dict) -> str:
             pre_sum_pass = bool(pre_sum.get("pass"))
             pre_sum_channels = pre_sum.get("channels") or {}
             pre_sum_metrics = "".join(
-                f'<div><small>{"L" if side == "left" else "R"} 모델 일치</small><b>MAE {values.get("magnitude_mae_db", "?")} / P90 {values.get("magnitude_p90_abs_error_db", "?")} dB</b><span>위상 중앙값 {values.get("phase_median_abs_error_deg", "?")}° · P90 {values.get("phase_p90_abs_error_deg", "?")}°</span></div>'
+                f'<div><small>{"L" if side == "left" else "R"} + 우퍼 측정 일치</small><b>PASS 기준 오차 · MAE {values.get("magnitude_mae_db", "?")} / P90 {values.get("magnitude_p90_abs_error_db", "?")} dB</b><span>위상 측정 반복 오차 P90 {values.get("phase_repeatability_p90_deg", "?")}° · 현재 정렬 상태의 좋고 나쁨은 아래 위상차에서 확인</span></div>'
                 for side, values in pre_sum_channels.items()
             )
             pre_sum_phase_limited = pre_sum.get("phase_verification_status") == "limited"
-            pre_sum_html = f'''<section class="pre-sum-card {'pass' if pre_sum_pass else 'fail'}" data-measurement-step-content="3"><div class="section-head"><div><h4>필터 전 합산 일치 검증</h4><p>L/R/우퍼 예측과 같은 위치의 L+우퍼/R+우퍼 실측 비교 · 개별 정규화 없음</p></div><span class="status-badge {'pass' if pre_sum_pass else 'fail'}">{'PASS' if pre_sum_pass else 'FAIL'}</span></div><div class="diagnostic-grid">{pre_sum_metrics}</div>{'<p class="diagnostic-note"><b>위상 정밀도 제한</b> · 합산 크기와 SNR은 통과했습니다. U7 출력과 UMIK-1 입력은 하드웨어 clock을 공유하지 않아 절대 위상은 참고값이며, FIR은 보수적인 감쇄 전용 합산 상한으로 보호합니다.</p>' if pre_sum_phase_limited else ''}{'' if pre_sum_pass else f'<p class="failure"><b>실행할 조치</b> · {html.escape(str(pre_sum.get("action", "3단계 측정을 다시 확인하세요.")))}</p>'}</section>'''
+            pre_sum_html = f'''<section class="pre-sum-card {'pass' if pre_sum_pass else 'fail'}" data-measurement-step-content="3"><div class="section-head"><div><h4>필터 전 합산 교차항 확인</h4><p>L/R/우퍼 예측과 같은 위치의 L+우퍼/R+우퍼 실측 비교 · PASS 후 공동 FIR 제약으로 사용 · 개별 정규화 없음</p></div><span class="status-badge {'pass' if pre_sum_pass else 'fail'}">{'PASS' if pre_sum_pass else 'FAIL'}</span></div><div class="diagnostic-grid">{pre_sum_metrics}</div>{'<p class="diagnostic-note"><b>위상 기준 미완료</b> · 합산 음압은 통과했지만 여섯 측정 공동 FIR에는 L+R+우퍼 동시 위상 PASS도 필요합니다. 3단계 위상 카드를 확인하세요.</p>' if pre_sum_phase_limited else ''}{'' if pre_sum_pass else f'<p class="failure"><b>실행할 조치</b> · {html.escape(str(pre_sum.get("action", "3단계 측정을 다시 확인하세요.")))}</p>'}</section>'''
+
+        phase_reference_html = ""
+        if phase_reference_included and positions == total:
+            phase_items = [item for item in (job.get("phase_references") or []) if isinstance(item, dict)]
+            phase_details = [item for item in (job.get("phase_details") or []) if isinstance(item, dict)]
+            phase_display_items = phase_details if phase_details else phase_items
+            phase_rows = "".join(
+                f'''<div class="{'validation-pass' if item.get('reliable') else 'validation-fail'}"><small>위치 {item.get('position', '?')} · 측정 품질</small><b>{'PASS' if item.get('reliable') else 'FAIL'} · 최소 SNR {item.get('minimum_median_snr_db', '?')} dB</b><span>반복 위상 오차 P90 {item.get('phase_repeatability_p90_deg', '?')}° / 허용 ≤45°<br>반복 파형 일치도 {item.get('period_correlation', '?')} / 허용 ≥0.65</span></div>'''
+                for item in phase_display_items
+            )
+            phase_all_pass = phase_expected_count > 0 and phase_reliable_count == phase_expected_count
+            crossover_hz = float(preferences.get("crossover_frequency_hz", 100) or 100)
+            def phase_pair_card(pair_key: str, label: str, second_minus_first: str) -> str:
+                pair = (phase_details[0].get("pairs") or {}).get(pair_key, {}) if phase_details else {}
+                frequencies = [float(value) for value in pair.get("frequency_hz", [])]
+                phases = [float(value) for value in pair.get("relative_phase_deg", [])]
+                if not frequencies or len(frequencies) != len(phases):
+                    return f'<div class="validation-fail"><small>{html.escape(label)}</small><b>계산값 없음</b><span>저장 원본을 무음 재계산하세요.</span></div>'
+                if crossover_hz <= frequencies[0]:
+                    phase_deg = phases[0]
+                elif crossover_hz >= frequencies[-1]:
+                    phase_deg = phases[-1]
+                else:
+                    upper = next(index for index, value in enumerate(frequencies) if value >= crossover_hz)
+                    lower = upper - 1
+                    fraction = (crossover_hz - frequencies[lower]) / max(1.0e-12, frequencies[upper] - frequencies[lower])
+                    phase_deg = phases[lower] * (1.0 - fraction) + phases[upper] * fraction
+                wrapped_deg = (phase_deg + 180.0) % 360.0 - 180.0
+                equivalent_ms = -wrapped_deg / (360.0 * crossover_hz) * 1000.0
+                period_ms = 1000.0 / crossover_hz
+                alternate_ms = equivalent_ms + period_ms if equivalent_ms < 0 else equivalent_ms - period_ms
+                absolute_phase = abs(wrapped_deg)
+                alignment = (
+                    "거의 같은 위상" if absolute_phase <= 30.0 else
+                    "거의 반대 위상 · 합산 시 상쇄 가능" if absolute_phase >= 150.0 else
+                    "중간 위상차 · FIR 합산 정렬 대상"
+                )
+                return (
+                    f'<div class="{"phase-complex" if absolute_phase > 30.0 else "validation-pass"}">'
+                    f'<small>{html.escape(label)} · {crossover_hz:g} Hz</small>'
+                    f'<b>{wrapped_deg:+.1f}° · {html.escape(alignment)}</b>'
+                    f'<span>한 주기 안의 시간 환산 {equivalent_ms:+.3f} ms (동일 표현 {alternate_ms:+.3f} ms)<br>{html.escape(second_minus_first)} 상대 위상 · 물리 거리로 환산하지 않음</span></div>'
+                )
+
+            phase_pair_rows = "".join((
+                phase_pair_card("left_right", "L ↔ R", "R−L"),
+                phase_pair_card("left_woofer", "L ↔ 우퍼", "W−L"),
+                phase_pair_card("right_woofer", "R ↔ 우퍼", "W−R"),
+            ))
+            phase_action = (
+                '' if phase_all_pass else
+                '<p class="failure"><b>실행할 조치</b> · 저장 원본이 있으면 아래 ‘원본 재계산’을 먼저 누르세요. 그래도 실패하면 기존 ESS 5개는 보존하고 ‘L+R+W만 재측정’을 실행하세요.</p>'
+            )
+            phase_remeasure = (
+                f'''<form method="post" action="/measurement/phase-reference" onsubmit="return confirm('기존 L/R/W/L+W/R+W ESS는 보존하고 L+R+W Walsh 위상 기준만 한 번 재생합니다. 진행할까요?')"><button class="secondary"{disabled}>L+R+W만 재측정</button></form>'''
+                if total == 1 and not phase_all_pass else ''
+            )
+            phase_reference_html = f'''<section class="pre-sum-card {'pass' if phase_all_pass else 'fail'}" data-measurement-step-content="3"><div class="section-head"><div><h4>L+R+우퍼 주파수별 상대 위상</h4><p>같은 주파수 톤을 4개 부호 조합으로 나눠 L/R/우퍼의 상대 위상을 측정합니다. 현재 crossover 주파수에서 실제 합산에 중요한 차이를 보여줍니다.</p></div><span class="status-badge {'pass' if phase_all_pass else 'fail'}">{'측정 PASS' if phase_all_pass else '측정 FAIL'}</span></div><div class="diagnostic-grid">{phase_rows}{phase_pair_rows}</div><p class="diagnostic-note"><b>측정 PASS 기준</b> · SNR, 반복 파형 일치도, 같은 톤을 반복했을 때의 위상 오차가 모두 허용 범위입니다. 이는 측정값을 FIR에 사용할 수 있다는 뜻이며, 현재 스피커 위상이 이미 잘 맞는다는 뜻은 아닙니다. FIR은 표의 광대역 단일 delay 요약값이 아니라 주파수별 상대 위상과 L+우퍼/R+우퍼 실측 합산을 사용합니다. ms는 해당 주파수 한 주기 안의 환산값이라 거리 차이가 아닙니다.</p>{phase_action}{phase_remeasure}</section>'''
 
         capture_recovery_html = ""
         if expected_capture_count:
             recovery_action = ""
-            if bool(capture_inventory.get("can_reprocess_all")) and response_count < expected_capture_count and not busy:
+            all_raw_reprocessable = bool(capture_inventory.get("can_reprocess_all")) and (
+                not phase_reference_included or bool(phase_capture_inventory.get("can_reprocess_all"))
+            )
+            needs_reprocess = response_count < expected_capture_count or phase_result_count < phase_expected_count or phase_reliable_count < phase_expected_count
+            if all_raw_reprocessable and needs_reprocess and not busy:
                 recovery_action = '''<form method="post" action="/measurement/reprocess-saved"><button class="secondary">원본 재계산</button></form>'''
-            capture_recovery_html = f'''<section class="capture-recovery" data-measurement-step-content="3"><div><small>저장 상태</small><b>녹음 {raw_capture_count}/{expected_capture_count} · 응답 {response_count}/{expected_capture_count}</b><span>‘원본 재계산’은 저장 WAV만 사용하며 소리를 재생하지 않습니다.</span></div>{recovery_action}</section>'''
+            phase_inventory_text = f" · 위상 원본 {phase_capture_inventory.get('raw_count', 0)}/{phase_expected_count} · 결과 {phase_result_count}/{phase_expected_count}" if phase_reference_included else ""
+            capture_recovery_html = f'''<section class="capture-recovery" data-measurement-step-content="3"><div><small>저장 상태</small><b>ESS 녹음 {raw_capture_count}/{expected_capture_count} · 응답 {response_count}/{expected_capture_count}{phase_inventory_text}</b><span>‘원본 재계산’은 저장 WAV만 사용하며 소리를 재생하지 않습니다.</span></div>{recovery_action}</section>'''
 
         controls = f"""
         {session_settings}
@@ -1630,8 +1751,9 @@ def measurement_panel(job: dict, preview: dict) -> str:
           {position_control}
         </div>
         {capture_recovery_html}
+        {phase_reference_html}
         {pre_sum_html}
-            <p class="muted" data-measurement-step-content="3"><b>위치당 측정 순서:</b> {html.escape(source_sequence)}. 한 위치의 {source_count}개 스윕을 DSP 재시작이나 FFT 대기 없이 먼저 연속 녹음하고, 소리가 모두 멈춘 뒤 응답을 일괄 계산합니다. 완료된 채널은 재시도할 때 다시 재생하지 않습니다.</p><p class="form-note" data-measurement-step-content="3"><b>정밀 모드 계산 원칙:</b> L/R/우퍼만 FIR 설계에 사용합니다. L+우퍼/R+우퍼는 물리 합산 일치 검증에만 한 번 사용하므로 보정·평균·정규화가 중복되지 않습니다.</p>"""
+            <p class="muted" data-measurement-step-content="3"><b>위치당 측정 순서:</b> {html.escape(source_sequence)}. 한 위치의 {acquisition_count}회 재생을 DSP 재시작이나 FFT 대기 없이 먼저 연속 녹음하고, 소리가 모두 멈춘 뒤 응답을 일괄 계산합니다. 완료된 항목은 재시도할 때 다시 재생하지 않습니다.</p><p class="form-note" data-measurement-step-content="3"><b>여섯 측정 공동 계산:</b> L/R/우퍼는 분기별 음압, L+우퍼/R+우퍼는 실제 합산 교차항, L+R+우퍼 동시 기준은 위상 부호·상대 지연을 제공합니다. 합산 응답을 개별 응답에 평균하지 않고 수학적 제약으로 사용하므로 우퍼가 두 번 반영되지 않습니다.</p>"""
 
         if positions == total:
             build_open = f'<fieldset class="build-fieldset"{" disabled" if busy else ""}>'
@@ -1654,7 +1776,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
                     for value in (60, 70, 80, 90, 100, 120)
                 ) + '</select></label>'
                 if mode == "lrw_sum":
-                    crossover_note = f'<p class="form-note"><b>기본 켜짐 · 정밀 검증:</b> 프런트 LR4 HPF와 우퍼 LR4 LPF를 32768탭 WAV에 내장합니다. 선택한 {total}위치에서 L/R/우퍼 예측이 실제 L+우퍼/R+우퍼와 일치하는지 먼저 확인하고, 최종 합산 상한을 감쇄 전용으로 보호합니다. 추가 CamillaDSP 처리 단계나 블록 지연은 없습니다.</p>'
+                    crossover_note = f'<p class="form-note"><b>기본 켜짐 · 여섯 측정 공동 합성:</b> 프런트 LR4 HPF와 우퍼 LR4 LPF를 32768탭 WAV에 내장합니다. {total}위치의 L/R/우퍼 음압, L+우퍼/R+우퍼 교차항, L+R+우퍼 상대 위상을 함께 사용해 지연·극성과 합산 감쇄를 결정합니다. 추가 CamillaDSP 처리 단계나 블록 지연은 없습니다.</p>'
                 else:
                     crossover_note = f'<p class="form-note"><b>기본 켜짐:</b> 프런트 LR4 HPF와 우퍼 LR4 LPF를 32768탭 WAV에 내장합니다. 선택한 {total}위치의 신뢰 가능한 시간 기준으로 합산 타깃과 상한을 검증합니다. L+우퍼/R+우퍼 물리 합산과 모델 일치까지 확인하려면 다음 세션에서 ‘정밀 분리+합산’을 선택하세요.</p>'
             else:
@@ -1677,13 +1799,13 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 <label>추가 고음 경사<select name="treble_tilt_db">""" + "".join(f'<option value="{value}" {"selected" if value == preferences.get("treble_tilt_db", 0) else ""}>{value:+d} dB @ 20 kHz</option>' for value in range(-6, 3)) + """</select></label>
                 <label>룸보정 하한<select name="correction_low_hz">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("correction_low_hz", 20) else ""}>{value} Hz</option>' for value in (20, 30, 40, 60, 80)) + """</select></label>
                 <label>룸보정 상한<select name="correction_high_hz">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("correction_high_hz", 20000) else ""}>{value // 1000 if value >= 1000 else value}{" kHz" if value >= 1000 else " Hz"}{" · 자연 고역 권장" if value == 5000 else " · 전대역" if value == 20000 else ""}</option>' for value in (300, 500, 1000, 5000, 20000)) + """</select></label>
-                <label>최대 룸 부스트<select name="max_boost_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("max_boost_db", 6) else ""}>+{value} dB</option>' for value in (0, 3, 6, 9)) + """</select></label>
+                <label>최대 상대 보상<select name="max_boost_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("max_boost_db", 10) else ""}>+{value} dB</option>' for value in (0, 3, 6, 9, 10)) + """<span>신뢰 가능한 가장 큰 보정점을 0 dB로 두고 L/R/우퍼 전체를 같은 양만큼 내립니다. 기본 10 dB이며 좁고 깊은 딥은 별도 보호되어 이 한도를 그대로 채우지 않습니다.</span></label>
                 <label>최대 룸 감쇄<select name="max_cut_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("max_cut_db", 18) else ""}>−{value} dB</option>' for value in (6, 9, 12, 18, 24)) + """</select></label>
                 <label>저역 위상 상한<select name="phase_cutoff">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("phase_cutoff", 200) else ""}>{value} Hz</option>' for value in (80, 120, 160, 200, 250)) + """</select></label>
                 <label>MIMO 공동제어 상한<select name="mimo_high_hz">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_high_hz", 150) else ""}>{value} Hz</option>' for value in (80, 120, 150)) + """</select></label>
                 <label>MIMO 강도<select name="mimo_strength">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_strength", "balanced") else ""}>{label}</option>' for value, label in (("safe", "Safe · 높은 안정성"), ("balanced", "Balanced · 권장"), ("maximum", "Maximum · 측정영역 우선"))) + """</select></label>
                 <label>지원 제어원 제한<select name="mimo_support_penalty_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_support_penalty_db", 6) else ""}>{value} dB</option>' for value in (3, 6, 9, 12)) + """</select></label>
-              </div><p class="muted">자연 roll-off 밖과 위치별 편차가 큰 null은 최대 boost보다 우선하여 보호됩니다. MIMO 항목은 MIMO 측정 구성에만 쓰이며 Pi4/5에서 chunksize 1024 이상으로 동작합니다.</p></details></fieldset>
+              </div><p class="muted"><b>공통 기준:</b> L/R/우퍼를 따로 0 dB로 맞추지 않습니다. 전체 FIR 묶음에서 하나의 공통 gain만 적용해 상대레벨과 crossover 합산을 보존합니다. 위치별 편차가 크거나 좁고 깊은 null은 ‘최대 상대 보상’보다 우선하여 제한됩니다. MIMO 항목은 MIMO 측정 구성에만 쓰이며 Pi4/5에서 chunksize 1024 이상으로 동작합니다.</p></details></fieldset>
             </form>
             <div class="target-preview" data-measurement-step-content="4"><b>선택 타깃 곡선 · 1 kHz 기준</b><svg id="target-graph" viewBox="0 0 760 230" role="img" aria-label="타깃 주파수 응답"></svg></div>"""
     result_html = ""
@@ -1727,6 +1849,12 @@ def measurement_panel(job: dict, preview: dict) -> str:
         )
         audit_html = f'<details class="audit-report" open><summary>보정 가능 / 한계 / 미측정 전체 분류</summary><div class="table-scroll"><table><thead><tr><th>요소</th><th>분류</th><th>상태</th><th>해석·조치</th></tr></thead><tbody>{audit_rows}</tbody></table></div></details>' if audit_rows else ""
         limits = result.get("correction_limits", {})
+        bank_normalization = result.get("filter_bank_normalization", {})
+        common_reference = result.get("common_level_reference", {})
+        common_gain_db = bank_normalization.get("applied_common_gain_db")
+        common_gain_label = f"{float(common_gain_db):+.2f} dB" if isinstance(common_gain_db, (int, float)) else "?"
+        bank_scope = str(bank_normalization.get("scope", ""))
+        common_scope_label = "L/R/우퍼 전체" if "woofer" in bank_scope or "mimo" in bank_scope else "L/R 전체"
         preference = result.get("preference", {})
         crossover = result.get("crossover", {})
         crossover_check = self_validation.get("crossover_sum", {})
@@ -1798,12 +1926,17 @@ def measurement_panel(job: dict, preview: dict) -> str:
 
         core_labels = {
             "exact_32768_taps": ("32768탭 길이", "4 · FIR 계산에서 ‘FIR 계산’을 다시 누르세요. 반복되면 5 · A/B 검토에서 ‘결과 JSON’을 내려받아 오류로 보고하세요."),
-            "finite_samples": ("FIR 유한 샘플", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘최대 룸 부스트’를 한 단계 낮추고 ‘추가 저음 취향’과 ‘추가 고음 경사’를 0 dB에 가깝게 바꾼 뒤 ‘FIR 계산’을 누르세요."),
-            "no_positive_transfer": ("0 dB 초과 전달이득 방지", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘최대 룸 부스트’를 한 단계 낮추고 ‘FIR 계산’을 누르세요."),
+            "finite_samples": ("FIR 유한 샘플", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘최대 상대 보상’을 한 단계 낮추고 ‘추가 저음 취향’과 ‘추가 고음 경사’를 0 dB에 가깝게 바꾼 뒤 ‘FIR 계산’을 누르세요."),
+            "no_positive_transfer": ("0 dB 초과 전달이득 방지", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘최대 상대 보상’을 한 단계 낮추고 ‘FIR 계산’을 누르세요."),
             "early_impulse": ("앞쪽 임펄스·낮은 지연", "4 · FIR 계산에서 ‘위상 방식’을 ‘음량만 · 최소위상’으로 바꾸고 ‘FIR 계산’을 누르세요."),
             "fir_matches_design": ("설계 응답과 실제 WAV 일치", "4 · FIR 계산에서 같은 설정으로 ‘FIR 계산’을 다시 누르세요. 계속 실패하면 정식 적용하지 말고 5 · A/B 검토에서 ‘결과 JSON’을 내려받아 진단하세요."),
             "time_alignment_safe": ("프런트/우퍼 시간 정렬 안전성", "4 · FIR 계산에서 ‘위상 방식’을 ‘음량만 · 최소위상’으로 바꾸거나 ‘크로스오버 주파수’를 한 단계 낮춘 뒤 ‘FIR 계산’을 누르세요. 정밀 측정이면 3 · 위치 측정의 ‘필터 전 합산 일치 검증’도 확인하세요."),
-            "finite": ("MIMO FIR 유한 샘플", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘MIMO 강도’를 ‘Safe · 높은 안정성’으로, ‘최대 룸 부스트’를 한 단계 낮춘 뒤 ‘FIR 계산’을 누르세요."),
+            "one_common_level_reference": ("L/R/우퍼 공통 음압 기준", "4 · FIR 계산에서 ‘FIR 계산’을 다시 누르세요. 새 계산은 L/R/우퍼를 하나의 500–2000 Hz 기준으로 평가합니다."),
+            "one_common_bank_gain": ("FIR 묶음 공통 0 dB", "4 · FIR 계산에서 ‘FIR 계산’을 다시 누르세요. 채널별 정규화가 검출된 결과는 정식 적용하지 않습니다."),
+            "relative_branch_level_preserved": ("L/R/우퍼 상대레벨 보존", "4 · FIR 계산에서 ‘FIR 계산’을 다시 누르세요. 반복되면 5 · A/B 검토에서 ‘결과 JSON’을 내려받아 보고하세요."),
+            "relative_compensation_limit": ("최대 상대 보상 한도", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘최대 상대 보상’을 한 단계 낮추거나 ‘추가 저음 취향’과 ‘추가 고음 경사’를 0 dB에 가깝게 바꾼 뒤 ‘FIR 계산’을 누르세요."),
+            "narrow_null_boost_guard": ("좁고 깊은 딥 과보정 방지", "4 · FIR 계산에서 같은 설정으로 ‘FIR 계산’을 다시 누르세요. 반복되면 ‘최대 상대 보상’을 한 단계 낮추고 스피커/청취 위치 이동을 우선하세요."),
+            "finite": ("MIMO FIR 유한 샘플", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘MIMO 강도’를 ‘Safe · 높은 안정성’으로, ‘최대 상대 보상’을 한 단계 낮춘 뒤 ‘FIR 계산’을 누르세요."),
             "correlated_input_headroom": ("MIMO 상관 입력 여유", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘MIMO 강도’를 ‘Safe · 높은 안정성’으로, ‘지원 제어원 제한’을 9 dB 또는 12 dB로 바꾼 뒤 ‘FIR 계산’을 누르세요."),
             "common_causality": ("MIMO 공통 인과 지연", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘MIMO 강도’를 ‘Safe · 높은 안정성’으로 하고 ‘MIMO 공동제어 상한’을 한 단계 낮춘 뒤 고급 설정을 접고 ‘설정으로 32768탭 FIR 생성’을 누르세요."),
             "predicted_target_and_spatial_non_regression": ("MIMO 타겟·좌석 편차 비악화", "4 · FIR 계산 > ‘고급 보정 설정’에서 먼저 ‘MIMO 강도’를 ‘Safe · 높은 안정성’으로 바꾸고, 계속 FAIL이면 ‘MIMO 공동제어 상한’을 한 단계 낮추거나 ‘지원 제어원 제한’을 한 단계 높인 뒤 고급 설정을 접고 ‘설정으로 32768탭 FIR 생성’을 누르세요. 그래도 실패하면 이 측정에서는 MIMO가 SISO보다 낫지 않으므로 1 · 연결·Cal > ‘측정 구성’에서 SISO 구성을 선택하고 ‘측정 구성 변경 적용’을 누르세요."),
@@ -1861,9 +1994,9 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 continue
             fit_detail = f"MAE {item.get('mae_db', '?')} dB / P90 {item.get('p90_abs_error_db', '?')} dB · 허용 ≤3.5 / ≤7 dB"
             if channel == "woofer":
-                fit_guide = f"4 · FIR 계산에서 결과가 높으면 ‘우퍼 최종 트림’을 더 음수로 또는 ‘우퍼 과잉 억제’를 더 강하게 선택하고 ‘FIR 계산’을 누르세요. 낮으면 T5S 물리 볼륨·극성을 확인한 뒤 3 · 위치 측정의 ‘{total}위치 처음부터 재측정’을 실행하세요. 깊은 룸 딥에는 ‘최대 룸 부스트’를 올리지 마세요."
+                fit_guide = f"4 · FIR 계산에서 결과가 높으면 ‘우퍼 최종 트림’을 더 음수로 또는 ‘우퍼 과잉 억제’를 더 강하게 선택하고 ‘FIR 계산’을 누르세요. 낮으면 T5S 물리 볼륨·극성을 확인한 뒤 3 · 위치 측정의 ‘{total}위치 처음부터 재측정’을 실행하세요. 깊은 룸 딥에는 ‘최대 상대 보상’을 올리지 마세요."
             else:
-                fit_guide = f"스피커 거리·토인·주변 반사를 확인하고 3 · 위치 측정의 ‘{total}위치 처음부터 재측정’을 실행하세요. 깊은 딥이면 스피커/청취 위치를 옮기고 4 · FIR 계산 > ‘최대 룸 부스트’를 무작정 올리지 마세요."
+                fit_guide = f"스피커 거리·토인·주변 반사를 확인하고 3 · 위치 측정의 ‘{total}위치 처음부터 재측정’을 실행하세요. 깊은 딥이면 스피커/청취 위치를 옮기고 4 · FIR 계산 > ‘최대 상대 보상’을 무작정 올리지 마세요."
             add_validation_row(channel_label, "pass" if item.get("pass") else "fail", fit_detail, fit_guide)
         if crossover_check.get("required"):
             crossover_status = str(crossover_check.get("status", ""))
@@ -1943,12 +2076,12 @@ def measurement_panel(job: dict, preview: dict) -> str:
                                 f"최악 P90 {p90} dB"
                                 + (f", 딥 약 {dip_hz} Hz" if isinstance(dip_hz, (int, float)) else "")
                                 + "입니다. ‘크로스오버 주파수’를 80 Hz 또는 120 Hz로 바꿔 각각 ‘FIR 계산’하고 PASS 결과를 비교하세요. "
-                                "둘 다 FAIL이면 ‘기준 음색 타깃’을 Flat으로 바꾸거나 T5S 위치·극성·LPF 노브를 조정하세요. ‘최대 룸 부스트’를 올려 깊은 딥을 메우지 마세요."
+                                "둘 다 FAIL이면 ‘기준 음색 타깃’을 Flat으로 바꾸거나 T5S 위치·극성·LPF 노브를 조정하세요. ‘최대 상대 보상’을 올려 깊은 딥을 메우지 마세요."
                             )
                         else:
                             direction_guide = f"합산 중앙 오차가 타깃보다 {signed_error:+.1f} dB 낮습니다. ‘우퍼 최종 트림’을 0 dB 쪽으로 되돌리고 ‘우퍼 과잉 억제’를 한 단계 약하게 하세요. 깊은 딥이면 부스트하지 말고 우퍼 위치·극성을 확인하세요."
                     else:
-                        direction_guide = "평균 레벨보다 크로스오버 부근의 굴곡·딥이 원인입니다. ‘위상 방식’을 ‘저역 음량+excess phase’로 바꾸거나 ‘크로스오버 주파수’를 한 단계 변경하세요."
+                        direction_guide = "평균 레벨보다 크로스오버 부근의 굴곡·딥이 원인입니다. ‘위상 방식’을 ‘저역 음량+위상’으로 바꾸거나 ‘크로스오버 주파수’를 한 단계 변경하세요."
                     crossover_guide = f"4 · FIR 계산에서 {direction_guide} 이어 ‘FIR 계산’을 누르세요. 정밀 모드의 ‘필터 전 합산 일치 검증’이 PASS이면 원측정은 다시 하지 않습니다."
                 add_validation_row("프런트+우퍼 전체 합산", "pass" if crossover_check.get("pass") else "fail", crossover_detail, crossover_guide)
                 if crossover_check.get("pass") and crossover.get("phase_verification_status") == "limited":
@@ -2117,7 +2250,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
           {result_path_note}
           <p><b>{html.escape(dict(target_labels).get(str(result.get('target')), str(result.get('target'))))}</b> · {html.escape(dict((('none', '추가 억제 없음'), ('primus360', 'Primus 360 수준'), ('strong', 'T5S 강한 억제'))).get(str(result.get('preset')), str(result.get('preset'))))} · {result.get('taps')}탭 · 프런트 피크 {left.get('peak_tap', '?')}탭 ({left.get('peak_delay_ms', '?')} ms)</p>
           <p><code>{html.escape(str(result.get('front_sha256', '')))}</code></p>
-          <div class="diagnostic-grid"><div><small>측정 범위</small><b>{'빠른 측정 · 1위치' if int(result.get('measurement_coverage', {}).get('positions', total)) == 1 else '표준 측정 · 3위치'}</b></div><div><small>공간 평균</small><b>{html.escape(str(result.get('spatial_mode', 'equal')))}</b></div><div><small>룸보정 범위</small><b>{limits.get('low_hz', '?')}–{limits.get('high_hz', '?')} Hz</b></div><div class="{'validation-fail' if crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if crossover_failed else '실측 대기 · ' if crossover_pending else ''}{html.escape(crossover_label)}</b></div>{phase_alignment_card}<div><small>추가 취향</small><b>저음 {preference.get('bass_db_at_20_hz', 0):+} / 고음 {preference.get('treble_db_at_20_khz', 0):+} dB</b></div><div><small>L/R 중앙값 차이</small><b>{diagnostics.get('lr_median_difference_db', '?')} dB</b></div><div><small>공간 편차 중앙값</small><b>{diagnostics.get('spatial_std_median_db', '?')} dB</b></div><div><small>측정 SNR 최소/중앙</small><b>{diagnostics.get('measurement_snr_min_db', '?')} / {diagnostics.get('measurement_snr_median_db', '?')} dB</b></div><div class="{'validation-fail' if validation_failed else ''}"><small>FIR 셀프검증</small><b>{validation_label}</b></div><div><small>우퍼 최종 트림</small><b>{result.get('woofer_trim_db', 0):+} dB</b></div><div><small>측정 시 우퍼 감쇄</small><b>{job.get('woofer_measurement_attenuation_db', -9):+} dB · 응답에서 복원됨</b></div></div>
+          <div class="diagnostic-grid"><div><small>측정 범위</small><b>{'빠른 측정 · 1위치' if int(result.get('measurement_coverage', {}).get('positions', total)) == 1 else '표준 측정 · 3위치'}</b></div><div><small>공간 평균</small><b>{html.escape(str(result.get('spatial_mode', 'equal')))}</b></div><div><small>룸보정 범위</small><b>{limits.get('low_hz', '?')}–{limits.get('high_hz', '?')} Hz</b></div><div><small>최대 상대 보상</small><b>{limits.get('max_relative_compensation_db', limits.get('max_room_boost_db', '?'))} dB</b><small>좁은 딥은 최대 3 dB로 별도 제한</small></div><div><small>공통 0 dB 기준</small><b>{common_scope_label} · 공통 gain {common_gain_label}</b><small>채널별 정규화 없음 · 상대레벨 보존</small></div><div class="{'validation-fail' if crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if crossover_failed else '실측 대기 · ' if crossover_pending else ''}{html.escape(crossover_label)}</b></div>{phase_alignment_card}<div><small>추가 취향</small><b>저음 {preference.get('bass_db_at_20_hz', 0):+} / 고음 {preference.get('treble_db_at_20_khz', 0):+} dB</b></div><div><small>L/R 중앙값 차이</small><b>{diagnostics.get('lr_median_difference_db', '?')} dB</b></div><div><small>공간 편차 중앙값</small><b>{diagnostics.get('spatial_std_median_db', '?')} dB</b></div><div><small>측정 SNR 최소/중앙</small><b>{diagnostics.get('measurement_snr_min_db', '?')} / {diagnostics.get('measurement_snr_median_db', '?')} dB</b></div><div class="{'validation-fail' if validation_failed else ''}"><small>FIR 셀프검증</small><b>{validation_label}</b></div><div><small>우퍼 최종 트림</small><b>{result.get('woofer_trim_db', 0):+} dB</b></div><div><small>측정 시 우퍼 감쇄</small><b>{job.get('woofer_measurement_attenuation_db', -9):+} dB · 응답에서 복원됨</b></div></div>
             <div class="graph-toolbar"><div><b>응답 비교</b><small>전체 대역이 기본이며 저역 확대에서 크로스오버 딥을 확인합니다.</small></div><div role="group" aria-label="그래프 주파수 범위"><button type="button" class="secondary selected" data-result-range="full" aria-pressed="true">전체</button><button type="button" class="secondary" data-result-range="bass" aria-pressed="false">저역</button></div></div>
           <svg id="measurement-result-graph" data-result-target="{html.escape(str(result.get('target', 'harman')))}" viewBox="0 0 760 250" role="img" aria-label="보정 전후 및 합산 주파수 응답"></svg>
           <p id="measurement-result-summary" class="muted" aria-live="polite"></p>
@@ -2127,7 +2260,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
           {validation_checklist_html}
           <div class="diagnostic-note"><b>추가 자동 진단 메모</b><ul>{warning_html}</ul></div>
           {audit_html}
-          <p class="muted">여기서 타깃과 적용 후 예상은 청취 위치 음압입니다. 현황/설정의 FIR 그래프는 이 목표를 만들기 위한 보정 전달함수이므로 타깃 모양과 같지 않습니다. 점선은 튜닝 전 측정, 실선은 32768탭 FIR 적용 후 예상 응답입니다.</p>
+          <p class="muted">여기서 타깃과 적용 후 예상은 청취 위치 음압입니다. 모든 곡선은 {common_reference.get('reference_band_hz', [500, 2000])[0]}–{common_reference.get('reference_band_hz', [500, 2000])[1]} Hz의 하나의 L/R/우퍼 공통 기준으로 표시·판정하며, 채널별로 다시 0 dB를 맞추지 않습니다. 현황/설정의 FIR 그래프는 이 목표를 만들기 위한 보정 전달함수이므로 타깃 모양과 같지 않습니다.</p>
           <div class="measure-actions"><a class="button" download href="/api/measurement/download/front">프런트 WAV</a>
           {('<a class="button" download href="/api/measurement/download/rear">우퍼 WAV</a>' if result.get('rear') else '')}
           {('<a class="button" download href="/api/measurement/download/all">전체 ZIP</a>' if result.get('rear') else '')}
@@ -2177,7 +2310,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
               {stale_result_notice}
               {result_path_note}
               <p><b>{topology}</b> · {result.get('taps')} taps × 8 convolution paths · 공동 제어 {mimo.get('frequency_range_hz', ['?', '?'])[0]}–{mimo.get('frequency_range_hz', ['?', '?'])[1]} Hz</p>
-        <div class="diagnostic-grid">{metric_cards}<div class="{'validation-fail' if mimo_crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if mimo_crossover_failed else '실측 대기 · ' if mimo_crossover_pending else ''}{html.escape(mimo_crossover_label)}</b><small>{html.escape(str(crossover_check.get('status', mimo_crossover.get('status', ''))))}</small></div><div><small>최악 상관입력 행 합계</small><b>{headroom.get('maximum_correlated_input_row_sum', '?')}</b><small>전체 {headroom.get('global_scale_db', '?')} dB · 우퍼 트림 실제 전달 제한</small></div><div><small>제어원 최대 코히어런스</small><b>{diversity.get('maximum_coherence', '?')}</b><small>1에 가까우면 독립성 부족</small></div><div><small>저역 기준 레벨 고정</small><b>L {target_offsets.get('left', '?')} / R {target_offsets.get('right', '?')} dB</b><small>{normalization.get('reference_band_hz', ['?', '?'])[0]}–{normalization.get('reference_band_hz', ['?', '?'])[1]} Hz 기존 SISO 기준</small></div><div><small>MIMO 해 강도</small><b>{html.escape(str(mimo.get('strength', '?')))} · 혼합 {mimo.get('solution_blend', '?')}</b><small>기존 안정 해와 공동제어 해의 혼합</small></div><div><small>메모리 계획값</small><b>실시간 {resource_budget.get('runtime_dsp_planning_mib', '?')} / 생성 {resource_budget.get('filter_generation_planning_mib', '?')} MiB</b><small>실측 부하가 아닌 보수적 상한 · CPU/XRUN은 별도 검증</small></div><div class="{'validation-fail' if mimo_validation_failed else ''}"><small>자체 검증</small><b>{mimo_validation_label}</b></div></div>
+        <div class="diagnostic-grid">{metric_cards}<div class="{'validation-fail' if mimo_crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if mimo_crossover_failed else '실측 대기 · ' if mimo_crossover_pending else ''}{html.escape(mimo_crossover_label)}</b><small>{html.escape(str(crossover_check.get('status', mimo_crossover.get('status', ''))))}</small></div><div><small>최악 상관입력 행 합계</small><b>{headroom.get('maximum_correlated_input_row_sum', '?')}</b><small>전체 {headroom.get('global_scale_db', '?')} dB · 우퍼 트림 실제 전달 제한</small></div><div><small>공통 0 dB 기준</small><b>L/R/우퍼 전체 · 공통 gain {common_gain_label}</b><small>채널별 정규화 없음 · 최대 상대 보상 {limits.get('max_relative_compensation_db', '?')} dB</small></div><div><small>제어원 최대 코히어런스</small><b>{diversity.get('maximum_coherence', '?')}</b><small>1에 가까우면 독립성 부족</small></div><div><small>저역 기준 레벨 고정</small><b>공통 {target_offsets.get('left', '?')} dB</b><small>{normalization.get('reference_band_hz', ['?', '?'])[0]}–{normalization.get('reference_band_hz', ['?', '?'])[1]} Hz · L/R 동일 기준</small></div><div><small>MIMO 해 강도</small><b>{html.escape(str(mimo.get('strength', '?')))} · 혼합 {mimo.get('solution_blend', '?')}</b><small>기존 안정 해와 공동제어 해의 혼합</small></div><div><small>메모리 계획값</small><b>실시간 {resource_budget.get('runtime_dsp_planning_mib', '?')} / 생성 {resource_budget.get('filter_generation_planning_mib', '?')} MiB</b><small>실측 부하가 아닌 보수적 상한 · CPU/XRUN은 별도 검증</small></div><div class="{'validation-fail' if mimo_validation_failed else ''}"><small>자체 검증</small><b>{mimo_validation_label}</b></div></div>
               <div class="graph-toolbar"><div><b>응답 비교</b><small>전체 대역 / 저역 확대</small></div><div role="group" aria-label="그래프 주파수 범위"><button type="button" class="secondary selected" data-result-range="full" aria-pressed="true">전체</button><button type="button" class="secondary" data-result-range="bass" aria-pressed="false">저역</button></div></div>
               <svg id="measurement-result-graph" data-result-target="{html.escape(str(result.get('target', 'harman')))}" viewBox="0 0 760 250" role="img" aria-label="MIMO 보정 예상 응답"></svg><p id="measurement-result-summary" class="muted" aria-live="polite"></p>
               {validation_checklist_html}<div class="diagnostic-note"><b>추가 자동 진단 메모</b><ul>{warning_html}</ul></div>{audit_html}
@@ -2230,7 +2363,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
     )
     return f"""
     <section class="measurement card-wide" data-job-state="{html.escape(state)}" data-job-position="{positions}" data-job-post-position="{int((job.get('post_filter_validation') or {}).get('positions_completed', 0))}" data-job-updated="{job.get('updated_unix', 0)}" data-job-result-token="{html.escape(str(job.get('result_token', 'none')))}" data-job-path-match="{path_match_token}" data-job-output="{html.escape(str(current_profile or ''))}">
-      <div class="section-head"><div><h2>UMIK-1 측정 · 32768탭 자동 보정</h2><p class="muted">선택한 청취 위치 {total}곳 · 위치당 {len(job.get('sources') or ()) if state != 'idle' else '선택 구성'} sweep · UMIK 천장 방향 90°. 재생 중 CamillaDSP direct bypass 및 U7 입력 OFF.</p></div><span class="pill">{'UMIK 연결' if job.get('umik_connected') else 'UMIK 없음'}</span></div>
+      <div class="section-head"><div><h2>UMIK-1 측정 · 32768탭 자동 보정</h2><p class="muted">선택한 청취 위치 {total}곳 · 위치당 {panel_acquisition_count if state != 'idle' else '선택 구성'}회 재생 · UMIK 천장 방향 90°. 재생 중 CamillaDSP direct bypass 및 U7 입력 OFF.</p></div><span class="pill">{'UMIK 연결' if job.get('umik_connected') else 'UMIK 없음'}</span></div>
       {error}<div class="job-status"><div class="job-status-head"><div role="status" aria-live="polite" aria-atomic="true"><b id="job-stage">{html.escape(str(job.get('stage', '대기')))}</b><span id="job-eta">{eta_text}</span></div><span id="job-live-state" class="job-live-state"><i aria-hidden="true"></i>실시간</span></div><progress id="job-progress" max="100" value="{progress:.2f}"></progress><small id="job-percent">{progress:.0f}%</small></div>
       {session_overview}
       <nav class="workflow" role="tablist" aria-label="측정·보정 6단계 탭">{workflow}</nav>
@@ -2245,7 +2378,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
       {'' if mimo_supported else f'<p class="diagnostic-note" data-measurement-step-content="1"><b>MIMO 비활성</b> · {html.escape(str(capabilities.get("reason", "플랫폼 또는 timing reference 조건 미충족")))} SISO L/R/우퍼 보정은 그대로 사용할 수 있습니다.</p>'}
       {controls}
       {result_html}{MEASUREMENT_LEVEL_SCRIPT}
-      <details data-measurement-step-content="4"><summary>알고리즘과 안전 제한</summary><p>세 위치 대표 응답에는 저역 1/12-oct, 중역 1/6-oct, 고역 1/3-oct 가변 smoothing을 사용합니다. Sweep 정합 deconvolution에 더해 pre/post-roll noise PSD로 대역별 SNR을 계산하고, 6–15 dB 신뢰도 ramp로 오염된 위치·대역의 보정과 boost를 줄입니다. 순간 생활소음은 100 ms sweep-envelope 이상치로 표시하며 원본 impulse/잔향을 잘라내지 않습니다. 위치 편차가 큰 null은 주파수별 regularization으로 boost를 축소하고, 반 옥타브 중앙값으로 추정한 스피커 자연 roll-off 밖은 boost하지 않습니다. 옥타브별 noise-compensated Schroeder EDT/T20으로 잔향을 진단하고 신뢰 가능한 300 Hz 이하 장시간 공진만 cut-only로 최대 3 dB 더 감쇄합니다. late reverb는 역보정하지 않습니다. 고역은 magnitude 위주이며 L/R은 공통 phase를 사용합니다. 저역 phase 모드는 FIR 자체 지연과 음향 도달 지연을 합산해 Front/Woofer를 정렬하고, L/R 잔차가 안전 한계를 넘으면 phase 보정을 자동 축소·해제합니다. MIMO는 제거했던 제어원별 bulk delay를 복원한 복소 응답으로 계산하고, 기존 SISO 저역 레벨을 기준으로 타깃을 고정하며 spectral continuity·기존 해 혼합·저역 late/early 비악화 검사를 적용합니다. 모든 최종 FIR의 최대 전달 이득은 0 dB 이하입니다.</p></details>
+      <details data-measurement-step-content="4"><summary>알고리즘과 안전 제한</summary><p>세 위치 대표 응답에는 저역 1/12-oct, 중역 1/6-oct, 고역 1/3-oct 가변 smoothing을 사용합니다. Sweep 정합 deconvolution에 더해 pre/post-roll noise PSD로 대역별 SNR을 계산하고, 6–15 dB 신뢰도 ramp로 오염된 위치·대역의 보정과 boost를 줄입니다. 순간 생활소음은 100 ms sweep-envelope 이상치로 표시하며 원본 impulse/잔향을 잘라내지 않습니다. 위치 편차가 큰 null은 주파수별 regularization으로 boost를 축소하고, 반 옥타브 중앙값으로 추정한 스피커 자연 roll-off 밖은 boost하지 않습니다. 정밀 모드는 L/R/우퍼 음압, L+우퍼/R+우퍼의 |S|² 교차항, L+R+우퍼 동시 신호의 위상 부호·상대 지연을 공동 사용합니다. 합산 응답은 분기에 평균하지 않으며 한쪽 분기가 지배하는 주파수에서는 불안정한 교차항의 가중치를 자동으로 낮춥니다. 옥타브별 noise-compensated Schroeder EDT/T20으로 잔향을 진단하고 신뢰 가능한 300 Hz 이하 장시간 공진만 cut-only로 최대 3 dB 더 감쇄합니다. late reverb는 역보정하지 않습니다. 고역은 magnitude 위주이며 L/R은 공통 phase를 사용합니다. 저역 phase 모드는 FIR 자체 지연과 음향 도달 지연을 합산해 Front/Woofer를 정렬하고, 합산 개선이 없으면 현재 지연·극성을 유지합니다. MIMO는 검증된 공통 timing reference가 있을 때만 활성화합니다. 모든 최종 FIR의 최대 전달 이득은 0 dB 이하입니다.</p></details>
       </div>
       <noscript><style>.measurement-tab-panels{{display:none!important}}.measurement-step-sources{{display:block!important}}</style><p class="failure">단계 탭에는 JavaScript가 필요합니다. 아래에 전체 단계를 순서대로 표시합니다.</p></noscript>
     </section>"""
@@ -2477,7 +2610,7 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
     .workflow{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:3px;margin:18px 0 0;padding:4px;border:1px solid color-mix(in srgb,var(--step-accent) 38%,var(--border));border-radius:14px 14px 0 0;background:color-mix(in srgb,var(--surface-strong) 78%,transparent)}}.flow-step{{display:flex;min-width:0;align-items:center;justify-content:center;gap:7px;min-height:48px;padding:9px 8px;border:0;border-radius:10px;color:var(--muted);background:transparent;box-shadow:none;font-size:.78rem;text-align:center;text-decoration:none}}button.flow-step{{cursor:pointer}}button.flow-step:hover{{color:var(--text);background:var(--step-soft);transform:none}}.flow-step>span{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;background:var(--border);color:var(--text);font-weight:800}}.flow-step.done{{color:var(--success)}}.flow-step.done>span{{background:var(--success-bg);color:var(--success)}}.flow-step.current:not(.selected){{box-shadow:inset 0 -3px 0 var(--step-accent)}}.flow-step.current>span{{background:var(--step-accent);color:var(--on-step)}}.flow-step.selected{{color:var(--text);background:var(--step-soft);box-shadow:inset 0 -3px 0 var(--step-accent)}}.flow-step.future{{opacity:.66}}.measurement-tab-panels{{border:1px solid color-mix(in srgb,var(--step-accent) 38%,var(--border));border-top:0;border-radius:0 0 14px 14px;background:color-mix(in srgb,var(--surface-strong) 32%,transparent);min-height:240px}}.measurement-panel{{padding:clamp(14px,2.5vw,22px);outline:none}}.measurement-panel[hidden]{{display:none}}.measurement-panel:focus-visible{{outline:3px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:-3px}}.measurement-panel-heading{{display:flex;align-items:center;gap:11px;padding-bottom:12px;border-bottom:1px solid var(--border)}}.measurement-panel-heading>span{{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--step-accent);color:var(--on-step);font-weight:900}}.measurement-panel-heading>div{{display:grid;gap:2px;min-width:0}}.measurement-panel-heading small{{color:var(--muted);line-height:1.35}}.measurement-panel-content{{min-width:0}}.measurement-panel-empty{{margin-top:14px;padding:16px;border:1px dashed var(--border);border-radius:12px;color:var(--muted);background:var(--surface-strong)}}.measurement-step-sources{{display:none}}[id^="measurement-step-"]{{scroll-margin-top:18px}}.form-note{{grid-column:1/-1;margin:0;color:var(--muted);font-size:.8rem;line-height:1.45}}.cal-card{{display:grid;gap:14px;padding:14px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent)}}.cal-head{{display:flex;gap:10px;align-items:center}}.cal-head p,.cal-card p{{margin:5px 0 0}}.cal-slots{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.cal-slot{{display:grid;grid-template-columns:1fr auto;gap:8px 12px;padding:12px;margin:0;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.cal-slot>div{{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:8px}}.cal-slot>p{{grid-column:1/-1;color:var(--muted);font-size:.82rem}}.cal-slot label{{display:grid;gap:5px;color:var(--muted);font-size:.82rem}}.cal-slot input[type=file]{{margin:0}}.pill.neutral{{background:var(--border);color:var(--muted)}}
     .flow-step.validation-error,.flow-step.validation-error.selected{{border:1px solid var(--danger);background:var(--danger-bg);color:var(--danger);box-shadow:inset 0 -3px 0 var(--danger)}}.flow-step.validation-error>span{{background:var(--danger);color:#fff}}.flow-step>em{{padding:2px 5px;border-radius:999px;background:var(--danger);color:#fff;font-size:.58rem;font-style:normal;font-weight:900;letter-spacing:.04em}}.validation-jumps{{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}}.validation-jump{{min-height:34px;padding:6px 10px;font-size:.76rem}}
     .level-result{{margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:14px}}.level-result.ok{{border-color:var(--success);background:color-mix(in srgb,var(--success-bg) 55%,transparent)}}.level-result.not-ok{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 8%,var(--surface-strong))}}.level-verdict{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}.level-verdict>b{{font-size:1.05rem}}.metric-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-top:12px}}.metric-grid>div{{display:grid;gap:3px;padding:9px;border-radius:10px;background:var(--surface-strong)}}.metric-grid small{{color:var(--muted)}}button:disabled{{cursor:not-allowed;opacity:.45;transform:none;box-shadow:none}}
-    .diagnostic-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:12px 0}}.diagnostic-grid>div{{display:grid;gap:4px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.diagnostic-grid>div.validation-fail{{border-color:var(--danger);background:var(--danger-bg);color:var(--danger);box-shadow:0 0 0 2px color-mix(in srgb,var(--danger) 12%,transparent)}}.diagnostic-grid>div.validation-fail small{{color:var(--danger)}}.diagnostic-grid small{{color:var(--muted)}}.validation-checklist{{margin:16px 0;padding:14px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent)}}.validation-checklist h4{{margin:0 0 4px;font-size:1rem}}.validation-checklist .section-head+div{{display:grid;gap:7px;margin-top:12px}}.validation-row{{display:grid;grid-template-columns:72px 1fr;gap:10px;align-items:start;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.validation-row.fail{{border-color:var(--danger);background:var(--danger-bg)}}.validation-row.pending{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-strong))}}.validation-row.na{{opacity:.82}}.validation-row>div{{display:grid;gap:3px}}.validation-row small{{color:var(--muted);line-height:1.4}}.validation-row.fail small{{color:color-mix(in srgb,var(--danger) 76%,var(--text))}}.validation-row p{{margin:5px 0 0;padding:8px;border-radius:8px;background:color-mix(in srgb,var(--surface-strong) 68%,transparent);color:var(--danger);font-size:.82rem;line-height:1.5}}.validation-row.pending p{{color:var(--warning)}}.status-badge{{display:inline-grid;place-items:center;min-height:25px;padding:4px 7px;border-radius:999px;font-size:.68rem;font-weight:950;letter-spacing:.04em}}.status-badge.pass{{background:var(--success-bg);color:var(--success)}}.status-badge.fail{{background:var(--danger);color:#fff}}.status-badge.pending{{background:var(--warning);color:#10151e}}.status-badge.na{{background:var(--border);color:var(--muted)}}.pre-sum-card{{margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:14px;background:var(--surface-strong)}}.pre-sum-card.pass{{border-color:var(--success)}}.pre-sum-card.fail{{border-color:var(--danger);background:var(--danger-bg)}}.diagnostic-note{{padding:12px;border-left:4px solid var(--accent);border-radius:8px;background:var(--accent-soft)}}.diagnostic-note ul{{margin:6px 0 0;padding-left:20px}}.target-fit{{margin:10px 0}}.decay-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}}.decay-grid>div{{display:grid;gap:5px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.decay-grid small{{color:var(--muted);font-weight:800}}.decay-grid span{{display:flex;justify-content:space-between;gap:8px;font-size:.82rem}}
+    .diagnostic-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:12px 0}}.diagnostic-grid>div{{display:grid;gap:4px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.diagnostic-grid>div.validation-fail{{border-color:var(--danger);background:var(--danger-bg);color:var(--danger);box-shadow:0 0 0 2px color-mix(in srgb,var(--danger) 12%,transparent)}}.diagnostic-grid>div.validation-fail small{{color:var(--danger)}}.diagnostic-grid>div.phase-complex{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 8%,var(--surface-strong))}}.diagnostic-grid>div.phase-complex small{{color:var(--warning)}}.diagnostic-grid small{{color:var(--muted)}}.validation-checklist{{margin:16px 0;padding:14px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent)}}.validation-checklist h4{{margin:0 0 4px;font-size:1rem}}.validation-checklist .section-head+div{{display:grid;gap:7px;margin-top:12px}}.validation-row{{display:grid;grid-template-columns:72px 1fr;gap:10px;align-items:start;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.validation-row.fail{{border-color:var(--danger);background:var(--danger-bg)}}.validation-row.pending{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-strong))}}.validation-row.na{{opacity:.82}}.validation-row>div{{display:grid;gap:3px}}.validation-row small{{color:var(--muted);line-height:1.4}}.validation-row.fail small{{color:color-mix(in srgb,var(--danger) 76%,var(--text))}}.validation-row p{{margin:5px 0 0;padding:8px;border-radius:8px;background:color-mix(in srgb,var(--surface-strong) 68%,transparent);color:var(--danger);font-size:.82rem;line-height:1.5}}.validation-row.pending p{{color:var(--warning)}}.status-badge{{display:inline-grid;place-items:center;min-height:25px;padding:4px 7px;border-radius:999px;font-size:.68rem;font-weight:950;letter-spacing:.04em}}.status-badge.pass{{background:var(--success-bg);color:var(--success)}}.status-badge.fail{{background:var(--danger);color:#fff}}.status-badge.pending{{background:var(--warning);color:#10151e}}.status-badge.na{{background:var(--border);color:var(--muted)}}.pre-sum-card{{margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:14px;background:var(--surface-strong)}}.pre-sum-card.pass{{border-color:var(--success)}}.pre-sum-card.fail{{border-color:var(--danger);background:var(--danger-bg)}}.diagnostic-note{{padding:12px;border-left:4px solid var(--accent);border-radius:8px;background:var(--accent-soft)}}.diagnostic-note ul{{margin:6px 0 0;padding-left:20px}}.target-fit{{margin:10px 0}}.decay-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}}.decay-grid>div{{display:grid;gap:5px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.decay-grid small{{color:var(--muted);font-weight:800}}.decay-grid span{{display:flex;justify-content:space-between;gap:8px;font-size:.82rem}}
     .stage-workflow{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding-top:16px;border-top:1px solid var(--border)}}.stage-step{{display:grid;grid-template-columns:30px 1fr;column-gap:8px;align-items:center;padding:10px;border:1px solid var(--border);border-radius:12px;color:var(--muted)}}.stage-step span{{grid-row:1/3;display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:var(--border);font-weight:900;color:var(--text)}}.stage-step b{{font-size:.88rem;color:var(--text)}}.stage-step small{{font-size:.72rem}}.stage-step.done span{{background:var(--success-bg);color:var(--success)}}.stage-step.current{{border-color:var(--accent);background:var(--accent-soft)}}.stage-step.current span{{background:var(--accent);color:var(--on-accent)}}.stage-summary{{display:flex;align-items:center;gap:12px;padding:14px;margin:12px 0;border-radius:13px;background:color-mix(in srgb,var(--accent-soft) 56%,var(--surface-strong));border:1px solid color-mix(in srgb,var(--accent) 45%,var(--border))}}.stage-summary>div{{flex:1}}.stage-summary p{{margin:4px 0 0;color:var(--muted);font-size:.84rem;line-height:1.45}}.staged-compare h3{{margin:18px 0 4px;font-size:1rem}}.stage-actions{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:14px;margin-top:12px;border:1px solid var(--border);border-radius:13px;background:color-mix(in srgb,var(--surface-strong) 70%,transparent)}}.stage-actions p{{margin:4px 0 0}}.stage-actions.final{{border-color:color-mix(in srgb,var(--success) 52%,var(--border));background:color-mix(in srgb,var(--success-bg) 35%,var(--surface-strong))}}
     .backup-actions{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}}.backup-actions>div,.backup-actions>form{{display:grid;align-content:start;gap:8px;padding:14px;margin:0;border:1px solid var(--border);border-radius:13px;background:var(--surface-strong)}}.backup-actions p{{margin:0;color:var(--muted);font-size:.84rem}}.backup-actions .button,.backup-actions button{{justify-self:start}}.restore-review{{margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}}
     table{{border-collapse:collapse;width:100%}}td{{padding:9px 6px;border-bottom:1px solid var(--border)}}td:first-child{{color:var(--muted);width:38%}}output,progress,table,code,.metric-grid,.diagnostic-grid{{font-variant-numeric:tabular-nums}}
@@ -2501,7 +2634,66 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
     <nav class="app-nav" aria-label="주요 화면">{nav}</nav>{notice}{failure}{status_html}{measurement_html}{settings_html}
     <script>(()=>{{const buttons=[...document.querySelectorAll('[data-theme-choice]')];const current=()=>localStorage.getItem('audiodsp-theme')||'auto';const paint=()=>buttons.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.themeChoice===current())));buttons.forEach(b=>b.addEventListener('click',()=>{{const t=b.dataset.themeChoice;if(t==='auto'){{localStorage.removeItem('audiodsp-theme');delete document.documentElement.dataset.theme;}}else{{localStorage.setItem('audiodsp-theme',t);document.documentElement.dataset.theme=t;}}paint();}}));paint();const failure=document.querySelector('.failure');if(failure)failure.focus();}})();</script>
     <script>(()=>{{/* output_volume_control */const root=document.getElementById('output-volume-control');if(!root)return;const slider=document.getElementById('output-volume-slider'),value=document.getElementById('output-volume-value'),note=document.getElementById('output-volume-status'),form=document.getElementById('output-volume-form');let timer=0,writing=false;const clamp=db=>Math.max(-60,Math.min(0,Math.round(db)));const label=db=>`${{Number(db).toFixed(Number.isInteger(Number(db))?0:1)}} dB`;const paint=v=>{{const saved=Number(v.saved_db??root.dataset.savedVolume);root.dataset.savedVolume=String(saved);const actual=v.available?Number(v.actual_db):null;if(document.activeElement!==slider)slider.value=String(actual??saved);value.textContent=label(actual??saved);if(!v.available){{note.textContent=`U7 실제 볼륨을 읽을 수 없음 · 재부팅 저장값 ${{label(saved)}}${{v.error?' · '+v.error:''}}`;note.classList.add('bad');}}else if(Math.abs(actual-saved)>.05){{note.textContent=`U7 실제 ${{label(actual)}} · 재부팅 저장값 ${{label(saved)}} · 물리 노브 변경 감지`;note.classList.remove('bad');}}else{{note.textContent=`U7 실제·저장값 ${{label(actual)}} · ${{v.channels}}채널 동일 적용`;note.classList.remove('bad');}}}};const load=async()=>{{clearTimeout(timer);if(document.hidden){{timer=setTimeout(load,3000);return;}}try{{const r=await fetch('/api/volume',{{cache:'no-store'}});if(r.ok)paint(await r.json());}}catch(_e){{}}finally{{timer=setTimeout(load,3000);}}}};const write=async db=>{{if(writing)return;writing=true;const target=clamp(db);slider.value=String(target);value.textContent=label(target);note.textContent='U7에 적용 중…';try{{const r=await fetch('/api/volume',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{db:target}})}});const body=await r.json().catch(()=>({{}}));if(!r.ok)throw Error(body.error||`HTTP ${{r.status}}`);paint(body);}}catch(e){{note.textContent='볼륨 적용 실패 · '+e.message;note.classList.add('bad');}}finally{{writing=false;}}}};slider.addEventListener('input',()=>{{value.textContent=label(Number(slider.value));}});slider.addEventListener('change',()=>write(Number(slider.value)));form.addEventListener('submit',e=>{{e.preventDefault();write(Number(slider.value));}});root.querySelectorAll('[data-volume-step]').forEach(b=>b.addEventListener('click',()=>write(Number(slider.value)+Number(b.dataset.volumeStep))));root.querySelectorAll('[data-volume]').forEach(b=>b.addEventListener('click',()=>write(Number(b.dataset.volume))));document.addEventListener('visibilitychange',()=>{{if(!document.hidden)load();}});load();}})();</script>
-    <script>(()=>{{/* live_u7_status_poll */const initial={{physical:document.body.dataset.physical,requested:document.body.dataset.requested,effective:document.body.dataset.effective}},labels={{speaker:'스피커 출력',headphone:'헤드폰 잭'}};let timer=0,busy=false,reloading=false;const badge=(card,on)=>{{card.classList.toggle('active-profile',on);let b=card.querySelector('.active-badge');if(on&&!b){{b=document.createElement('span');b.className='active-badge';b.textContent='U7 현재 출력';card.querySelector('.profile-title').append(b);}}else if(!on&&b)b.remove();}};const paint=s=>{{const q=s.u7_selector||{{}};const physical=q.stale?'':(q.profile||''),physicalLabel=labels[physical]||'감지 대기';const physicalNode=document.getElementById('u7-physical');if(physicalNode)physicalNode.textContent=physicalLabel;const flowNode=document.getElementById('u7-flow-output');if(flowNode)flowNode.textContent=physicalLabel;document.querySelectorAll('.selector-node,.output-node').forEach(n=>{{n.classList.toggle('is-active',!!physical);n.classList.toggle('is-waiting',!physical);}});document.querySelectorAll('.card[data-profile]').forEach(c=>badge(c,c.dataset.profile===physical));const requested=s.settings.requested_profile;const effective=s.resolved.effective_profile;const requestedNode=document.getElementById('dsp-requested');const effectiveNode=document.getElementById('dsp-effective');if(requestedNode)requestedNode.textContent=labels[requested]||requested;if(effectiveNode)effectiveNode.textContent=(labels[effective]||effective)+(requested!==effective?' (대체 사용)':'');if(!reloading&&(requested!==initial.requested||effective!==initial.effective)){{reloading=true;setTimeout(()=>location.reload(),180);}}}};const poll=async()=>{{clearTimeout(timer);if(document.hidden){{timer=setTimeout(poll,3000);return;}}if(busy)return;busy=true;try{{const r=await fetch('/api/status',{{cache:'no-store'}});if(r.ok)paint(await r.json());}}catch(_e){{}}finally{{busy=false;timer=setTimeout(poll,1500);}}}};document.addEventListener('visibilitychange',()=>{{if(!document.hidden)poll();}});timer=setTimeout(poll,500);}})();</script>
+    <script>(()=>{{/* live_u7_status_poll */
+      const initial={{
+        physical:document.body.dataset.physical,
+        requested:document.body.dataset.requested,
+        effective:document.body.dataset.effective
+      }};
+      const labels={{speaker:'스피커 출력',headphone:'헤드폰 잭'}};
+      let timer=0,busy=false,reloading=false;
+      const badge=(card,on)=>{{
+        card.classList.toggle('active-profile',on);
+        let node=card.querySelector('.active-badge');
+        if(on&&!node){{
+          node=document.createElement('span');
+          node.className='active-badge';
+          node.textContent='U7 현재 출력';
+          card.querySelector('.profile-title').append(node);
+        }}else if(!on&&node) node.remove();
+      }};
+      const paint=status=>{{
+        const selector=status.u7_selector||{{}};
+        const physical=selector.stale?'':(selector.profile||'');
+        const stateByte=!selector.stale&&selector.state_byte?String(selector.state_byte):'';
+        const physicalLabel=labels[physical]||(stateByte?`미확인 (${{stateByte}})`:'감지 대기');
+        const physicalNode=document.getElementById('u7-physical');
+        if(physicalNode) physicalNode.textContent=physicalLabel;
+        const flowNode=document.getElementById('u7-flow-output');
+        if(flowNode) flowNode.textContent=physicalLabel;
+        document.querySelectorAll('.selector-node,.output-node').forEach(node=>{{
+          node.classList.toggle('is-active',!!physical);
+          node.classList.toggle('is-waiting',!physical);
+        }});
+        document.querySelectorAll('.card[data-profile]').forEach(card=>badge(card,card.dataset.profile===physical));
+        const requested=status.settings.requested_profile;
+        const effective=status.resolved.effective_profile;
+        const requestedNode=document.getElementById('dsp-requested');
+        const effectiveNode=document.getElementById('dsp-effective');
+        if(requestedNode) requestedNode.textContent=labels[requested]||requested;
+        if(effectiveNode) effectiveNode.textContent=(labels[effective]||effective)+(requested!==effective?' (대체 사용)':'');
+        if(!reloading&&(requested!==initial.requested||effective!==initial.effective)){{
+          reloading=true;
+          setTimeout(()=>location.reload(),180);
+        }}
+      }};
+      const poll=async()=>{{
+        clearTimeout(timer);
+        if(document.hidden){{timer=setTimeout(poll,3000);return;}}
+        if(busy)return;
+        busy=true;
+        try{{
+          const response=await fetch('/api/status',{{cache:'no-store'}});
+          if(response.ok)paint(await response.json());
+        }}catch(_error){{
+        }}finally{{
+          busy=false;
+          timer=setTimeout(poll,1500);
+        }}
+      }};
+      document.addEventListener('visibilitychange',()=>{{if(!document.hidden)poll();}});
+      timer=setTimeout(poll,500);
+    }})();</script>
     <script>(()=>{{/* measurement_ui */
 const panel=document.querySelector('.measurement');
 if(!panel)return;
@@ -2637,6 +2829,11 @@ const poll=async()=>{{
       const terminalChanged=!busy&&Number(j.updated_unix||0)>initial.updated&&String(j.state)!==initial.state&&['ready','measured','built','error'].includes(String(j.state));
       if(!reloading&&(jobDone||posAdv||postAdv||resultChanged||measurementPathChanged||terminalChanged)){{
         reloading=true;
+        const completedPositions=Number(j.positions_completed||0);
+        const totalPositions=Number(j.positions_total||0);
+        if(posAdv&&completedPositions>0&&completedPositions<totalPositions){{
+          window.alert(`위치 ${{completedPositions}} 측정이 완료되었습니다.\n\n마이크를 청취점 근처의 다음 위치 ${{completedPositions+1}}로 옮기고, 천장 방향 90°를 유지하세요.\n\n확인을 누르면 다음 위치 준비 화면으로 이동합니다. 소리는 자동으로 시작되지 않습니다.`);
+        }}
         paintLive('결과 반영 중','refreshing');
         const url=new URL(location.href);url.searchParams.set('updated',String(j.updated_unix||Date.now()));
         setTimeout(()=>location.replace(url),150);
@@ -3150,6 +3347,10 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/measurement/restart-positions":
                 measurement("restart-positions")
                 self.redirect("기존 위치 측정 이후 결과를 초기화하고 위치 1부터 재측정을 시작했습니다.", "/measure")
+                return
+            if parsed.path == "/measurement/phase-reference":
+                measurement("start-phase-reference")
+                self.redirect("기존 ESS 5개는 보존하고 L+R+우퍼 Walsh 위상 기준만 재측정합니다.", "/measure")
                 return
             if parsed.path == "/measurement/reprocess-saved":
                 measurement("start-reprocess-saved")
