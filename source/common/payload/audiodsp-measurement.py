@@ -13,7 +13,10 @@ import math
 import os
 from pathlib import Path
 import platform
+import random
+import re
 import shutil
+import signal
 import statistics
 import struct
 import subprocess
@@ -49,6 +52,7 @@ APLAY = environment("APLAY", "/usr/bin/aplay")
 ARECORD = environment("ARECORD", "/usr/bin/arecord")
 SYSTEMCTL = environment("SYSTEMCTL", "/usr/bin/systemctl")
 AMIXER = environment("AMIXER", "/usr/bin/amixer")
+U7_MIXER = environment("U7_MIXER", "hw:U7")
 CAMILLA = environment("CAMILLA", "/usr/local/bin/camilladsp")
 CAMILLA_CONFIG = Path(environment("CAMILLA_CONFIG", "/etc/camilladsp/camilladsp.yml"))
 CAPTURE_DEVICE = environment("UMIK_DEVICE", "hw:CARD=UMIK1,DEV=0")
@@ -59,10 +63,15 @@ OUTPUT_PROFILE_LABELS = {
     "speaker": "U7 Speaker output · speaker chain",
     "headphone": "U7 Headphone jack · speaker chain",
 }
+MEASUREMENT_OUTPUT_GAIN_DB = 0.0
 DEFAULT_NOISE_LEVEL_DBFS = -42
 DEFAULT_SWEEP_LEVEL_DBFS = -42
 DEFAULT_WOOFER_MEASUREMENT_ATTENUATION_DB = -9
-RESULT_ALGORITHM_REVISION = "2026-08-19-prebuild-sum-gate-v7"
+MINIMUM_USABLE_SNR_DB = 6.0
+RECOMMENDED_SNR_DB = 15.0
+PREFLIGHT_TARGET_SNR_DB = MINIMUM_USABLE_SNR_DB
+RESULT_ALGORITHM_REVISION = "2026-08-20-source-band-sweep-simultaneous-phase-v13"
+PHASE_CLOCK_SHARED = environment("AUDIODSP_PHASE_CLOCK_SHARED", "0") == "1"
 WOOFER_MEASUREMENT_ATTENUATION_DB = float(environment(
     "WOOFER_MEASUREMENT_ATTENUATION_DB",
     str(DEFAULT_WOOFER_MEASUREMENT_ATTENUATION_DB),
@@ -70,6 +79,12 @@ WOOFER_MEASUREMENT_ATTENUATION_DB = float(environment(
 if not -18.0 <= WOOFER_MEASUREMENT_ATTENUATION_DB <= 0.0:
     raise RuntimeError("WOOFER_MEASUREMENT_ATTENUATION_DB must be between -18 and 0 dB")
 WOOFER_MEASUREMENT_SCALE = 10.0 ** (WOOFER_MEASUREMENT_ATTENUATION_DB / 20.0)
+PHASE_REFERENCE_BLOCK = 32_768
+PHASE_REFERENCE_PERIODS = 6
+PHASE_REFERENCE_ANALYSIS_PERIODS = 4
+PHASE_REFERENCE_HEADROOM_DB = 6.0
+PHASE_REFERENCE_MIN_CORRELATION = 0.65
+PHASE_REFERENCE_MAX_PHASE_P90_DEG = 45.0
 ALLOWED_NOISE_LEVELS = tuple(range(-54, -5))
 ALLOWED_SWEEP_LEVELS = tuple(range(-54, 1))
 ALLOWED_WOOFER_MEASUREMENT_ATTENUATIONS = tuple(range(-18, 1))
@@ -91,11 +106,12 @@ SOURCES = {
     "mimo_dual_sub": ("front_left", "front_right", "sub_left", "sub_right"),
 }
 SOURCE_LABELS = {
-    "left": "Front L (Woofer muted)",
-    "right": "Front R (Woofer muted)",
-    "woofer": "Woofer only",
-    "left_woofer": "L + Woofer",
-    "right_woofer": "R + Woofer",
+    "left": "프런트 L (우퍼 음소거)",
+    "right": "프런트 R (우퍼 음소거)",
+    "woofer": "우퍼 단독",
+    "left_woofer": "L + 우퍼",
+    "right_woofer": "R + 우퍼",
+    "phase_reference": "L/R/우퍼 동시 위상 기준",
     "front_left": "Front L actuator",
     "front_right": "Front R actuator",
     "sub_pair": "T5S single-sub actuator",
@@ -119,7 +135,7 @@ CROSSOVER_FREQUENCIES = (60, 70, 80, 90, 100, 120)
 MAX_PHASE_SHIFT = 2048
 MAX_PLAUSIBLE_BULK_DELAY_SAMPLES = RATE // 4
 DEFAULT_CORRECTION_PREFERENCES = {
-    "target": "harman",
+    "target": "flat",
     # Baseline must mean exactly the selected acoustic target. Optional bass
     # suppression and trim are explicit deltas applied only after that baseline.
     "preset": "none",
@@ -183,6 +199,11 @@ def measurement_worker_alive(value: dict[str, Any]) -> bool:
         return time.time() < float(value.get("worker_launch_pending_until", 0.0))
     try:
         os.kill(pid, 0)
+    except PermissionError:
+        # A non-root maintenance/status command cannot signal a root-owned
+        # web worker even with signal 0. EPERM proves that the PID exists; the
+        # /proc command-line check below still verifies that it is ours.
+        pass
     except (OSError, ValueError):
         return False
     command_line = Path(f"/proc/{pid}/cmdline")
@@ -218,6 +239,117 @@ def recover_interrupted_worker(value: dict[str, Any]) -> dict[str, Any]:
     return recovered
 
 
+def normalize_level_check(
+    level_check: dict[str, Any],
+    configured_sweep_level_dbfs: int | None = None,
+    expected_sources: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Apply the current quick-sweep contract to new and saved sessions.
+
+    New level checks measure every selected output using the same routing,
+    band and estimator as the full measurement.  Therefore PASS uses the
+    same 6 dB usable floor; 15 dB remains a quality recommendation, not a
+    second blocking threshold.
+    """
+    result = dict(level_check)
+    measured_snr = float(result.get("snr_db", -300.0))
+    measured_peak = float(result.get("peak_dbfs", -300.0))
+    checked_level = int(result.get(
+        "requested_level_dbfs",
+        configured_sweep_level_dbfs if configured_sweep_level_dbfs is not None else DEFAULT_SWEEP_LEVEL_DBFS,
+    ))
+    configured_level = checked_level if configured_sweep_level_dbfs is None else int(configured_sweep_level_dbfs)
+
+    # Schema-1 level checks could use the white-noise slider for the quick
+    # sweep. Project that capture to the configured full-sweep level so a
+    # stale PASS cannot unlock measurement at a quieter level.
+    level_delta = configured_level - checked_level
+    assessment_snr = measured_snr + level_delta
+    assessment_peak = measured_peak + level_delta
+    channels = result.get("channels") if isinstance(result.get("channels"), list) else []
+    measured_sources = {str(item.get("source")) for item in channels if isinstance(item, dict)}
+    expected = {str(source) for source in (expected_sources or ())}
+    coverage_ok = not expected or measured_sources == expected
+    if not coverage_ok:
+        ok = False
+        verdict = "FAIL · 이전 빠른 검사는 현재 측정 구성의 모든 출력을 확인하지 않았습니다. 빠른 검사를 다시 실행하세요."
+    elif assessment_peak >= -1.0:
+        ok = False
+        verdict = "FAIL · 입력 클리핑 위험 · 스윕 출력을 낮추고 다시 검사하세요."
+    elif assessment_snr < PREFLIGHT_TARGET_SNR_DB:
+        ok = False
+        verdict = (
+            f"FAIL · 빠른 스윕 최저 SNR {assessment_snr:.1f} dB · "
+            f"본 측정과 같은 사용 가능 하한 {PREFLIGHT_TARGET_SNR_DB:.0f} dB에 미달합니다."
+        )
+    else:
+        ok = True
+        verdict = (
+            f"PASS · 빠른 스윕 최저 {assessment_snr:.1f} dB · 권장 {RECOMMENDED_SNR_DB:.0f} dB 이상"
+            if assessment_snr >= RECOMMENDED_SNR_DB else
+            f"PASS · 빠른 스윕 최저 {assessment_snr:.1f} dB · 사용 가능, 권장 {RECOMMENDED_SNR_DB:.0f} dB 미만"
+        )
+
+    result.update({
+        "required_snr_db": PREFLIGHT_TARGET_SNR_DB,
+        "minimum_measurement_snr_db": MINIMUM_USABLE_SNR_DB,
+        "recommended_measurement_snr_db": RECOMMENDED_SNR_DB,
+        "preflight_target_snr_db": PREFLIGHT_TARGET_SNR_DB,
+        "preflight_safety_margin_db": 0.0,
+        "assessment_snr_db": round(assessment_snr, 2),
+        "assessment_peak_dbfs": round(assessment_peak, 2),
+        "coverage_ok": coverage_ok,
+        "measured_sources": sorted(measured_sources),
+        "expected_sources": sorted(expected),
+        "quality_recommended": coverage_ok and assessment_peak < -1.0 and assessment_snr >= RECOMMENDED_SNR_DB,
+        "ok": ok,
+        "verdict": verdict,
+    })
+
+    if configured_sweep_level_dbfs is not None:
+        required_raise = max(0, int(math.ceil(PREFLIGHT_TARGET_SNR_DB - assessment_snr)))
+        quality_raise = max(0, int(math.ceil(RECOMMENDED_SNR_DB - assessment_snr)))
+        safe_raise = max(0, int(math.floor(-6.0 - assessment_peak)))
+        applied_raise = min(required_raise, safe_raise)
+        if not coverage_ok:
+            recommended_level = configured_level
+            action = "2 · 출력 설정과 빠른 검사에서 현재 측정 구성의 모든 출력 조합을 다시 검사하세요."
+        elif assessment_peak >= -1.0:
+            recommended_level = max(-54, min(0, configured_level + int(math.floor(-6.0 - assessment_peak))))
+            action = f"2 · 레벨 확인에서 스윕 출력을 {configured_level} → {recommended_level} dBFS로 낮추고 다시 검사하세요."
+        elif required_raise:
+            recommended_level = max(-54, min(0, configured_level + applied_raise))
+            if applied_raise >= required_raise:
+                action = (
+                    f"2 · 레벨 확인에서 스윕 출력을 {configured_level} → {recommended_level} dBFS "
+                    f"(+{applied_raise} dB)로 올리고 빠른 스윕을 다시 실행하세요."
+                )
+            else:
+                action = (
+                    f"입력 여유를 고려한 스윕 안전 상한은 {recommended_level} dBFS(+{applied_raise} dB)입니다. "
+                    f"그래도 {PREFLIGHT_TARGET_SNR_DB:.0f} dB가 안 되면 주변 소음을 줄이거나 마이크/기기 레벨을 확인하세요."
+                )
+        elif quality_raise:
+            optional_raise = min(quality_raise, safe_raise)
+            optional_level = max(-54, min(0, configured_level + optional_raise))
+            recommended_level = optional_level
+            action = (
+                f"PASS · 현재 {configured_level} dBFS로 본 측정 가능. 권장 {RECOMMENDED_SNR_DB:.0f} dB 품질이 필요하면 "
+                f"{optional_level} dBFS(+{optional_raise} dB)까지 단계적으로 올릴 수 있습니다."
+            )
+        else:
+            recommended_level = configured_level
+            action = f"현재 스윕 출력 {configured_level} dBFS를 유지하세요."
+        result.update({
+            "recommended_sweep_level_dbfs": recommended_level,
+            "recommended_raise_db": max(0, recommended_level - configured_level),
+            "required_raise_db": required_raise,
+            "quality_raise_db": quality_raise,
+            "level_action": action,
+        })
+    return result
+
+
 def load_current() -> dict[str, Any]:
     if not CURRENT.is_file():
         selector = output_selector_status()
@@ -232,7 +364,9 @@ def load_current() -> dict[str, Any]:
             "capabilities": platform_capabilities(),
             "output_selector": selector,
             "measurement_profile": None,
+            "measurement_acquisition_revision": None,
             "measurement_output_match": None,
+            "measurement_sweep_output": {"active": False, "hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB},
             "session_note": "",
         }
     try:
@@ -245,6 +379,15 @@ def load_current() -> dict[str, Any]:
     value.setdefault("woofer_measurement_attenuation_db", int(WOOFER_MEASUREMENT_ATTENUATION_DB))
     value.setdefault("measurement_profile", None)
     value.setdefault("measurement_output", None)
+    value.setdefault("measurement_acquisition_revision", None)
+    value.setdefault("measurement_sweep_output", {"active": False, "hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB})
+    level_check = value.get("level_check")
+    if isinstance(level_check, dict) and isinstance(level_check.get("snr_db"), (int, float)):
+        value["level_check"] = normalize_level_check(
+            level_check,
+            int(value.get("level_dbfs", DEFAULT_SWEEP_LEVEL_DBFS)),
+            list(value.get("sources", ())),
+        )
     session_directory = Path(str(value.get("session_dir", "")))
     note_path = session_directory / "session-note.txt"
     if value.get("session_dir") and note_path.is_file():
@@ -266,6 +409,47 @@ def load_current() -> dict[str, Any]:
         None if measured_profile not in OUTPUT_PROFILE_LABELS
         else bool(not selector.get("stale") and selector.get("profile") == measured_profile)
     )
+    if session_directory.is_dir():
+        level_sources = list(value.get("sources", []))
+        level_files = [
+            {
+                "source": source,
+                "sweep": f"level_check_{source}_sweep.wav",
+                "recorded": f"level_check_{source}_recorded.wav",
+            }
+            for source in level_sources
+            if (session_directory / f"level_check_{source}_sweep.wav").is_file()
+            and (session_directory / f"level_check_{source}_recorded.wav").is_file()
+        ]
+        value["level_recording_inventory"] = {
+            "expected": len(level_sources),
+            "complete_count": len(level_files),
+            "files": level_files,
+            "can_reprocess_all": bool(level_sources) and len(level_files) == len(level_sources),
+        }
+        expected = [
+            (position, source)
+            for position in range(1, session_position_count(value) + 1)
+            for source in value.get("sources", [])
+        ]
+        raw = [
+            {"position": position, "source": source, "file": f"p{position}_{source}_recorded.wav"}
+            for position, source in expected
+            if (session_directory / f"p{position}_{source}_recorded.wav").is_file()
+        ]
+        responses = [
+            {"position": position, "source": source, "file": f"p{position}_{source}_response.json"}
+            for position, source in expected
+            if (session_directory / f"p{position}_{source}_response.json").is_file()
+        ]
+        value["capture_inventory"] = {
+            "expected": len(expected),
+            "raw_count": len(raw),
+            "response_count": len(responses),
+            "raw": raw,
+            "responses": responses,
+            "can_reprocess_all": bool(expected) and len(raw) == len(expected),
+        }
     return value
 
 
@@ -335,7 +519,7 @@ def session_position_count(state: dict[str, Any]) -> int:
     """Return the explicit acoustic coverage selected for this session."""
     count = int(state.get("positions_total", POSITIONS))
     if count not in ALLOWED_POSITION_COUNTS:
-        raise MeasurementError("측정 위치 수는 Fast 1위치 또는 Standard 3위치여야 합니다.")
+        raise MeasurementError("측정 위치 수는 빠른 측정 1위치 또는 표준 측정 3위치여야 합니다.")
     return count
 
 
@@ -391,6 +575,17 @@ def session_integrity(state: dict[str, Any], directory: Path) -> dict[str, Any]:
             for source in expected_sources:
                 if (position, str(source)) not in completed:
                     missing.append(f"p{position}_{source}_response.json")
+        if state.get("phase_reference_acquisition_revision") == "simultaneous-multisine-v1":
+            references = {
+                int(item.get("position", 0)): item
+                for item in state.get("phase_references", [])
+                if isinstance(item, dict)
+            }
+            for position in range(1, positions + 1):
+                item = references.get(position, {})
+                result_name = str(item.get("result", ""))
+                if not result_name or Path(result_name).name != result_name or not (directory / result_name).is_file():
+                    missing.append(f"p{position}_phase_reference.json")
     result = state.get("result")
     if result:
         if not isinstance(result, dict):
@@ -406,6 +601,7 @@ def session_integrity(state: dict[str, Any], directory: Path) -> dict[str, Any]:
         "positions_completed": positions,
         "positions_total": positions_total,
         "measurement_count": len(measurements),
+        "phase_reference_count": len(state.get("phase_references", [])),
         "has_result": bool(result),
         "has_level_check": bool(state.get("level_check")),
     }
@@ -606,6 +802,7 @@ def bind_measurement_output(state: dict[str, Any]) -> dict[str, Any]:
     if state.get("mode") in MIMO_MODES and profile != "speaker":
         raise MeasurementError("MIMO 4채널 측정은 U7 Speaker output에서만 시작할 수 있습니다.")
     state["measurement_profile"] = profile
+    state["measurement_acquisition_revision"] = "u7-pcm-unity-v1"
     state["measurement_output"] = {
         "profile": profile,
         "label": OUTPUT_PROFILE_LABELS[profile],
@@ -613,6 +810,9 @@ def bind_measurement_output(state: dict[str, Any]) -> dict[str, Any]:
         "source": selector.get("source"),
         "boot_id": selector.get("boot_id"),
         "bound_unix": time.time(),
+        "sweep_hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB,
+        "listening_volume_ignored_during_sweep": True,
+        "safety_order": ["input_off", "u7_pcm_unity", "sweep", "restore_volume", "input_on"],
     }
     state["output_selector"] = selector
     state["measurement_output_match"] = True
@@ -647,6 +847,200 @@ def ensure_post_preview_output_path(state: dict[str, Any]) -> dict[str, Any]:
     return selector
 
 
+def read_u7_pcm_output_volume() -> dict[str, Any]:
+    """Read the exact U7 PCM attenuation used after generated sweep samples."""
+    try:
+        process = subprocess.run(
+            [AMIXER, "-D", U7_MIXER, "cget", "numid=6"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MeasurementError(f"U7 출력 볼륨을 읽을 수 없습니다: {exc}") from exc
+    if process.returncode:
+        raise MeasurementError(process.stdout.strip() or "U7 출력 볼륨 읽기에 실패했습니다.")
+    metadata = re.search(r"values=(\d+),min=(-?\d+),max=(-?\d+)", process.stdout)
+    values_line = re.search(r"(?m)^\s*:\s*values=([0-9, -]+)\s*$", process.stdout)
+    if metadata is None or values_line is None:
+        raise MeasurementError("U7 PCM 출력 볼륨 응답 형식을 확인할 수 없습니다.")
+    channel_count, raw_min, raw_max = (int(value) for value in metadata.groups())
+    raw_values = [int(value.strip()) for value in values_line.group(1).split(",") if value.strip()]
+    if channel_count <= 0 or len(raw_values) != channel_count or raw_max <= raw_min:
+        raise MeasurementError("U7 PCM 출력 채널 수 또는 볼륨 범위가 잘못되었습니다.")
+    if any(value < raw_min or value > raw_max for value in raw_values):
+        raise MeasurementError("U7 PCM 출력 볼륨이 하드웨어 범위를 벗어났습니다.")
+    db_metadata = re.search(r"dBminmax-min=(-?\d+),max=(-?\d+)", process.stdout)
+    if db_metadata:
+        hardware_min_db, hardware_max_db = (int(value) / 100.0 for value in db_metadata.groups())
+    else:
+        hardware_min_db, hardware_max_db = float(raw_min - raw_max), 0.0
+    scale = (hardware_max_db - hardware_min_db) / (raw_max - raw_min)
+    channel_db = [hardware_min_db + (value - raw_min) * scale for value in raw_values]
+    return {
+        "mixer": U7_MIXER,
+        "control": "PCM,0 / numid=6",
+        "channels": channel_count,
+        "raw_min": raw_min,
+        "raw_max": raw_max,
+        "raw_values": raw_values,
+        "uniform": len(set(raw_values)) == 1,
+        "channel_db": [round(value, 3) for value in channel_db],
+        "actual_db": round(sum(channel_db) / len(channel_db), 3),
+        "hardware_min_db": hardware_min_db,
+        "hardware_max_db": hardware_max_db,
+    }
+
+
+def set_u7_pcm_output_raw(raw: int) -> dict[str, Any]:
+    """Set every U7 playback channel to one validated raw hardware value."""
+    current = read_u7_pcm_output_volume()
+    if raw < int(current["raw_min"]) or raw > int(current["raw_max"]):
+        raise MeasurementError("복원할 U7 출력 볼륨이 하드웨어 범위를 벗어났습니다.")
+    try:
+        process = subprocess.run(
+            [AMIXER, "-D", U7_MIXER, "set", "PCM,0", str(raw)],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MeasurementError(f"U7 출력 볼륨을 적용할 수 없습니다: {exc}") from exc
+    if process.returncode:
+        raise MeasurementError(process.stdout.strip() or "U7 출력 볼륨 적용에 실패했습니다.")
+    applied = read_u7_pcm_output_volume()
+    if not applied["uniform"] or any(int(value) != raw for value in applied["raw_values"]):
+        raise MeasurementError("U7 전체 출력 채널에 같은 볼륨이 적용되지 않았습니다.")
+    return applied
+
+
+def _set_u7_capture(name: str, enabled: bool) -> None:
+    """Apply the U7 capture switch and fail instead of advancing out of order."""
+    action = "cap" if enabled else "nocap"
+    try:
+        process = subprocess.run(
+            [AMIXER, "-D", U7_MIXER, "set", name, action],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MeasurementError(f"U7 {name} 입력 {'복구' if enabled else '차단'} 실패: {exc}") from exc
+    if process.returncode:
+        raise MeasurementError(
+            process.stdout.strip() or f"U7 {name} 입력 {'복구' if enabled else '차단'}에 실패했습니다."
+        )
+
+
+def _camilla_service_active() -> bool:
+    return subprocess.run(
+        [SYSTEMCTL, "is-active", "--quiet", "camilladsp.service"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def _start_camilla_service() -> None:
+    subprocess.run([SYSTEMCTL, "start", "camilladsp.service"], check=True, timeout=25)
+    if not _camilla_service_active():
+        raise MeasurementError("CamillaDSP 입력 경로를 다시 시작하지 못했습니다. U7 볼륨은 복원된 상태입니다.")
+
+
+def begin_measurement_audio_window(*, require_camilla: bool = False) -> dict[str, Any]:
+    """Disconnect normal input first, then force sweep playback to hardware 0 dB.
+
+    The order is deliberately transactional.  A sweep dBFS value is therefore
+    the level presented to the U7 DAC, independent of the saved listening
+    volume.  Normal input is never reconnected until the original PCM volume
+    has been restored and read back successfully.
+    """
+    window: dict[str, Any] = {
+        "camilla_was_active": _camilla_service_active(),
+        "input_disconnected": False,
+        "volume_snapshot": None,
+        "unity_applied": False,
+    }
+    if require_camilla and not window["camilla_was_active"]:
+        raise MeasurementError("CamillaDSP가 실행 중이 아닙니다. Preview를 다시 적용하세요.")
+    try:
+        if window["camilla_was_active"]:
+            subprocess.run([SYSTEMCTL, "stop", "camilladsp.service"], check=True, timeout=20)
+            if _camilla_service_active():
+                raise MeasurementError("CamillaDSP 입력 경로가 완전히 정지하지 않아 측정음을 재생하지 않습니다.")
+            time.sleep(0.75)
+        _set_u7_capture("Mic", False)
+        _set_u7_capture("Line", False)
+        window["input_disconnected"] = True
+        snapshot = read_u7_pcm_output_volume()
+        if not snapshot["uniform"]:
+            raise MeasurementError("U7 출력 채널 볼륨이 서로 다릅니다. 현황의 출력 볼륨을 한 번 적용한 뒤 다시 시도하세요.")
+        window["volume_snapshot"] = snapshot
+        unity = set_u7_pcm_output_raw(int(snapshot["raw_max"]))
+        if abs(float(unity["actual_db"]) - MEASUREMENT_OUTPUT_GAIN_DB) > 0.05:
+            raise MeasurementError(f"U7 측정 출력 기준이 0 dB가 아닙니다: {unity['actual_db']:.2f} dB")
+        window["unity_applied"] = True
+        window["unity"] = unity
+        return window
+    except Exception:
+        snapshot = window.get("volume_snapshot")
+        volume_safe = snapshot is None
+        if isinstance(snapshot, dict) and snapshot.get("raw_values"):
+            try:
+                set_u7_pcm_output_raw(int(snapshot["raw_values"][0]))
+                volume_safe = True
+            except Exception:
+                volume_safe = False
+        if volume_safe:
+            try:
+                if window["camilla_was_active"]:
+                    _start_camilla_service()
+                elif window["input_disconnected"]:
+                    _set_u7_capture("Line", True)
+            except Exception:
+                pass
+        raise
+
+
+def ensure_measurement_audio_window(window: dict[str, Any]) -> dict[str, Any]:
+    """Continuously enforce input-off and hardware-unity during sweep playback."""
+    ensure_measurement_output_path()
+    if _camilla_service_active():
+        raise MeasurementError("측정 중 CamillaDSP 입력 경로가 다시 켜져 안전을 위해 재생을 중단했습니다.")
+    current = read_u7_pcm_output_volume()
+    if not current["uniform"] or any(int(value) != int(current["raw_max"]) for value in current["raw_values"]):
+        raise MeasurementError("측정 중 U7 출력 볼륨이 0 dB에서 변경되어 재생을 중단했습니다. 원래 볼륨은 자동 복원됩니다.")
+    if not window.get("input_disconnected") or not window.get("unity_applied"):
+        raise MeasurementError("측정 오디오 안전 순서가 성립하지 않아 재생을 중단했습니다.")
+    return current
+
+
+def restore_measurement_audio_window(window: dict[str, Any] | None) -> None:
+    """Restore PCM first and reconnect normal input only after read-back PASS."""
+    if window is None:
+        return
+    snapshot = window.get("volume_snapshot")
+    if not isinstance(snapshot, dict) or not snapshot.get("raw_values"):
+        raise MeasurementError("원래 U7 볼륨 기록이 없어 입력을 다시 연결하지 않습니다.")
+    original_raw = int(snapshot["raw_values"][0])
+    restored = set_u7_pcm_output_raw(original_raw)
+    if not restored["uniform"] or any(int(value) != original_raw for value in restored["raw_values"]):
+        raise MeasurementError("원래 U7 볼륨 복원 확인에 실패하여 입력을 다시 연결하지 않습니다.")
+    window["volume_restored"] = True
+    window["restored"] = restored
+    if window.get("camilla_was_active"):
+        _start_camilla_service()
+    else:
+        _set_u7_capture("Line", True)
+    window["input_restored"] = True
+
+
 def platform_capabilities() -> dict[str, Any]:
     override = environment("PLATFORM_CLASS", "").strip().lower()
     if override:
@@ -661,9 +1055,20 @@ def platform_capabilities() -> dict[str, Any]:
             kind = "pi4plus"
         else:
             kind = "development"
+    mimo_compute_supported = kind in ("pi4plus", "development", "test")
+    mimo_supported = mimo_compute_supported and PHASE_CLOCK_SHARED
+    if not mimo_compute_supported:
+        mimo_reason = "Raspberry Pi 4/5 64-bit 전용입니다."
+    elif not PHASE_CLOCK_SHARED:
+        mimo_reason = "U7 출력과 UMIK-1 입력의 공통 timing reference가 없어 복소 MIMO 생성을 안전하게 차단했습니다."
+    else:
+        mimo_reason = "사용 가능"
     return {
         "platform_class": kind,
-        "mimo_supported": kind in ("pi4plus", "development", "test"),
+        "mimo_compute_supported": mimo_compute_supported,
+        "phase_clock_shared": PHASE_CLOCK_SHARED,
+        "mimo_supported": mimo_supported,
+        "reason": mimo_reason,
         "mimo_runtime_paths": 8,
         "mimo_minimum": "Raspberry Pi 4 / 64-bit AudioDSP",
         "offline_estimates_seconds": {
@@ -730,7 +1135,7 @@ def install_calibration(source: Path, orientation: str) -> dict[str, Any]:
     state = load_current()
     affects_session = state.get("state") != "idle" and state.get("orientation") == orientation
     if affects_session and state.get("state") in ("running", "processing", "cancelling"):
-        raise MeasurementError("측정 작업 중에는 현재 session이 사용하는 calibration을 바꿀 수 없습니다.")
+        raise MeasurementError("측정 작업 중에는 현재 세션이 사용하는 마이크 보정 파일을 바꿀 수 없습니다.")
     CAL_DIR.mkdir(parents=True, exist_ok=True)
     target = CAL_DIR / ("7200660_90deg.txt" if orientation == "90" else "7200660.txt")
     temporary = target.with_name(f".{target.name}.{os.getpid()}")
@@ -938,25 +1343,25 @@ def pack_pcm24(value: float) -> bytes:
     return bytes((integer & 255, (integer >> 8) & 255, (integer >> 16) & 255))
 
 
-def write_sweep(
-    path: Path,
-    source: str,
+def generate_sweep_mono(
     level_dbfs: int,
     seconds: int,
     *,
     level_check: bool = False,
-    woofer_attenuation_db: float | None = None,
-) -> list[float]:
+    low_hz: float | None = None,
+    high_hz: float | None = None,
+) -> tuple[list[float], int]:
+    """Generate deterministic mono logarithmic sine sweep samples."""
     lead_seconds = 0.35
     tail_seconds = 1.0 if level_check else 2.0
     sweep_seconds = float(seconds)
     frames = round((lead_seconds + sweep_seconds + tail_seconds) * RATE)
     amplitude = 10.0 ** (level_dbfs / 20.0)
-    woofer_db = WOOFER_MEASUREMENT_ATTENUATION_DB if woofer_attenuation_db is None else float(woofer_attenuation_db)
-    if not -18.0 <= woofer_db <= 0.0:
-        raise MeasurementError("우퍼 측정 상대레벨은 -18~0 dB여야 합니다.")
-    woofer_scale = 10.0 ** (woofer_db / 20.0)
-    f1, f2 = (40.0, 2_000.0) if level_check else (15.0, 22_000.0)
+    default_band = (40.0, 2_000.0) if level_check else (15.0, 22_000.0)
+    f1 = default_band[0] if low_hz is None else float(low_hz)
+    f2 = default_band[1] if high_hz is None else float(high_hz)
+    if not 5.0 <= f1 < f2 <= RATE * 0.48:
+        raise MeasurementError(f"Sweep 대역이 잘못되었습니다: {f1:g}~{f2:g} Hz")
     ratio_log = math.log(f2 / f1)
     scale = 2.0 * math.pi * f1 * sweep_seconds / ratio_log
     fade = max(1, round(0.03 * RATE))
@@ -971,6 +1376,60 @@ def write_sweep(
         if index >= sweep_frames - fade:
             envelope *= 0.5 - 0.5 * math.cos(math.pi * (sweep_frames - 1 - index) / fade)
         mono[lead + index] = amplitude * envelope * math.sin(scale * (math.exp(t * ratio_log / sweep_seconds) - 1.0))
+    return mono, frames
+
+
+def reference_sweep_for_source(
+    source: str,
+    level_dbfs: int,
+    seconds: int,
+    *,
+    woofer_attenuation_db: float | None = None,
+) -> list[float]:
+    """Build the deconvolution reference without touching a saved WAV."""
+    low_hz, high_hz = sweep_band_for_source(source)
+    mono, _ = generate_sweep_mono(level_dbfs, seconds, low_hz=low_hz, high_hz=high_hz)
+    if source not in SUBWOOFER_ONLY_SOURCES:
+        return mono
+    woofer_db = WOOFER_MEASUREMENT_ATTENUATION_DB if woofer_attenuation_db is None else float(woofer_attenuation_db)
+    if not -18.0 <= woofer_db <= 0.0:
+        raise MeasurementError("우퍼 측정 감쇄는 -18~0 dB여야 합니다.")
+    scale = 10.0 ** (woofer_db / 20.0)
+    return [value * scale for value in mono]
+
+
+def sweep_band_for_source(source: str) -> tuple[float, float]:
+    """Avoid spending sweep energy where a routed actuator cannot reproduce it."""
+    if source in SUBWOOFER_ONLY_SOURCES:
+        return 15.0, 320.0
+    if source in ("left", "right", "front_left", "front_right", "front_both"):
+        return 30.0, 22_000.0
+    # Physical L+Woofer/R+Woofer sums must cover both branches.
+    return 15.0, 22_000.0
+
+
+def write_sweep(
+    path: Path,
+    source: str,
+    level_dbfs: int,
+    seconds: int,
+    *,
+    level_check: bool = False,
+    woofer_attenuation_db: float | None = None,
+) -> list[float]:
+    """Write a deterministic logarithmic sweep to one physical channel in 4ch S24_3LE."""
+    low_hz, high_hz = sweep_band_for_source(source)
+    mono, frames = generate_sweep_mono(
+        level_dbfs,
+        seconds,
+        level_check=level_check,
+        low_hz=low_hz,
+        high_hz=high_hz,
+    )
+    woofer_db = WOOFER_MEASUREMENT_ATTENUATION_DB if woofer_attenuation_db is None else float(woofer_attenuation_db)
+    if not -18.0 <= woofer_db <= 0.0:
+        raise MeasurementError("우퍼 측정 상대레벨은 -18~0 dB여야 합니다.")
+    woofer_scale = 10.0 ** (woofer_db / 20.0)
     data_bytes = frames * 4 * 3
     with path.open("wb") as handle:
         handle.write(b"RIFF" + struct.pack("<I", 36 + data_bytes) + b"WAVE")
@@ -984,10 +1443,6 @@ def write_sweep(
             elif source in ("right", "front_right"):
                 frame = zero + pack_pcm24(value) + zero + zero
             elif source in ("woofer", "sub_pair"):
-                # The T5S receives both Rear channels through a stereo cable. Each
-                # side carries half the mono sweep, and the pair is attenuated for
-                # night-safe measurement. The returned reference is scaled by the
-                # same amount so deconvolution remains level-correct.
                 rear = pack_pcm24(value * 0.5 * woofer_scale)
                 frame = zero + zero + rear + rear
             elif source == "sub_left":
@@ -1014,19 +1469,384 @@ def write_sweep(
     return mono
 
 
+def phase_reference_bins() -> dict[str, list[int]]:
+    """Build sparse, non-harmonic, disjoint bins for one simultaneous L/R/W capture."""
+    assigned: dict[str, list[int]] = {"left": [], "right": [], "woofer": []}
+    used: set[int] = set()
+
+    def add_grid(low_hz: float, high_hz: float, divisions_per_octave: int, rotation: tuple[str, ...]) -> None:
+        index = 0
+        frequency = low_hz
+        while frequency <= high_hz * 1.000001:
+            source = rotation[index % len(rotation)]
+            ideal = frequency * PHASE_REFERENCE_BLOCK / RATE
+            candidates = sorted(
+                range(max(2, round(ideal) - 5), min(PHASE_REFERENCE_BLOCK // 2 - 1, round(ideal) + 5) + 1),
+                key=lambda item: (abs(item - ideal), item),
+            )
+            chosen = next((item for item in candidates if all(abs(item - other) >= 2 for other in used)), None)
+            if chosen is not None:
+                assigned[source].append(chosen)
+                used.add(chosen)
+            index += 1
+            frequency = low_hz * (2.0 ** (index / divisions_per_octave))
+
+    # Woofer-only low bins, three-way interleaving in the crossover region,
+    # then alternating Front bins high enough to identify L/R delay robustly.
+    add_grid(20.0, 44.0, 4, ("woofer",))
+    add_grid(45.0, 250.0, 12, ("woofer", "left", "right"))
+    add_grid(260.0, 800.0, 8, ("left", "right"))
+    for values in assigned.values():
+        values.sort()
+    return assigned
+
+
+def synthesize_low_crest_multisine(
+    bins: list[int],
+    peak_dbfs: float,
+    seed: int,
+    fft: FFTBackend,
+) -> tuple[list[float], list[complex], float]:
+    """Choose deterministic random phases with the lowest peak/RMS ratio."""
+    if not bins:
+        raise MeasurementError("위상 기준 tone bin이 비어 있습니다.")
+    best: tuple[float, list[float], list[complex]] | None = None
+    for trial in range(12):
+        generator = random.Random(seed + trial * 1_000_003)
+        spectrum = [0j] * (PHASE_REFERENCE_BLOCK // 2 + 1)
+        for bin_index in bins:
+            phase = generator.uniform(-math.pi, math.pi)
+            spectrum[bin_index] = 0.5 * PHASE_REFERENCE_BLOCK * complex(math.cos(phase), math.sin(phase))
+        samples = fft.irfft(spectrum, PHASE_REFERENCE_BLOCK)
+        peak = max(abs(value) for value in samples)
+        rms = math.sqrt(sum(value * value for value in samples) / len(samples))
+        crest = peak / max(rms, 1.0e-15)
+        if best is None or crest < best[0]:
+            best = (crest, samples, spectrum)
+    assert best is not None
+    target_peak = 10.0 ** (float(peak_dbfs) / 20.0)
+    scale = target_peak / max(max(abs(value) for value in best[1]), 1.0e-15)
+    scaled_samples = [value * scale for value in best[1]]
+    scaled_spectrum = [value * scale for value in best[2]]
+    return scaled_samples, scaled_spectrum, best[0]
+
+
+def write_phase_reference(
+    path: Path,
+    level_dbfs: int,
+    woofer_attenuation_db: float,
+) -> dict[str, Any]:
+    """Write one quiet periodic 4-channel signal that identifies L/R/W together."""
+    if not -18.0 <= float(woofer_attenuation_db) <= 0.0:
+        raise MeasurementError("우퍼 측정 감쇄는 -18~0 dB여야 합니다.")
+    bins = phase_reference_bins()
+    fft = FFTBackend()
+    try:
+        source_levels = {
+            "left": float(level_dbfs) - PHASE_REFERENCE_HEADROOM_DB,
+            "right": float(level_dbfs) - PHASE_REFERENCE_HEADROOM_DB,
+            "woofer": float(level_dbfs) - PHASE_REFERENCE_HEADROOM_DB + float(woofer_attenuation_db),
+        }
+        generated = {}
+        for source, seed in (("left", 0x4C4654), ("right", 0x524748), ("woofer", 0x574652)):
+            samples, spectrum, crest = synthesize_low_crest_multisine(
+                bins[source], source_levels[source], seed, fft,
+            )
+            generated[source] = {"samples": samples, "spectrum": spectrum, "crest": crest}
+    finally:
+        fft.close()
+
+    lead_frames = round(0.35 * RATE)
+    tail_frames = round(0.75 * RATE)
+    active_frames = PHASE_REFERENCE_BLOCK * PHASE_REFERENCE_PERIODS
+    frames = lead_frames + active_frames + tail_frames
+    data_bytes = frames * 4 * 3
+    zero = b"\x00\x00\x00"
+    fade_frames = round(0.08 * RATE)
+    with path.open("wb") as handle:
+        handle.write(b"RIFF" + struct.pack("<I", 36 + data_bytes) + b"WAVE")
+        handle.write(b"fmt " + struct.pack("<IHHIIHH", 16, 1, 4, RATE, RATE * 12, 12, 24))
+        handle.write(b"data" + struct.pack("<I", data_bytes))
+        buffer = bytearray()
+        for frame_index in range(frames):
+            active_index = frame_index - lead_frames
+            if not 0 <= active_index < active_frames:
+                frame = zero * 4
+            else:
+                period = active_index // PHASE_REFERENCE_BLOCK
+                index = active_index % PHASE_REFERENCE_BLOCK
+                envelope = 1.0
+                if period == 0 and index < fade_frames:
+                    envelope = 0.5 - 0.5 * math.cos(math.pi * index / max(1, fade_frames))
+                elif period == PHASE_REFERENCE_PERIODS - 1 and index >= PHASE_REFERENCE_BLOCK - fade_frames:
+                    remaining = PHASE_REFERENCE_BLOCK - 1 - index
+                    envelope = 0.5 - 0.5 * math.cos(math.pi * remaining / max(1, fade_frames))
+                left = generated["left"]["samples"][index] * envelope
+                right = generated["right"]["samples"][index] * envelope
+                woofer_half = generated["woofer"]["samples"][index] * 0.5 * envelope
+                frame = pack_pcm24(left) + pack_pcm24(right) + pack_pcm24(woofer_half) + pack_pcm24(woofer_half)
+            buffer.extend(frame)
+            if len(buffer) >= 1024 * 1024:
+                handle.write(buffer)
+                buffer.clear()
+        if buffer:
+            handle.write(buffer)
+
+    return {
+        "version": 1,
+        "method": "simultaneous sparse disjoint-bin periodic multisine",
+        "sample_rate": RATE,
+        "block_samples": PHASE_REFERENCE_BLOCK,
+        "periods": PHASE_REFERENCE_PERIODS,
+        "analysis_periods": PHASE_REFERENCE_ANALYSIS_PERIODS,
+        "lead_frames": lead_frames,
+        "tail_frames": tail_frames,
+        "configured_sweep_level_dbfs": int(level_dbfs),
+        "phase_reference_headroom_db": PHASE_REFERENCE_HEADROOM_DB,
+        "woofer_measurement_attenuation_db": float(woofer_attenuation_db),
+        "source_levels_dbfs": source_levels,
+        "tone_policy": "sparse quarter-octave-equivalent coverage; exact octave/harmonic stacking avoided",
+        "sources": {
+            source: {
+                "crest_factor": round(float(generated[source]["crest"]), 5),
+                "bins": [
+                    {
+                        "bin": bin_index,
+                        "frequency_hz": round(bin_index * RATE / PHASE_REFERENCE_BLOCK, 6),
+                        "real": float(generated[source]["spectrum"][bin_index].real),
+                        "imag": float(generated[source]["spectrum"][bin_index].imag),
+                    }
+                    for bin_index in bins[source]
+                ],
+            }
+            for source in ("left", "right", "woofer")
+        },
+    }
+
+
+def linear_resample_period(values: list[float], output_length: int) -> list[float]:
+    if len(values) == output_length:
+        return list(values)
+    if len(values) < 2 or output_length < 2:
+        raise MeasurementError("위상 기준 반복 구간이 너무 짧습니다.")
+    scale = (len(values) - 1) / (output_length - 1)
+    result = []
+    for index in range(output_length):
+        position = index * scale
+        lower = min(len(values) - 2, int(position))
+        fraction = position - lower
+        result.append(values[lower] * (1.0 - fraction) + values[lower + 1] * fraction)
+    return result
+
+
+def interpolate_linear(frequencies: list[float], values: list[float], frequency: float) -> float:
+    if frequency <= frequencies[0]:
+        return values[0]
+    if frequency >= frequencies[-1]:
+        return values[-1]
+    lower = 0
+    upper = len(frequencies) - 1
+    while upper - lower > 1:
+        middle = (lower + upper) // 2
+        if frequencies[middle] <= frequency:
+            lower = middle
+        else:
+            upper = middle
+    fraction = (frequency - frequencies[lower]) / max(1.0e-15, frequencies[upper] - frequencies[lower])
+    return values[lower] * (1.0 - fraction) + values[upper] * fraction
+
+
+def analyze_phase_reference_samples(
+    samples: list[float],
+    metadata: dict[str, Any],
+    cal: dict[str, Any],
+    fft: FFTBackend,
+) -> dict[str, Any]:
+    """Recover relative L/R/W phase from one continuous UMIK recording."""
+    block = int(metadata.get("block_samples", PHASE_REFERENCE_BLOCK))
+    analysis_periods = int(metadata.get("analysis_periods", PHASE_REFERENCE_ANALYSIS_PERIODS))
+    start = round(1.0 * RATE)
+    if len(samples) < start + (analysis_periods + 1) * (block + 8):
+        raise MeasurementError("L/R/우퍼 위상 기준 녹음 길이가 부족합니다.")
+    # The U7 playback and UMIK capture clocks are independent. Estimate the
+    # recorded period, then resample each period to the nominal FFT size.
+    correlations: list[tuple[float, int]] = []
+    compare_length = min(block * 2, len(samples) - start - block - 8)
+    stride = 8
+    for lag in range(block - 8, block + 9):
+        first = samples[start:start + compare_length:stride]
+        second = samples[start + lag:start + lag + compare_length:stride]
+        count = min(len(first), len(second))
+        if count < 100:
+            continue
+        first = first[:count]
+        second = second[:count]
+        first_mean = sum(first) / count
+        second_mean = sum(second) / count
+        numerator = sum((a - first_mean) * (b - second_mean) for a, b in zip(first, second))
+        first_power = sum((value - first_mean) ** 2 for value in first)
+        second_power = sum((value - second_mean) ** 2 for value in second)
+        correlation = numerator / max(math.sqrt(first_power * second_power), 1.0e-30)
+        correlations.append((correlation, lag))
+    if not correlations:
+        raise MeasurementError("위상 기준 반복 주기를 찾을 수 없습니다.")
+    period_correlation, recorded_period = max(correlations)
+    spectra = []
+    for period_index in range(analysis_periods):
+        period_start = start + period_index * recorded_period
+        values = samples[period_start:period_start + recorded_period]
+        if len(values) != recorded_period:
+            raise MeasurementError("위상 기준 반복 구간이 중간에 끊겼습니다.")
+        spectra.append(fft.rfft(linear_resample_period(values, block), block))
+    average_spectrum = [sum(values) / len(values) for values in zip(*spectra)]
+    used_bins = {
+        int(item["bin"])
+        for source in metadata["sources"].values()
+        for item in source["bins"]
+    }
+    cal_f, cal_db = cal["frequencies"], cal["corrections"]
+    source_results: dict[str, Any] = {}
+    all_phase_errors = []
+    for source in ("left", "right", "woofer"):
+        frequencies, levels, phases, snrs, phase_errors = [], [], [], [], []
+        for item in metadata["sources"][source]["bins"]:
+            bin_index = int(item["bin"])
+            reference = complex(float(item["real"]), float(item["imag"]))
+            transfers = [spectrum[bin_index] / reference for spectrum in spectra]
+            transfer = sum(transfers) / len(transfers)
+            frequency = bin_index * RATE / block
+            frequencies.append(frequency)
+            levels.append(
+                20.0 * math.log10(max(abs(transfer), 1.0e-15))
+                + interpolate_log(cal_f, cal_db, frequency)
+            )
+            phases.append(math.atan2(transfer.imag, transfer.real))
+            local_noise = [
+                abs(average_spectrum[candidate])
+                for offset in (-6, -5, -4, 4, 5, 6)
+                for candidate in (bin_index + offset,)
+                if 1 <= candidate < len(average_spectrum) and candidate not in used_bins
+            ]
+            noise = statistics.median(local_noise) if local_noise else 1.0e-15
+            snrs.append(20.0 * math.log10(max(abs(average_spectrum[bin_index]), 1.0e-15) / max(noise, 1.0e-15)))
+            for value in transfers:
+                difference = math.atan2(value.imag, value.real) - math.atan2(transfer.imag, transfer.real)
+                phase_errors.append(abs(math.degrees(math.atan2(math.sin(difference), math.cos(difference)))))
+        phases = unwrap(phases)
+        source_snr = statistics.median(snrs) if snrs else float("-inf")
+        phase_p90 = percentile(phase_errors, 0.90)
+        all_phase_errors.extend(phase_errors)
+        source_results[source] = {
+            "frequencies": [round(value, 6) for value in frequencies],
+            "db": [round(value, 5) for value in levels],
+            "phase_rad": [round(value, 9) for value in phases],
+            "median_snr_db": round(source_snr, 3),
+            "phase_repeatability_p90_deg": round(phase_p90, 3),
+            "tone_count": len(frequencies),
+        }
+
+    pair_results = {}
+    for key, first_name, second_name, low_hz, high_hz in (
+        ("left_right", "left", "right", 70.0, 650.0),
+        ("left_woofer", "left", "woofer", 50.0, 220.0),
+        ("right_woofer", "right", "woofer", 50.0, 220.0),
+    ):
+        first = source_results[first_name]
+        second = source_results[second_name]
+        low = max(low_hz, first["frequencies"][0], second["frequencies"][0])
+        high = min(high_hz, first["frequencies"][-1], second["frequencies"][-1])
+        count = 28
+        frequencies = [low * ((high / low) ** (index / (count - 1))) for index in range(count)]
+        phase_difference = [
+            interpolate_linear(second["frequencies"], second["phase_rad"], frequency)
+            - interpolate_linear(first["frequencies"], first["phase_rad"], frequency)
+            for frequency in frequencies
+        ]
+        phase_difference = unwrap(phase_difference)
+        slopes = []
+        for left_index in range(len(frequencies)):
+            for right_index in range(left_index + 1, len(frequencies)):
+                if frequencies[right_index] - frequencies[left_index] >= max(20.0, 0.15 * low):
+                    slopes.append(
+                        (phase_difference[right_index] - phase_difference[left_index])
+                        / (frequencies[right_index] - frequencies[left_index])
+                    )
+        slope = statistics.median(slopes) if slopes else 0.0
+        delay_samples = -slope * RATE / (2.0 * math.pi)
+        intercepts = [phase + 2.0 * math.pi * frequency * delay_samples / RATE for frequency, phase in zip(frequencies, phase_difference)]
+        center = statistics.median(intercepts)
+        residuals = [
+            abs(math.degrees(math.atan2(math.sin(value - center), math.cos(value - center))))
+            for value in intercepts
+        ]
+        pair_results[key] = {
+            "first": first_name,
+            "second": second_name,
+            "frequency_hz": [round(value, 4) for value in frequencies],
+            "relative_phase_deg": [round(math.degrees(value), 4) for value in phase_difference],
+            "second_minus_first_delay_samples": round(delay_samples, 4),
+            "second_minus_first_delay_ms": round(delay_samples * 1000.0 / RATE, 5),
+            "delay_fit_residual_p90_deg": round(percentile(residuals, 0.90), 3),
+            "polarity_hint": "inverted" if math.cos(center) < -0.5 else "normal" if math.cos(center) > 0.5 else "ambiguous",
+        }
+
+    minimum_snr = min(float(value["median_snr_db"]) for value in source_results.values())
+    phase_p90 = percentile(all_phase_errors, 0.90)
+    reliable = (
+        period_correlation >= PHASE_REFERENCE_MIN_CORRELATION
+        and minimum_snr >= MINIMUM_USABLE_SNR_DB
+        and phase_p90 <= PHASE_REFERENCE_MAX_PHASE_P90_DEG
+    )
+    return {
+        "version": 1,
+        "method": metadata["method"],
+        "reliable": reliable,
+        "recommended": reliable and minimum_snr >= RECOMMENDED_SNR_DB and phase_p90 <= 20.0,
+        "recorded_period_samples": recorded_period,
+        "sample_clock_offset_ppm": round((recorded_period / block - 1.0) * 1_000_000.0, 3),
+        "period_correlation": round(period_correlation, 6),
+        "minimum_median_snr_db": round(minimum_snr, 3),
+        "phase_repeatability_p90_deg": round(phase_p90, 3),
+        "thresholds": {
+            "minimum_period_correlation": PHASE_REFERENCE_MIN_CORRELATION,
+            "minimum_snr_db": MINIMUM_USABLE_SNR_DB,
+            "maximum_phase_repeatability_p90_deg": PHASE_REFERENCE_MAX_PHASE_P90_DEG,
+        },
+        "sources": source_results,
+        "pairs": pair_results,
+        "timing_scope": "relative L/R/W timing inside this recording; not a shared absolute U7/UMIK clock",
+        "normalization_applied": False,
+    }
+
+
+def phase_reference_from_recording(recorded: Path, metadata: dict[str, Any], cal: dict[str, Any]) -> dict[str, Any]:
+    _, bits, samples = read_pcm_wav(recorded)
+    peak = max(abs(value) for value in samples)
+    if peak >= 0.988:
+        raise MeasurementError("L/R/우퍼 위상 기준 녹음이 클리핑되었습니다. 측정 출력을 낮추세요.")
+    fft = FFTBackend()
+    try:
+        result = analyze_phase_reference_samples(samples, metadata, cal, fft)
+    finally:
+        fft.close()
+    result["capture_bits"] = bits
+    result["peak_dbfs"] = round(20.0 * math.log10(max(peak, 1.0e-15)), 3)
+    return result
+
+
 def write_filtered_stereo_sweep(path: Path, side: str, level_dbfs: int, seconds: int) -> list[float]:
-    """Write a stereo input sweep that must travel through the active FIR graph."""
+    """Write a stereo input sweep that must travel through the active FIR graph directly in 2ch."""
     if side not in ("left", "right"):
         raise MeasurementError("사후 합산 검증 채널이 잘못되었습니다.")
-    reference = write_sweep(path, "left", level_dbfs, seconds)
-    data_bytes = len(reference) * 2 * 3
+    mono, _ = generate_sweep_mono(level_dbfs, seconds)
+    data_bytes = len(mono) * 2 * 3
     zero = b"\x00\x00\x00"
     with path.open("wb") as handle:
         handle.write(b"RIFF" + struct.pack("<I", 36 + data_bytes) + b"WAVE")
         handle.write(b"fmt " + struct.pack("<IHHIIHH", 16, 1, 2, RATE, RATE * 6, 6, 24))
         handle.write(b"data" + struct.pack("<I", data_bytes))
         buffer = bytearray()
-        for value in reference:
+        for value in mono:
             payload = pack_pcm24(value)
             buffer.extend(payload + zero if side == "left" else zero + payload)
             if len(buffer) >= 1024 * 1024:
@@ -1034,8 +1854,7 @@ def write_filtered_stereo_sweep(path: Path, side: str, level_dbfs: int, seconds:
                 buffer.clear()
         if buffer:
             handle.write(buffer)
-    return reference
-
+    return mono
 
 def filtered_file_config(input_path: Path) -> str:
     """Derive a finite-file capture config from the exact current Preview graph."""
@@ -1059,12 +1878,12 @@ def filtered_file_config(input_path: Path) -> str:
     return config.replace("__PLAYBACK_DEVICE__", "audiodsp_dsp").replace("__CAPTURE_DEVICE__", "unused_file_capture")
 
 
-def write_white_noise(path: Path, level_dbfs: int, seconds: int = 5) -> None:
-    """Write deterministic full-band white noise to Front L/R in 4ch S24_3LE."""
-    frames = seconds * RATE
-    amplitude = 10.0 ** (level_dbfs / 20.0) * 0.70710678
-    fade = round(0.05 * RATE)
-    state = 0x7200660
+def write_quick_sweep(path: Path, level_dbfs: int, seconds: float = 2.0, low_hz: float = 40.0, high_hz: float = 12000.0) -> None:
+    """Write a comfortable 2.0 s log sine sweep (40 Hz ~ 12 kHz) to Front L/R in 4ch S24_3LE."""
+    frames = round(seconds * RATE)
+    amplitude = 10.0 ** (level_dbfs / 20.0)
+    fade = round(0.04 * RATE)
+    log_ratio = math.log(high_hz / low_hz)
     data_bytes = frames * 4 * 3
     with path.open("wb") as handle:
         handle.write(b"RIFF" + struct.pack("<I", 36 + data_bytes) + b"WAVE")
@@ -1073,21 +1892,25 @@ def write_white_noise(path: Path, level_dbfs: int, seconds: int = 5) -> None:
         buffer = bytearray()
         zero = b"\x00\x00\x00"
         for index in range(frames):
-            state ^= (state << 13) & 0xFFFFFFFF
-            state ^= state >> 17
-            state ^= (state << 5) & 0xFFFFFFFF
-            value = amplitude * (2.0 * (state & 0xFFFFFFFF) / 0xFFFFFFFF - 1.0)
+            t = index / RATE
+            phase = 2.0 * math.pi * low_hz * seconds / log_ratio * (math.exp(t / seconds * log_ratio) - 1.0)
+            sample = amplitude * math.sin(phase)
             if index < fade:
-                value *= 0.5 - 0.5 * math.cos(math.pi * index / fade)
+                sample *= 0.5 - 0.5 * math.cos(math.pi * index / fade)
             elif index >= frames - fade:
-                value *= 0.5 - 0.5 * math.cos(math.pi * (frames - 1 - index) / fade)
-            payload = pack_pcm24(value)
+                sample *= 0.5 - 0.5 * math.cos(math.pi * (frames - 1 - index) / fade)
+            payload = pack_pcm24(sample)
             buffer.extend(payload + payload + zero + zero)
             if len(buffer) >= 1024 * 1024:
                 handle.write(buffer)
                 buffer.clear()
         if buffer:
             handle.write(buffer)
+
+
+def write_white_noise(path: Path, level_dbfs: int, seconds: int = 5) -> None:
+    """Compatibility alias: redirects to write_quick_sweep for comfortable level checks."""
+    write_quick_sweep(path, level_dbfs, seconds=2.0)
 
 
 def read_pcm_wav(path: Path) -> tuple[int, int, list[float]]:
@@ -1133,26 +1956,29 @@ def run_direct_capture_batch(
     if not captures:
         return
     ensure_measurement_output_path()
-    camilla_was_active = subprocess.run([SYSTEMCTL, "is-active", "--quiet", "camilladsp.service"], check=False).returncode == 0
     with AUDIO_LOCK.open("w") as audio_handle:
         fcntl.flock(audio_handle, fcntl.LOCK_EX)
         active_processes: list[subprocess.Popen] = []
+        audio_window: dict[str, Any] | None = None
         try:
-            if camilla_was_active:
-                subprocess.run([SYSTEMCTL, "stop", "camilladsp.service"], check=True, timeout=20)
-                # USB/amp switching transients immediately after stopping the
-                # live stream must not contaminate the background reference.
-                time.sleep(0.75)
-            # Measurement must not capture or loop the preamp/U7 input. The
-            # CamillaDSP starter restores Line capture when normal DSP resumes.
-            subprocess.run([AMIXER, "-D", "hw:U7", "set", "Mic", "nocap"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run([AMIXER, "-D", "hw:U7", "set", "Line", "nocap"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            update_current(dsp_mode="direct_bypass", u7_input="off", stage="DSP bypass · U7 입력 OFF · UMIK 녹음 준비", progress=progress_base)
+            audio_window = begin_measurement_audio_window()
+            update_current(
+                dsp_mode="direct_bypass",
+                u7_input="off",
+                measurement_sweep_output={
+                    "active": True,
+                    "hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB,
+                    "listening_volume_ignored": True,
+                    "restore_before_input": True,
+                },
+                stage="DSP bypass · U7 입력 OFF · 출력 0 dB 기준 · UMIK 녹음 준비",
+                progress=progress_base,
+            )
             item_span = progress_span / len(captures)
             for index, (output, recorded, label) in enumerate(captures):
                 if load_current().get("cancel_requested"):
                     raise MeasurementError("사용자가 측정을 취소했습니다.")
-                ensure_measurement_output_path()
+                ensure_measurement_audio_window(audio_window)
                 item_base = progress_base + item_span * index
                 capture_seconds = max(2, math.ceil(output.stat().st_size / (RATE * 12) + 1.0))
                 capture = subprocess.Popen([
@@ -1168,21 +1994,20 @@ def run_direct_capture_batch(
                 start = time.monotonic()
                 expected = max(1.0, output.stat().st_size / (RATE * 12))
                 while playback.poll() is None:
-                    ensure_measurement_output_path()
+                    ensure_measurement_audio_window(audio_window)
                     elapsed = time.monotonic() - start
                     fraction = min(0.98, elapsed / expected)
                     update_current(progress=item_base + item_span * fraction, eta_seconds=max(0, round(expected - elapsed)))
                     time.sleep(0.5)
                 if playback.returncode != 0:
                     raise MeasurementError(f"U7 측정음 재생 실패: {playback.returncode}")
-                ensure_measurement_output_path()
+                ensure_measurement_audio_window(audio_window)
                 capture.wait(timeout=capture_seconds + 3)
                 if capture.returncode != 0:
                     raise MeasurementError(f"UMIK 녹음 실패: {capture.returncode}")
                 active_processes = []
                 update_current(progress=item_base + item_span)
         finally:
-            update_current(active_pids=[])
             for process in active_processes:
                 if process.poll() is None:
                     process.terminate()
@@ -1190,11 +2015,19 @@ def run_direct_capture_batch(
                         process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         process.kill()
-            if camilla_was_active:
-                subprocess.run([SYSTEMCTL, "start", "camilladsp.service"], check=False, timeout=25)
-            else:
-                subprocess.run([AMIXER, "-D", "hw:U7", "set", "Line", "cap"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            update_current(dsp_mode="restored", u7_input="restored")
+                        process.wait(timeout=3)
+            restore_measurement_audio_window(audio_window)
+            update_current(
+                dsp_mode="restored",
+                u7_input="restored",
+                active_pids=[],
+                measurement_sweep_output={
+                    "active": False,
+                    "hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB,
+                    "listening_volume_ignored": True,
+                    "volume_restored_before_input": True,
+                },
+            )
 
 
 def run_direct_capture(output: Path, recorded: Path, duration: int, progress_base: float, progress_span: float) -> None:
@@ -1226,22 +2059,31 @@ def run_filtered_capture_batch(
     if manager_process.returncode or not preview.get("active") or preview.get("stale") or preview.get("profile") != state.get("preview_profile"):
         raise MeasurementError("실제 CamillaDSP Preview가 현재 결과와 일치하지 않습니다. 이번 튜닝 Preview를 다시 적용하세요.")
     ensure_post_preview_output_path(state)
-    camilla_was_active = subprocess.run([SYSTEMCTL, "is-active", "--quiet", "camilladsp.service"], check=False).returncode == 0
-    if not camilla_was_active:
+    if not _camilla_service_active():
         raise MeasurementError("CamillaDSP가 실행 중이 아닙니다. Preview를 다시 적용하세요.")
     with AUDIO_LOCK.open("w") as audio_handle:
         fcntl.flock(audio_handle, fcntl.LOCK_EX)
         active_processes: list[subprocess.Popen] = []
+        audio_window: dict[str, Any] | None = None
         try:
-            subprocess.run([SYSTEMCTL, "stop", "camilladsp.service"], check=True, timeout=20)
-            time.sleep(0.75)
-            subprocess.run([AMIXER, "-D", "hw:U7", "set", "Mic", "nocap"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run([AMIXER, "-D", "hw:U7", "set", "Line", "nocap"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            update_current(dsp_mode="filtered_file_preview", u7_input="off", stage="Preview FIR 유지 · U7 입력 OFF · 사후 합산 검증 준비", progress=progress_base)
+            audio_window = begin_measurement_audio_window(require_camilla=True)
+            update_current(
+                dsp_mode="filtered_file_preview",
+                u7_input="off",
+                measurement_sweep_output={
+                    "active": True,
+                    "hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB,
+                    "listening_volume_ignored": True,
+                    "restore_before_input": True,
+                },
+                stage="Preview FIR 유지 · U7 입력 OFF · 출력 0 dB 기준 · 사후 합산 검증 준비",
+                progress=progress_base,
+            )
             item_span = progress_span / len(captures)
             for index, (input_path, recorded, label) in enumerate(captures):
                 if load_current().get("cancel_requested"):
                     raise MeasurementError("사용자가 측정을 취소했습니다.")
+                ensure_measurement_audio_window(audio_window)
                 item_base = progress_base + item_span * index
                 config_path = input_path.with_suffix(".camilladsp.yml")
                 atomic_text(config_path, filtered_file_config(input_path))
@@ -1265,6 +2107,7 @@ def run_filtered_capture_batch(
                 update_current(active_pids=[capture.pid, playback.pid], stage=f"Preview FIR · {label} 검증 sweep 재생 중")
                 started = time.monotonic()
                 while playback.poll() is None:
+                    ensure_measurement_audio_window(audio_window)
                     elapsed = time.monotonic() - started
                     update_current(
                         progress=item_base + item_span * min(0.98, elapsed / max(input_seconds, 1.0)),
@@ -1273,13 +2116,13 @@ def run_filtered_capture_batch(
                     time.sleep(0.5)
                 if playback.returncode:
                     raise MeasurementError(f"Preview FIR 검증 재생 실패: {playback.returncode}")
+                ensure_measurement_audio_window(audio_window)
                 capture.wait(timeout=capture_seconds + 3)
                 if capture.returncode:
                     raise MeasurementError(f"UMIK 사후 검증 녹음 실패: {capture.returncode}")
                 active_processes = []
                 update_current(progress=item_base + item_span)
         finally:
-            update_current(active_pids=[])
             for process in active_processes:
                 if process.poll() is None:
                     process.terminate()
@@ -1287,57 +2130,76 @@ def run_filtered_capture_batch(
                         process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         process.kill()
-            subprocess.run([SYSTEMCTL, "start", "camilladsp.service"], check=False, timeout=25)
-            update_current(dsp_mode="restored_preview", u7_input="restored")
+                        process.wait(timeout=3)
+            restore_measurement_audio_window(audio_window)
+            update_current(
+                dsp_mode="restored_preview",
+                u7_input="restored",
+                active_pids=[],
+                measurement_sweep_output={
+                    "active": False,
+                    "hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB,
+                    "listening_volume_ignored": True,
+                    "volume_restored_before_input": True,
+                },
+            )
 
 
 def run_level_sequence(noise: Path, silence_recorded: Path, noise_recorded: Path) -> None:
-    """Capture 5 s background and 5 s white noise under one exclusive bypass window."""
+    """Capture 2 s background and 2 s quick sweep under one exclusive bypass window."""
     ensure_measurement_output_path()
-    camilla_was_active = subprocess.run([SYSTEMCTL, "is-active", "--quiet", "camilladsp.service"], check=False).returncode == 0
     with AUDIO_LOCK.open("w") as audio_handle:
         fcntl.flock(audio_handle, fcntl.LOCK_EX)
         processes: list[subprocess.Popen] = []
+        audio_window: dict[str, Any] | None = None
         try:
-            if camilla_was_active:
-                subprocess.run([SYSTEMCTL, "stop", "camilladsp.service"], check=True, timeout=20)
-                time.sleep(0.75)
-            subprocess.run([AMIXER, "-D", "hw:U7", "set", "Mic", "nocap"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run([AMIXER, "-D", "hw:U7", "set", "Line", "nocap"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            update_current(dsp_mode="direct_bypass", u7_input="off", stage="1/2 · 무음 5초 · 배경소음 측정 중", progress=5.0, eta_seconds=11)
+            audio_window = begin_measurement_audio_window()
+            update_current(
+                dsp_mode="direct_bypass",
+                u7_input="off",
+                measurement_sweep_output={
+                    "active": True,
+                    "hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB,
+                    "listening_volume_ignored": True,
+                    "restore_before_input": True,
+                },
+                stage="1/2 · 입력 OFF · 출력 0 dB 기준 · 무음 2초 배경소음 측정 중",
+                progress=10.0,
+                eta_seconds=4,
+            )
             silence = subprocess.Popen([
                 ARECORD, "-q", "--fatal-errors", "-D", CAPTURE_DEVICE, "-t", "wav", "-f", "S24_3LE",
-                "-r", str(RATE), "-c", "1", "-d", "5", str(silence_recorded),
+                "-r", str(RATE), "-c", "1", "-d", "2", str(silence_recorded),
             ])
             processes = [silence]
             update_current(active_pids=[silence.pid])
-            silence.wait(timeout=9)
+            silence.wait(timeout=5)
             if silence.returncode != 0:
                 raise MeasurementError(f"UMIK 무음 녹음 실패: {silence.returncode}")
 
-            update_current(stage="2/2 · 백색소음 5초 · 신호 레벨 측정 중", progress=45.0, eta_seconds=6)
+            update_current(stage="2/2 · 2초 퀵 스윕 · 신호 레벨 측정 중", progress=50.0, eta_seconds=2)
             capture = subprocess.Popen([
                 ARECORD, "-q", "--fatal-errors", "-D", CAPTURE_DEVICE, "-t", "wav", "-f", "S24_3LE",
-                "-r", str(RATE), "-c", "1", "-d", "6", str(noise_recorded),
+                "-r", str(RATE), "-c", "1", "-d", "3", str(noise_recorded),
             ])
             processes = [capture]
-            time.sleep(0.4)
-            ensure_measurement_output_path()
+            time.sleep(0.3)
+            ensure_measurement_audio_window(audio_window)
             playback = subprocess.Popen([APLAY, "-q", "-D", PLAYBACK_DEVICE, str(noise)])
             processes.append(playback)
             update_current(active_pids=[capture.pid, playback.pid])
-            playback_deadline = time.monotonic() + 9.0
+            playback_deadline = time.monotonic() + 5.0
             while playback.poll() is None:
-                ensure_measurement_output_path()
+                ensure_measurement_audio_window(audio_window)
                 if time.monotonic() >= playback_deadline:
-                    raise MeasurementError("U7 백색소음 재생 시간이 초과되었습니다.")
-                time.sleep(0.25)
+                    raise MeasurementError("U7 퀵 스윕 재생 시간이 초과되었습니다.")
+                time.sleep(0.15)
             if playback.returncode != 0:
-                raise MeasurementError(f"U7 백색소음 재생 실패: {playback.returncode}")
-            ensure_measurement_output_path()
-            capture.wait(timeout=10)
+                raise MeasurementError(f"U7 퀵 스윕 재생 실패: {playback.returncode}")
+            ensure_measurement_audio_window(audio_window)
+            capture.wait(timeout=5)
             if capture.returncode != 0:
-                raise MeasurementError(f"UMIK 백색소음 녹음 실패: {capture.returncode}")
+                raise MeasurementError(f"UMIK 퀵 스윕 녹음 실패: {capture.returncode}")
             update_current(progress=95.0, eta_seconds=1)
         finally:
             for process in processes:
@@ -1347,12 +2209,19 @@ def run_level_sequence(noise: Path, silence_recorded: Path, noise_recorded: Path
                         process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         process.kill()
-            update_current(active_pids=[])
-            if camilla_was_active:
-                subprocess.run([SYSTEMCTL, "start", "camilladsp.service"], check=False, timeout=25)
-            else:
-                subprocess.run([AMIXER, "-D", "hw:U7", "set", "Line", "cap"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            update_current(dsp_mode="restored", u7_input="restored")
+                        process.wait(timeout=3)
+            restore_measurement_audio_window(audio_window)
+            update_current(
+                dsp_mode="restored",
+                u7_input="restored",
+                active_pids=[],
+                measurement_sweep_output={
+                    "active": False,
+                    "hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB,
+                    "listening_volume_ignored": True,
+                    "volume_restored_before_input": True,
+                },
+            )
 
 
 def detect_subwoofer_passband(
@@ -1444,6 +2313,11 @@ def detect_subwoofer_passband(
     }
 
 
+def coherent_sweep_integration_gain_db(active_seconds: float) -> float:
+    """Matched-filter processing gain relative to the 2 s preflight ESS."""
+    return max(0.0, 10.0 * math.log10(max(active_seconds, 1.0e-9) / 2.0))
+
+
 def sweep_capture_quality(
     samples: list[float],
     reference: list[float],
@@ -1486,22 +2360,74 @@ def sweep_capture_quality(
         rolling += envelope_power[index] - envelope_power[index - active_blocks]
         window_powers.append(rolling)
     best_power = max(window_powers)
-    # A bandwidth-limited actuator can produce a plateau of equally energetic
-    # sweep-length windows.  Prefer the nominal ALSA arm timing within 0.5% of
-    # the maximum, while still allowing a clearly truncated/delayed recording
-    # to move away from that anchor.
+    # A bandwidth-limited actuator can make a later sweep-length window look
+    # stronger simply because its silent natural roll-off was shifted out of
+    # the window. Search only around the known arecord -> 400 ms -> aplay
+    # sequence; otherwise Front roll-off can masquerade as seconds of delay.
     nominal_block = round((round(0.4 * RATE) + reference_start) / envelope_block)
+    timing_radius_blocks = round(0.75 * RATE / envelope_block)
+    plausible_start = max(0, nominal_block - timing_radius_blocks)
+    plausible_end = min(len(window_powers), nominal_block + timing_radius_blocks + 1)
+    plausible_powers = window_powers[plausible_start:plausible_end]
+    if not plausible_powers:
+        raise MeasurementError("측정 sweep의 재생 시점을 평가할 수 없습니다.")
+    plausible_best = max(plausible_powers)
     near_best = [
-        index for index, power in enumerate(window_powers)
-        if power >= best_power * 0.995
+        index for index in range(plausible_start, plausible_end)
+        if window_powers[index] >= plausible_best * 0.995
     ]
     best_block = min(near_best, key=lambda index: abs(index - nominal_block))
     active_start = min(len(samples), best_block * envelope_block)
+    timing_method = "nominal arecord/aplay anchor with bounded +/-750 ms maximum-energy refinement"
+
+    # Correlate a one-second signature from the middle of the ESS instead of
+    # trusting total energy alone. Music or a U7 stream-switch transient in the
+    # pre-roll can otherwise look like the strongest sweep-length window (the
+    # real Pi2 capture reproduced this as a false -350 ms start). Restricting
+    # both operands to the known ALSA start-latency range keeps this at a
+    # 262144-point FFT for both 2 s and 14 s sweeps, instead of allocating a
+    # multi-million-point full-sweep correlation on a 1 GB Pi2. A subwoofer is
+    # deliberately excluded because its narrow low-pass output does not contain
+    # the middle-band signature.
+    if source not in SUBWOOFER_ONLY_SOURCES:
+        signature_length = min(RATE, max(1, active_length // 2))
+        signature_start = reference_start + (active_length - signature_length) // 2
+        signature_end = signature_start + signature_length
+        signature = reference[signature_start:signature_end]
+        search_start = max(0, signature_start - round(0.35 * RATE))
+        search_end = min(len(samples), signature_end + round(1.25 * RATE))
+        search = samples[search_start:search_end]
+        fft_length = next_power_of_two(len(search) + len(signature) - 1)
+        fft = FFTBackend()
+        try:
+            sample_mean = sum(search) / len(search)
+            reference_mean = sum(signature) / len(signature)
+            sample_spectrum = fft.rfft((value - sample_mean for value in search), fft_length)
+            reference_spectrum = fft.rfft(
+                (value - reference_mean for value in signature), fft_length,
+            )
+            for index in range(len(sample_spectrum)):
+                sample_spectrum[index] *= reference_spectrum[index].conjugate()
+            correlation = fft.irfft(sample_spectrum, fft_length)
+            maximum_lag = max(0, len(search) - len(signature))
+            if maximum_lag:
+                best_lag = max(
+                    range(maximum_lag + 1),
+                    key=lambda index: abs(correlation[index]),
+                )
+                capture_lead = search_start + best_lag - signature_start
+                active_start = max(0, min(len(samples), capture_lead + reference_start))
+                timing_method = "bounded FFT cross-correlation of a one-second middle-band ESS signature"
+        finally:
+            fft.close()
     active_end = min(len(samples), active_start + active_length)
     capture_lead = active_start - reference_start
 
-    # Median 200 ms AC-RMS rejects switching clicks.  When both sides of the
-    # sweep are available, retain the noisier median as a conservative floor.
+    # Estimate stationary room noise from the quieter 35th percentile of all
+    # 200 ms pre/post blocks. A U7/Camilla stream transition can contaminate
+    # one side for several blocks; choosing max(pre, post) turned that click
+    # into a false negative SNR. Persistent noise remains present on both
+    # sides, while side imbalance is reported separately as contamination.
     noise_guard = round(0.10 * RATE)
     noise_block = round(0.20 * RATE)
     noise_segments = [
@@ -1509,16 +2435,21 @@ def sweep_capture_quality(
         samples[min(len(samples), active_end + noise_guard):],
     ]
     noise_estimates = []
+    noise_blocks_by_side: list[list[float]] = []
     for segment in noise_segments:
         blocks = [
             ac_rms(segment[start:start + noise_block])
             for start in range(0, len(segment) - noise_block + 1, noise_block)
         ]
         if blocks:
-            noise_estimates.append(statistics.median(blocks))
+            noise_blocks_by_side.append(blocks)
+            noise_estimates.append(percentile(blocks, 0.35))
     if not noise_estimates:
         raise MeasurementError("측정 sweep의 무음 구간을 평가할 수 없습니다.")
-    background_rms = max(noise_estimates)
+    all_noise_blocks = [value for blocks in noise_blocks_by_side for value in blocks]
+    background_rms = percentile(all_noise_blocks, 0.35)
+    noise_side_dbfs = [20.0 * math.log10(max(value, 1.0e-15)) for value in noise_estimates]
+    noise_side_spread_db = max(noise_side_dbfs) - min(noise_side_dbfs) if len(noise_side_dbfs) > 1 else 0.0
     passband: dict[str, Any] | None = None
     if source in SUBWOOFER_ONLY_SOURCES:
         passband = detect_subwoofer_passband(
@@ -1539,30 +2470,113 @@ def sweep_capture_quality(
             active_end = min(len(samples), capture_lead + reference_start + round((full_reference_end - reference_start) * fraction_300_hz))
             analysis_band_hz = [15.0, 300.0]
     active = samples[active_start:active_end]
-    minimum_active_samples = RATE // 5 if source in SUBWOOFER_ONLY_SOURCES else RATE
+    # A 2 s full-band quick sweep maps a legitimate narrow subwoofer passband
+    # (for example the measured T5S 53-95 Hz band) to about 160 ms. Requiring a
+    # fixed 200 ms rejected that valid recording before SNR could be reported.
+    # Fifty milliseconds still provides multiple low-frequency cycles and the
+    # sustained -3 dB detector already requires at least two adjacent bins.
+    minimum_active_samples = RATE // 20 if source in SUBWOOFER_ONLY_SOURCES else RATE
     if len(active) < minimum_active_samples:
         raise MeasurementError("측정 sweep의 무음/신호 구간을 평가할 수 없습니다.")
     active_rms = ac_rms(active)
     signal_power = max(0.0, active_rms * active_rms - background_rms * background_rms)
-    snr_db = 10.0 * math.log10(max(signal_power, 1.0e-30) / max(background_rms * background_rms, 1.0e-30))
+    raw_snr_db = 10.0 * math.log10(max(signal_power, 1.0e-30) / max(background_rms * background_rms, 1.0e-30))
+    # ESS deconvolution is a coherent matched-filter operation: at the same
+    # playback level, longer frequency dwell integrates more signal energy
+    # while uncorrelated room noise grows only in power. The former scalar RMS
+    # gate ignored that processing gain, so a 14 s sweep could fail after its
+    # otherwise identical 2 s preflight passed. Keep the 2 s quick check as the
+    # zero-gain safety reference and expose both numbers for auditability.
+    reference_active_seconds = active_length / RATE
+    coherent_integration_gain_db = coherent_sweep_integration_gain_db(reference_active_seconds)
+    snr_db = raw_snr_db + coherent_integration_gain_db
     return {
         "background_rms_dbfs": round(20.0 * math.log10(max(background_rms, 1.0e-15)), 2),
         "active_rms_dbfs": round(20.0 * math.log10(max(active_rms, 1.0e-15)), 2),
         "estimated_signal_rms_dbfs": round(10.0 * math.log10(max(signal_power, 1.0e-30)), 2),
         "snr_db": round(snr_db, 2),
-        "minimum_usable_snr_db": 6.0,
-        "recommended_snr_db": 15.0,
-        "usable": snr_db >= 6.0,
-        "recommended": snr_db >= 15.0,
+        "raw_instantaneous_snr_db": round(raw_snr_db, 2),
+        "coherent_integration_gain_db": round(coherent_integration_gain_db, 2),
+        "reference_active_seconds": round(reference_active_seconds, 3),
+        "minimum_usable_snr_db": MINIMUM_USABLE_SNR_DB,
+        "recommended_snr_db": RECOMMENDED_SNR_DB,
+        "usable": snr_db >= MINIMUM_USABLE_SNR_DB,
+        "recommended": snr_db >= RECOMMENDED_SNR_DB,
         "analysis_band_hz": analysis_band_hz,
         "subwoofer_passband": passband,
         "source": source,
         "active_interval_samples": [active_start, active_end],
         "capture_delay_samples": capture_lead,
         "capture_delay_ms": round(capture_lead * 1000.0 / RATE, 3),
-        "timing_method": "maximum-energy sweep-length window on 50 ms AC-RMS envelope",
+        "timing_method": timing_method,
         "noise_segments_used": len(noise_estimates),
+        "noise_blocks_used": len(all_noise_blocks),
+        "noise_side_estimates_dbfs": [round(value, 2) for value in noise_side_dbfs],
+        "noise_side_spread_db": round(noise_side_spread_db, 2),
+        "switching_transient_suspected": noise_side_spread_db >= 4.0,
+        "noise_method": "35th percentile of 200 ms pre/post AC-RMS blocks; side imbalance reported separately",
     }
+
+
+def measurement_level_guidance(
+    quality: dict[str, Any],
+    configured_level_dbfs: int,
+    peak_dbfs: float,
+) -> dict[str, Any]:
+    """Return exact minimum/recommended output changes with peak headroom."""
+    snr_db = float(quality.get("snr_db", -120.0))
+    safe_raise_db = max(0, int(math.floor(-3.0 - float(peak_dbfs))))
+    minimum_raise_db = max(0, int(math.ceil(MINIMUM_USABLE_SNR_DB - snr_db)))
+    recommended_raise_db = max(0, int(math.ceil(RECOMMENDED_SNR_DB - snr_db)))
+    minimum_raise_db = min(minimum_raise_db, safe_raise_db)
+    recommended_raise_db = min(recommended_raise_db, safe_raise_db)
+    minimum_level = min(0, int(configured_level_dbfs) + minimum_raise_db)
+    recommended_level = min(0, int(configured_level_dbfs) + recommended_raise_db)
+    return {
+        "configured_level_dbfs": int(configured_level_dbfs),
+        "minimum_raise_db": minimum_raise_db,
+        "minimum_level_dbfs": minimum_level,
+        "recommended_raise_db": recommended_raise_db,
+        "recommended_level_dbfs": recommended_level,
+        "safe_raise_limit_db": safe_raise_db,
+        "minimum_usable_snr_db": MINIMUM_USABLE_SNR_DB,
+        "recommended_snr_db": RECOMMENDED_SNR_DB,
+        "headroom_limited": recommended_raise_db < max(0, int(math.ceil(RECOMMENDED_SNR_DB - snr_db))),
+    }
+
+
+def measurement_quality_message(
+    quality: dict[str, Any],
+    source: str | None,
+    configured_level_dbfs: int,
+    peak_dbfs: float,
+) -> tuple[str, dict[str, Any]]:
+    guidance = measurement_level_guidance(quality, configured_level_dbfs, peak_dbfs)
+    source_label = SOURCE_LABELS.get(str(source), str(source or "측정 채널"))
+    band = quality.get("analysis_band_hz") or [15.0, 22_000.0]
+    snr_db = float(quality.get("snr_db", -120.0))
+    integration_gain = float(quality.get("coherent_integration_gain_db", 0.0))
+    raw_snr = float(quality.get("raw_instantaneous_snr_db", snr_db))
+    integration_note = (
+        f" · 원신호 {raw_snr:.1f} + ESS 적분 {integration_gain:.1f} dB"
+        if integration_gain >= 0.05 else ""
+    )
+    if guidance["headroom_limited"]:
+        action = (
+            f"디지털 출력을 최대 +{guidance['safe_raise_limit_db']} dB까지만 올릴 수 있습니다. "
+            "기기 볼륨·마이크 위치를 확인하거나 Sweep 길이를 늘리세요."
+        )
+    else:
+        action = (
+            f"Sweep 출력을 {configured_level_dbfs} → {guidance['recommended_level_dbfs']} dBFS"
+            f" (+{guidance['recommended_raise_db']} dB)로 올리면 권장 품질을 예상할 수 있습니다."
+        )
+    message = (
+        f"{source_label} 유효 SNR {snr_db:.1f} dB{integration_note} "
+        f"(평가 {float(band[0]):g}–{float(band[1]):g} Hz · 최소 {MINIMUM_USABLE_SNR_DB:g} / 권장 {RECOMMENDED_SNR_DB:g} dB). "
+        f"{action}"
+    )
+    return message, guidance
 
 
 def decay_fit(values: list[float]) -> dict[str, Any]:
@@ -1756,6 +2770,24 @@ def frequency_noise_metrics(
         mean = sum(values) / max(1, len(values))
         return [value - mean for value in values]
 
+    def stable_noise_window(values: list[float]) -> list[float]:
+        block = round(0.20 * RATE)
+        candidates = [
+            values[start:start + block]
+            for start in range(0, len(values) - block + 1, block)
+        ]
+        if not candidates:
+            return values
+        def power(candidate: list[float]) -> float:
+            mean = sum(candidate) / len(candidate)
+            return sum((value - mean) ** 2 for value in candidate) / len(candidate)
+        # Lowest stable block rejects one-off selector/stream transitions. A
+        # persistent fan, HVAC or household floor remains in every candidate.
+        return min(candidates, key=power)
+
+    pre = stable_noise_window(pre)
+    post = stable_noise_window(post)
+
     noise_fft_length = next_power_of_two(max(len(pre), len(post)))
     pre_spectrum = fft.rfft(centered(pre), noise_fft_length)
     post_spectrum = fft.rfft(centered(post), noise_fft_length)
@@ -1822,7 +2854,7 @@ def frequency_noise_metrics(
         "transient_contamination_detected": transient_detected,
         "evaluation_band_hz": [round(evaluation_low, 2), round(evaluation_high, 2)],
         "noise_fft_size": noise_fft_length,
-        "method": "conservative max(pre-roll, post-roll) short-window noise PSD; local 1/12-octave FFT SNR; 6-15 dB confidence ramp; 100 ms positive-transient detector",
+        "method": "max of stable 200 ms pre/post noise PSD windows; local 1/12-octave FFT SNR; 6-15 dB confidence ramp; 100 ms positive-transient detector",
     }
 
 
@@ -1879,11 +2911,26 @@ def response_from_recording(
     if peak >= 0.988:
         raise MeasurementError("UMIK 입력이 클리핑되었습니다. 볼륨을 낮추세요.")
     quality = sweep_capture_quality(samples, reference, source)
+    try:
+        configured_level_dbfs = int(load_current().get("level_dbfs", DEFAULT_SWEEP_LEVEL_DBFS))
+    except Exception:
+        configured_level_dbfs = DEFAULT_SWEEP_LEVEL_DBFS
+    quality_message, level_guidance = measurement_quality_message(
+        quality,
+        source,
+        configured_level_dbfs,
+        20.0 * math.log10(max(peak, 1.0e-15)),
+    )
+    quality["level_guidance"] = level_guidance
     if not quality["usable"]:
-        raise MeasurementError(
-            f"측정 sweep SNR이 {quality['snr_db']:.1f} dB로 너무 낮습니다. "
-            "측정 레벨 또는 sweep 시간을 올리세요."
-        )
+        if CURRENT.is_file():
+            update_current(last_measurement_quality={
+                "source": source,
+                "message": quality_message,
+                "quality": quality,
+                "recording": recorded.name,
+            })
+        raise MeasurementError(quality_message)
     capture_delay = int(quality.get("capture_delay_samples", round(0.4 * RATE)))
     if capture_delay >= 0:
         delayed_reference = [0.0] * capture_delay + reference
@@ -1986,19 +3033,23 @@ def response_from_recording(
     }
 
 
-def inspect_saved_recording(position: int, source: str, *, reprocess: bool = False) -> dict[str, Any]:
+def inspect_saved_recording(
+    position: int,
+    source: str,
+    *,
+    reprocess: bool = False,
+    batch_reprocess: bool = False,
+) -> dict[str, Any]:
     """Quality-check or rebuild one saved raw capture without playing sound."""
     state = load_current()
     positions_total = session_position_count(state)
     if position not in range(1, positions_total + 1) or source not in state.get("sources", []):
-        raise MeasurementError("현재 session의 측정 위치/채널이 아닙니다.")
+        raise MeasurementError("현재 세션의 측정 위치/채널이 아닙니다.")
     directory = Path(state["session_dir"])
     recorded = directory / f"p{position}_{source}_recorded.wav"
     if not recorded.is_file():
         raise MeasurementError(f"저장된 원본 녹음이 없습니다: {recorded.name}")
-    sweep = directory / f"p{position}_{source}_sweep.wav"
-    reference = write_sweep(
-        sweep,
+    reference = reference_sweep_for_source(
         source,
         int(state["level_dbfs"]),
         int(state["sweep_seconds"]),
@@ -2051,19 +3102,35 @@ def inspect_saved_recording(position: int, source: str, *, reprocess: bool = Fal
         else:
             break
     job_state = "measured" if completed_positions == positions_total else "ready"
-    stage = (
-        "세 위치 측정 완료 · 32768탭 FIR을 생성할 수 있습니다."
-        if completed_positions == positions_total
-        else f"저장 원본 무음 재처리 완료 · 위치 {completed_positions + 1} 준비"
-    )
+    completion_fields: dict[str, Any] = {}
+    if completed_positions == positions_total and state.get("mode") in PREMEASURED_SUM_MODES:
+        preferences = load_correction_preferences()
+        sum_model = evaluate_premeasured_sum_model(
+            directory,
+            positions_total,
+            float(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB)),
+            int(preferences.get("crossover_frequency_hz", 100)),
+        )
+        completion_fields["premeasured_sum_validation"] = sum_model
+        stage = (
+            f"저장 원본 {positions_total}위치 재계산 완료 · 합산 일치 검증 PASS · FIR 계산 가능"
+            if sum_model["pass"] else
+            f"저장 원본 {positions_total}위치 재계산 완료 · 합산 모델 FAIL · 3단계 조치 확인"
+        )
+    elif completed_positions == positions_total:
+        stage = f"저장 원본 {positions_total}위치 재계산 완료 · FIR 계산 가능"
+    else:
+        stage = f"저장 원본 무음 재계산 완료 · 위치 {completed_positions + 1} 준비"
     updated = update_current(
-        state=job_state,
+        state="processing" if batch_reprocess and completed_positions < positions_total else job_state,
         stage=stage,
         error=None,
-        worker_pid=None,
+        worker_pid=state.get("worker_pid") if batch_reprocess else None,
         measurements=measurements,
         positions_completed=completed_positions,
         progress=100.0 * completed_positions / positions_total,
+        last_measurement_quality=None,
+        **completion_fields,
     )
     atomic_json(directory / "session.json", updated)
     result["reprocessed"] = True
@@ -2071,6 +3138,39 @@ def inspect_saved_recording(position: int, source: str, *, reprocess: bool = Fal
     result["positions_completed"] = completed_positions
     result["measurement_quality"] = response["measurement_quality"]
     return result
+
+
+def reprocess_saved_recordings_worker() -> None:
+    """Rebuild every available response from raw WAVs without playback."""
+    state = load_current()
+    if state.get("state") == "idle" or not state.get("session_dir"):
+        raise MeasurementError("재계산할 측정 Session이 없습니다.")
+    directory = Path(state["session_dir"])
+    expected = [
+        (position, source)
+        for position in range(1, session_position_count(state) + 1)
+        for source in state.get("sources", [])
+    ]
+    available = [
+        item for item in expected
+        if (directory / f"p{item[0]}_{item[1]}_recorded.wav").is_file()
+    ]
+    if not available:
+        raise MeasurementError("저장된 원본 녹음이 없습니다.")
+    missing = [item for item in expected if item not in available]
+    if missing:
+        names = ", ".join(f"P{position} {SOURCE_LABELS.get(source, source)}" for position, source in missing)
+        raise MeasurementError(f"저장 원본이 부족합니다: {names}. 3 · 위치 측정에서 해당 위치를 측정하세요.")
+    for index, (position, source) in enumerate(available):
+        update_current(
+            state="processing",
+            stage=f"저장 원본 재계산 {index + 1}/{len(available)} · P{position} {SOURCE_LABELS.get(source, source)}",
+            progress=100.0 * index / len(available),
+            eta_seconds=round((len(available) - index) * platform_capabilities()["offline_estimates_seconds"]["response_per_channel"]),
+            last_measurement_quality=None,
+        )
+        inspect_saved_recording(position, source, reprocess=True, batch_reprocess=True)
+    update_current(worker_pid=None, eta_seconds=None, progress=100.0)
 
 
 def validate_measurement_output_levels(
@@ -2081,7 +3181,7 @@ def validate_measurement_output_levels(
     if sweep_level_dbfs not in ALLOWED_SWEEP_LEVELS:
         raise MeasurementError("Sweep 출력은 -54~0 dBFS 범위여야 합니다.")
     if noise_level_dbfs not in ALLOWED_NOISE_LEVELS:
-        raise MeasurementError("백색소음 출력은 -54~-6 dBFS 범위여야 합니다.")
+        raise MeasurementError("레벨 검사 출력은 -54~-6 dBFS 범위여야 합니다.")
     if woofer_attenuation_db not in ALLOWED_WOOFER_MEASUREMENT_ATTENUATIONS:
         raise MeasurementError("우퍼 측정 상대레벨은 -18~0 dB 범위여야 합니다.")
 
@@ -2101,7 +3201,7 @@ def new_session(
     if mode in MIMO_MODES and not capability["mimo_supported"]:
         raise MeasurementError("MIMO 측정/보정은 Raspberry Pi 4/5 전용입니다.")
     if position_count not in ALLOWED_POSITION_COUNTS:
-        raise MeasurementError("측정 위치 수는 Fast 1위치 또는 Standard 3위치여야 합니다.")
+        raise MeasurementError("측정 위치 수는 빠른 측정 1위치 또는 표준 측정 3위치여야 합니다.")
     if mode in MIMO_MODES and position_count != POSITIONS:
         raise MeasurementError("MIMO 공동제어는 독립 3위치 측정이 필요합니다.")
     if orientation != "90":
@@ -2146,12 +3246,18 @@ def new_session(
         "orientation": orientation,
         "calibration": {key: value for key, value in cal.items() if key not in ("frequencies", "corrections")},
         "measurements": [],
+        "phase_references": [],
+        "phase_reference_acquisition_revision": (
+            "simultaneous-multisine-v1" if mode in SEPARATE_WOOFER_MODES else None
+        ),
         "result": None,
         "validation": None,
         "premeasured_sum_validation": None,
         "measurement_profile": None,
+        "measurement_acquisition_revision": None,
         "measurement_output": None,
         "measurement_output_match": None,
+        "measurement_sweep_output": {"active": False, "hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB},
         "dsp_mode": "normal",
         "active_pids": [],
         "created_unix": time.time(),
@@ -2192,6 +3298,7 @@ def invalidate_from_step(state: dict[str, Any], step: int, reason: str) -> dict[
     if step <= 3:
         state.update({
             "measurements": [],
+            "phase_references": [],
             "positions_completed": 0,
             "validation": None,
             "premeasured_sum_validation": None,
@@ -2200,6 +3307,7 @@ def invalidate_from_step(state: dict[str, Any], step: int, reason: str) -> dict[
         state.update({
             "level_check": None,
             "measurement_profile": None,
+            "measurement_acquisition_revision": None,
             "measurement_output": None,
             "measurement_output_match": None,
         })
@@ -2232,12 +3340,14 @@ def reconfigure_session(
         raise MeasurementError("MIMO 측정/보정은 Raspberry Pi 4/5 전용입니다.")
     state = load_current()
     if state.get("state") == "idle":
-        raise MeasurementError("먼저 새 측정 session을 만드세요.")
-    noise_level_dbfs = int(state.get("noise_level_dbfs", state.get("level_dbfs", DEFAULT_NOISE_LEVEL_DBFS))) if noise_level_dbfs is None else int(noise_level_dbfs)
+        raise MeasurementError("먼저 새 측정 세션을 만드세요.")
+    # Retain the schema field for old sessions/API clients, but the UI and
+    # measurement engine now have one authoritative sweep level.
+    noise_level_dbfs = int(level_dbfs)
     woofer_measurement_attenuation_db = int(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB)) if woofer_measurement_attenuation_db is None else int(woofer_measurement_attenuation_db)
     position_count = session_position_count(state) if position_count is None else int(position_count)
     if position_count not in ALLOWED_POSITION_COUNTS:
-        raise MeasurementError("측정 위치 수는 Fast 1위치 또는 Standard 3위치여야 합니다.")
+        raise MeasurementError("측정 위치 수는 빠른 측정 1위치 또는 표준 측정 3위치여야 합니다.")
     if mode in MIMO_MODES and position_count != POSITIONS:
         raise MeasurementError("MIMO 공동제어는 독립 3위치 측정이 필요합니다.")
     validate_measurement_output_levels(level_dbfs, noise_level_dbfs, woofer_measurement_attenuation_db)
@@ -2247,42 +3357,23 @@ def reconfigure_session(
     earliest = 7
     if mode != state.get("mode"):
         changes.append("측정 구성")
-        earliest = min(earliest, 3)
+        earliest = min(earliest, 2)
     if position_count != session_position_count(state):
         changes.append("측정 위치 수")
         earliest = min(earliest, 3)
     if level_dbfs != state.get("level_dbfs"):
-        changes.append("sweep 출력")
-        checked = state.get("level_check") or {}
-        checked_noise_dbfs = int(checked.get(
-            "requested_white_noise_level_dbfs",
-            state.get("noise_level_dbfs", DEFAULT_NOISE_LEVEL_DBFS),
-        ))
-        checked_peak_dbfs = float(checked.get("peak_dbfs", 0.0))
-        # A sine sweep can peak about 3 dB above the deterministic white-noise
-        # generator at the same nominal setting. Preserve the check only with
-        # at least 6 dB of projected microphone headroom.
-        projected_sweep_peak_dbfs = checked_peak_dbfs + level_dbfs - checked_noise_dbfs + 3.0
-        # A successful broadband check at an equal or louder digital level
-        # already proves capture headroom. Every real sweep still has its own
-        # SNR/clipping gate, so only measured responses need invalidation.
-        level_step = 3 if checked.get("ok") and projected_sweep_peak_dbfs <= -6.0 else 2
-        earliest = min(earliest, level_step)
-    if noise_level_dbfs != int(state.get("noise_level_dbfs", state.get("level_dbfs", DEFAULT_NOISE_LEVEL_DBFS))):
-        changes.append("백색소음 출력")
+        changes.append("스윕 출력")
         earliest = min(earliest, 2)
     if woofer_measurement_attenuation_db != int(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB)):
-        changes.append("우퍼 측정 상대레벨")
-        earliest = min(earliest, 3)
+        changes.append("우퍼 측정 감쇄")
+        earliest = min(earliest, 2)
     if sweep_seconds != state.get("sweep_seconds"):
         changes.append("sweep 길이")
         earliest = min(earliest, 3)
     if orientation != state.get("orientation"):
         changes.append("UMIK 방향")
         earliest = min(earliest, 1)
-    preserve_front_measurements = (
-        changes == ["우퍼 측정 상대레벨"] and state.get("mode") == "lrw"
-    )
+    preserve_front_measurements = changes == ["우퍼 측정 감쇄"] and state.get("mode") in SEPARATE_WOOFER_MODES
     retained_front = [
         item for item in state.get("measurements", [])
         if item.get("source") in ("left", "right")
@@ -2292,10 +3383,13 @@ def reconfigure_session(
         state = invalidate_from_step(state, earliest, ", ".join(changes) + " 변경")
     if preserve_front_measurements:
         state["measurements"] = retained_front
-        state["stage"] = f"Woofer 측정 상대레벨 변경 · Front L/R {len(retained_front)}개 보존 · Woofer만 재측정"
+        state["stage"] = f"우퍼 측정 감쇄 변경 · 프런트 L/R {len(retained_front)}개 보존 · 빠른 검사 후 우퍼 관련 출력만 재측정"
     state.update(
         mode=mode,
         sources=list(SOURCES[mode]),
+        phase_reference_acquisition_revision=(
+            "simultaneous-multisine-v1" if mode in SEPARATE_WOOFER_MODES else None
+        ),
         positions_total=position_count,
         level_dbfs=level_dbfs,
         noise_level_dbfs=noise_level_dbfs,
@@ -2316,7 +3410,7 @@ def reconfigure_session(
 def prepare_level_check() -> dict[str, Any]:
     state = load_current()
     if state.get("state") == "idle" or not state.get("session_dir"):
-        raise MeasurementError("먼저 새 측정 session을 만드세요.")
+        raise MeasurementError("먼저 새 측정 세션을 만드세요.")
     state = invalidate_from_step(state, 2, "레벨 검사 다시 실행")
     state = bind_measurement_output(state)
     state["stage"] = f"{state['measurement_output']['label']} 경로 고정 · 레벨 검사 준비"
@@ -2327,7 +3421,9 @@ def prepare_level_check() -> dict[str, Any]:
 def prepare_position_restart() -> dict[str, Any]:
     state = load_current()
     if not (state.get("level_check") or {}).get("ok"):
-        raise MeasurementError("레벨 검사를 OK로 통과한 뒤 재측정하세요.")
+        raise MeasurementError(
+            f"2 · 레벨 확인에서 빠른 스윕 SNR {MINIMUM_USABLE_SNR_DB:g} dB 이상을 PASS한 뒤 재측정하세요."
+        )
     ensure_measurement_output_path(state)
     count = session_position_count(state)
     state = invalidate_from_step(state, 3, f"{count}위치 재측정 실행")
@@ -2391,7 +3487,10 @@ def spawn_worker(action: str, *arguments: str) -> dict[str, Any]:
 def measure_position_worker() -> None:
     state = load_current()
     if not (state.get("level_check") or {}).get("ok"):
-        raise MeasurementError("5초 무음 + 5초 백색소음 레벨 검사를 OK로 통과한 뒤 측정하세요.")
+        raise MeasurementError(
+            f"2 · 레벨 확인에서 빠른 스윕 SNR {MINIMUM_USABLE_SNR_DB:g} dB 이상을 PASS한 뒤 "
+            "3 · 위치 측정을 실행하세요."
+        )
     ensure_measurement_output_path(state)
     position = int(state["positions_completed"])
     positions_total = session_position_count(state)
@@ -2406,8 +3505,10 @@ def measure_position_worker() -> None:
         sources = ["left", "woofer", "right"] + [
             source for source in sources if source not in ("left", "right", "woofer")
         ]
-    total_items = positions_total * len(sources)
-    completed_items = position * len(sources)
+    phase_reference_required = state.get("mode") in SEPARATE_WOOFER_MODES
+    acquisitions_per_position = len(sources) + (1 if phase_reference_required else 0)
+    total_items = positions_total * acquisitions_per_position
+    completed_items = position * acquisitions_per_position
     new_items = list(state.get("measurements", []))
     completed_keys = {
         (int(item.get("position", 0)), str(item.get("source", "")))
@@ -2415,6 +3516,7 @@ def measure_position_worker() -> None:
         if (directory / str(item.get("response", ""))).is_file()
     }
     pending: list[dict[str, Any]] = []
+    phase_pending: dict[str, Any] | None = None
     response_eta = int(platform_capabilities()["offline_estimates_seconds"]["response_per_channel"])
     for source_index, source in enumerate(sources):
         if (position + 1, source) in completed_keys:
@@ -2444,6 +3546,32 @@ def measure_position_worker() -> None:
             "reference": reference,
         })
 
+    existing_phase_positions = {
+        int(item.get("position", 0))
+        for item in state.get("phase_references", [])
+        if isinstance(item, dict)
+        and (directory / str(item.get("result", ""))).is_file()
+    }
+    if phase_reference_required and position + 1 not in existing_phase_positions:
+        phase_sweep_path = directory / f"p{position + 1}_phase_reference_sweep.wav"
+        phase_record_path = directory / f"p{position + 1}_phase_reference_recorded.wav"
+        phase_metadata_path = directory / f"p{position + 1}_phase_reference_signal.json"
+        phase_result_path = directory / f"p{position + 1}_phase_reference.json"
+        phase_metadata = write_phase_reference(
+            phase_sweep_path,
+            int(state["level_dbfs"]),
+            float(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB)),
+        )
+        atomic_json(phase_metadata_path, phase_metadata)
+        phase_pending = {
+            "source_label": SOURCE_LABELS["phase_reference"],
+            "sweep_path": phase_sweep_path,
+            "record_path": phase_record_path,
+            "metadata": phase_metadata,
+            "metadata_path": phase_metadata_path,
+            "result_path": phase_result_path,
+        }
+
     # Sound first, processing second: CamillaDSP is stopped/restored once for
     # the whole position and no FFT delays occur between audible sweeps.
     position_base = 100.0 * position / positions_total
@@ -2452,6 +3580,12 @@ def measure_position_worker() -> None:
         (item["sweep_path"], item["record_path"], item["source_label"])
         for item in pending
     ]
+    if phase_pending is not None:
+        captures.append((
+            phase_pending["sweep_path"],
+            phase_pending["record_path"],
+            phase_pending["source_label"],
+        ))
     run_direct_capture_batch(captures, position_base, position_span * 0.65)
 
     for pending_index, item in enumerate(pending):
@@ -2485,6 +3619,32 @@ def measure_position_worker() -> None:
             "quality_recommended": response["measurement_quality"]["recommended"],
         })
         update_current(measurements=new_items, progress=position_base + position_span * (0.65 + 0.35 * (pending_index + 1) / max(1, len(pending))), eta_seconds=0)
+    phase_references = list(state.get("phase_references", []))
+    if phase_pending is not None:
+        update_current(
+            state="processing",
+            stage=f"위치 {position + 1}/{positions_total} · L/R/우퍼 상대 위상·지연 계산",
+            progress=position_base + position_span * 0.96,
+            eta_seconds=round(response_eta * 0.35),
+        )
+        phase_result = phase_reference_from_recording(
+            phase_pending["record_path"], phase_pending["metadata"], cal,
+        )
+        atomic_json(phase_pending["result_path"], phase_result)
+        phase_references = [
+            item for item in phase_references
+            if int(item.get("position", 0)) != position + 1
+        ]
+        phase_references.append({
+            "position": position + 1,
+            "recording": phase_pending["record_path"].name,
+            "signal": phase_pending["metadata_path"].name,
+            "result": phase_pending["result_path"].name,
+            "reliable": bool(phase_result["reliable"]),
+            "minimum_median_snr_db": phase_result["minimum_median_snr_db"],
+            "phase_repeatability_p90_deg": phase_result["phase_repeatability_p90_deg"],
+        })
+        update_current(phase_references=phase_references, progress=position_base + position_span)
     positions_completed = position + 1
     completion_fields: dict[str, Any] = {}
     if positions_completed < positions_total:
@@ -2501,9 +3661,9 @@ def measure_position_worker() -> None:
             )
             completion_fields["premeasured_sum_validation"] = sum_model
             if sum_model["pass"]:
-                stage = f"{positions_total}위치 정밀 측정 완료 · L/R/W 복소 합산 모델 PASS · FIR 계산 가능"
+                stage = f"{positions_total}위치 정밀 측정 완료 · L/R/우퍼 복소 합산 모델 PASS · FIR 계산 가능"
             else:
-                stage = f"{positions_total}위치 정밀 측정 완료 · L+Woofer/R+Woofer 모델 FAIL · 3단계 조치 확인"
+                stage = f"{positions_total}위치 정밀 측정 완료 · L+우퍼/R+우퍼 모델 FAIL · 3단계 조치 확인"
         else:
             stage = f"{positions_total}위치 측정 완료 · 32768탭 FIR을 생성할 수 있습니다."
         job_state = "measured"
@@ -2514,20 +3674,20 @@ def measure_position_worker() -> None:
         progress=100.0 * positions_completed / positions_total,
         eta_seconds=None,
         worker_pid=None,
+        phase_references=phase_references,
         **completion_fields,
     )
     atomic_json(directory / "session.json", state)
 
 
 def evaluate_level_samples(silence_samples: list[float], active_samples: list[float], bits: int) -> dict[str, Any]:
-    if len(silence_samples) < 4 * RATE or len(active_samples) < 4 * RATE:
+    if len(silence_samples) < round(1.5 * RATE) or len(active_samples) < round(1.5 * RATE):
         raise MeasurementError("레벨 검사 녹음 길이가 부족합니다.")
 
     def robust_ac_rms(samples: list[float]) -> float:
-        """Typical 200 ms block RMS, immune to one switching transient."""
-        trim = min(round(0.25 * RATE), len(samples) // 8)
+        trim = min(round(0.15 * RATE), len(samples) // 8)
         stable = samples[trim:len(samples) - trim] if trim else samples
-        block = round(0.20 * RATE)
+        block = round(0.15 * RATE)
         powers = []
         for start in range(0, len(stable) - block + 1, block):
             values = stable[start:start + block]
@@ -2543,59 +3703,156 @@ def evaluate_level_samples(silence_samples: list[float], active_samples: list[fl
     signal_rms = math.sqrt(signal_power)
     peak = max(abs(value) for value in active_samples)
     background_dbfs = 20.0 * math.log10(max(background_rms, 1e-15))
-    noise_dbfs = 20.0 * math.log10(max(total_rms, 1e-15))
     signal_dbfs = 20.0 * math.log10(max(signal_rms, 1e-15))
     peak_dbfs = 20.0 * math.log10(max(peak, 1e-15))
     snr_db = 10.0 * math.log10(max(signal_power, 1e-30) / max(background_rms * background_rms, 1e-30))
-    if peak_dbfs >= -1.0:
-        ok = False
-        verdict = "NOT OK · 입력 clipping 위험 · 기기 볼륨을 수동으로 낮추고 다시 검사하세요."
-    elif snr_db < 15.0:
-        ok = False
-        verdict = "NOT OK · 배경음 대비 신호가 작음 · 기기 볼륨을 수동으로 올리고 다시 검사하세요."
-    else:
-        ok = True
-        verdict = "OK · 배경음 대비 레벨과 입력 headroom이 적당합니다."
-    return {
+    return normalize_level_check({
         "bits": bits,
-        "silence_seconds": 5,
-        "white_noise_seconds": 5,
+        "silence_seconds": 2,
+        "quick_sweep_seconds": 2,
         "background_rms_dbfs": round(background_dbfs, 2),
-        "white_noise_rms_dbfs": round(noise_dbfs, 2),
         "estimated_signal_rms_dbfs": round(signal_dbfs, 2),
         "snr_db": round(snr_db, 2),
         "peak_dbfs": round(peak_dbfs, 2),
-        "required_snr_db": 15.0,
-        "estimator": "median 200 ms AC-RMS blocks after 250 ms edge trim",
-        "ok": ok,
-        "verdict": verdict,
-    }
+    })
+
+
+def level_check_source_order(state: dict[str, Any]) -> list[str]:
+    sources = list(state.get("sources", ()))
+    if all(source in sources for source in ("left", "right", "woofer")):
+        sources = ["left", "woofer", "right"] + [
+            source for source in sources if source not in ("left", "right", "woofer")
+        ]
+    if not sources:
+        raise MeasurementError("빠른 검사에 사용할 출력 조합이 없습니다.")
+    return sources
+
+
+def analyze_level_check_recordings(state: dict[str, Any], sources: list[str]) -> dict[str, Any]:
+    """Re-evaluate saved quick sweeps without replaying any audio."""
+    selector = ensure_measurement_output_path(state)
+    directory = Path(state["session_dir"])
+    level = int(state["level_dbfs"])
+    woofer_attenuation = float(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB))
+    reference, _ = generate_sweep_mono(level, 2)
+    channel_results: list[dict[str, Any]] = []
+    for index, source in enumerate(sources):
+        record_path = directory / f"level_check_{source}_recorded.wav"
+        sweep_path = directory / f"level_check_{source}_sweep.wav"
+        if not record_path.is_file() or not sweep_path.is_file():
+            raise MeasurementError(f"빠른 검사 저장 파일이 없습니다: {SOURCE_LABELS.get(source, source)}")
+        _, bits, samples = read_pcm_wav(record_path)
+        quality = sweep_capture_quality(samples, reference, source)
+        peak_dbfs = 20.0 * math.log10(max(max(abs(value) for value in samples), 1.0e-15))
+        channel = normalize_level_check({
+            "source": source,
+            "source_label": SOURCE_LABELS.get(source, source),
+            "bits": bits,
+            "snr_db": quality["snr_db"],
+            "peak_dbfs": round(peak_dbfs, 2),
+            "background_rms_dbfs": quality["background_rms_dbfs"],
+            "estimated_signal_rms_dbfs": quality["estimated_signal_rms_dbfs"],
+            "analysis_band_hz": quality["analysis_band_hz"],
+            "subwoofer_passband": quality.get("subwoofer_passband"),
+            "requested_level_dbfs": level,
+        }, level)
+        channel_results.append(channel)
+        update_current(
+            stage=f"빠른 검사 저장 원본 · {SOURCE_LABELS.get(source, source)} SNR 계산",
+            progress=80.0 + 15.0 * (index + 1) / len(sources),
+            eta_seconds=0,
+        )
+
+    worst = min(channel_results, key=lambda item: float(item.get("assessment_snr_db", -300.0)))
+    peak = max(float(item.get("assessment_peak_dbfs", -300.0)) for item in channel_results)
+    result = normalize_level_check({
+        "bits": min(int(item.get("bits", 0)) for item in channel_results),
+        "silence_seconds": 0,
+        "quick_sweep_seconds": 2,
+        "quick_sweep_count": len(channel_results),
+        "quick_sweep_method": "same ESS generator, routing, per-source passband and SNR estimator as full measurement",
+        "snr_db": float(worst["assessment_snr_db"]),
+        "peak_dbfs": peak,
+        "background_rms_dbfs": worst.get("background_rms_dbfs"),
+        "estimated_signal_rms_dbfs": worst.get("estimated_signal_rms_dbfs"),
+        "analysis_band_hz": worst.get("analysis_band_hz"),
+        "worst_source": worst.get("source"),
+        "worst_source_label": worst.get("source_label"),
+        "requested_white_noise_level_dbfs": int(state.get("noise_level_dbfs", DEFAULT_NOISE_LEVEL_DBFS)),
+        "requested_level_dbfs": level,
+        "sweep_level_dbfs": level,
+        "woofer_measurement_attenuation_db": int(woofer_attenuation),
+        "measurement_profile": state["measurement_profile"],
+        "measurement_output_label": OUTPUT_PROFILE_LABELS[state["measurement_profile"]],
+        "sweep_hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB,
+        "listening_volume_ignored_during_sweep": True,
+        "selector_state_byte": selector.get("state_byte"),
+        "channels": channel_results,
+    }, level, sources)
+    ok = result["ok"]
+    snr_db = result["snr_db"]
+    update_current(
+        state="ready",
+        stage=(
+            f"빠른 검사 {'PASS' if ok else 'FAIL'} · 최저 {result.get('worst_source_label', '출력')} "
+            f"SNR {snr_db:.1f} dB"
+        ),
+        progress=100.0,
+        eta_seconds=None,
+        worker_pid=None,
+        level_check=result,
+    )
+    return result
 
 
 def level_check_worker() -> None:
     state = load_current()
-    selector = ensure_measurement_output_path(state)
+    ensure_measurement_output_path(state)
     directory = Path(state["session_dir"])
-    level = int(state.get("noise_level_dbfs", state["level_dbfs"]))
-    noise = directory / "level_check_white_noise.wav"
-    silence_recorded = directory / "level_check_silence_5s.wav"
-    noise_recorded = directory / "level_check_white_noise_5s.wav"
-    write_white_noise(noise, level, 5)
-    run_level_sequence(noise, silence_recorded, noise_recorded)
-    _, bits, silence_samples = read_pcm_wav(silence_recorded)
-    _, _, captured_samples = read_pcm_wav(noise_recorded)
-    active_start = round(0.4 * RATE)
-    active_samples = captured_samples[active_start:active_start + 5 * RATE]
-    result = evaluate_level_samples(silence_samples, active_samples, bits)
-    result["requested_white_noise_level_dbfs"] = level
-    result["sweep_level_dbfs"] = int(state["level_dbfs"])
-    result["woofer_measurement_attenuation_db"] = int(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB))
-    result["measurement_profile"] = state["measurement_profile"]
-    result["measurement_output_label"] = OUTPUT_PROFILE_LABELS[state["measurement_profile"]]
-    result["selector_state_byte"] = selector.get("state_byte")
-    ok = result["ok"]
-    snr_db = result["snr_db"]
-    update_current(state="ready", stage=f"레벨 검사 {'OK' if ok else 'NOT OK'} · SNR {snr_db:.1f} dB", progress=100.0, eta_seconds=None, worker_pid=None, level_check=result)
+    level = int(state["level_dbfs"])
+    woofer_attenuation = float(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB))
+    sources = level_check_source_order(state)
+
+    pending: list[dict[str, Any]] = []
+    for source in sources:
+        sweep_path = directory / f"level_check_{source}_sweep.wav"
+        record_path = directory / f"level_check_{source}_recorded.wav"
+        # Use the same 15 Hz–22 kHz ESS generator and physical routing as the
+        # full measurement. Only the sweep duration is shortened to 2 s.
+        write_sweep(
+            sweep_path,
+            source,
+            level,
+            2,
+            woofer_attenuation_db=woofer_attenuation,
+        )
+        pending.append({
+            "source": source,
+            "label": SOURCE_LABELS.get(source, source),
+            "sweep": sweep_path,
+            "recorded": record_path,
+        })
+    update_current(
+        stage=f"빠른 검사 · {len(pending)}개 출력 조합을 각 2초 측정",
+        progress=5.0,
+        eta_seconds=round(len(pending) * 6),
+    )
+    run_direct_capture_batch(
+        [(item["sweep"], item["recorded"], f"빠른 검사 · {item['label']}") for item in pending],
+        5.0,
+        75.0,
+    )
+    analyze_level_check_recordings(load_current(), sources)
+
+
+def level_check_reprocess_worker() -> None:
+    state = load_current()
+    inventory = state.get("level_recording_inventory") or {}
+    if not inventory.get("can_reprocess_all"):
+        raise MeasurementError("빠른 검사 저장 원본이 모두 있어야 무음 재계산할 수 있습니다.")
+    ensure_measurement_output_path(state)
+    update_current(stage="빠른 검사 저장 원본 무음 재계산", progress=80.0, eta_seconds=0)
+    analyze_level_check_recordings(state, level_check_source_order(state))
 
 
 def validation_worker() -> None:
@@ -2701,9 +3958,14 @@ def evaluate_premeasured_sum_model(
         "magnitude_p90_db": 4.0,
         "phase_median_deg": 30.0,
         "phase_p90_deg": 75.0,
-        "minimum_snr_db": 12.0,
+        # Keep this acquisition gate identical to the quick sweep and normal
+        # response path.  15 dB is a recommendation, not a hidden later gate.
+        "minimum_snr_db": MINIMUM_USABLE_SNR_DB,
+        "recommended_snr_db": RECOMMENDED_SNR_DB,
     }
     channels: dict[str, Any] = {}
+    phase_references = load_phase_reference_results(directory, positions_total)
+    simultaneous_phase_reliable = len(phase_references) == positions_total
     all_pass = True
     all_phase_reliable = True
     all_snrs: list[float] = []
@@ -2713,17 +3975,18 @@ def evaluate_premeasured_sum_model(
         graph_frequency: list[float] = []
         graph_measured: list[float] = []
         graph_predicted: list[float] = []
-        side_phase_reliable = True
+        side_phase_reliable = simultaneous_phase_reliable or PHASE_CLOCK_SHARED
         side_snrs: list[float] = []
         for position in range(1, positions_total + 1):
             responses = {
                 source: json.loads((directory / f"p{position}_{source}_response.json").read_text(encoding="utf-8"))
                 for source in (side, "woofer", combined_source)
             }
-            side_phase_reliable = side_phase_reliable and all(
-                bool(response.get("bulk_delay_reliable", response.get("bulk_delay", {}).get("reliable", True)))
-                for response in responses.values()
-            )
+            if not simultaneous_phase_reliable:
+                side_phase_reliable = side_phase_reliable and all(
+                    bool(response.get("bulk_delay_reliable", response.get("bulk_delay", {}).get("reliable", True)))
+                    for response in responses.values()
+                )
             for response in responses.values():
                 snr = response.get("measurement_quality", {}).get("snr_db")
                 if isinstance(snr, (int, float)):
@@ -2733,14 +3996,39 @@ def evaluate_premeasured_sum_model(
             for frequency in frequencies:
                 if not low_hz <= frequency <= high_hz:
                     continue
-                main_value = response_complex(responses[side], frequency)
-                woofer_value = response_complex(responses["woofer"], frequency) * woofer_scale
-                predicted = main_value + woofer_value
+                phase_reference = phase_references[position - 1] if simultaneous_phase_reliable else None
+                main_value = phase_referenced_response_complex(
+                    responses[side], phase_reference, side, frequency,
+                )
+                woofer_value = phase_referenced_response_complex(
+                    responses["woofer"], phase_reference, "woofer", frequency,
+                ) * woofer_scale
                 measured = response_complex(responses[combined_source], frequency)
-                predicted_db = 20.0 * math.log10(max(abs(predicted), 1.0e-15))
                 measured_db = 20.0 * math.log10(max(abs(measured), 1.0e-15))
-                magnitude_errors.append(abs(predicted_db - measured_db))
-                phase_errors.append(wrapped_phase_error_degrees(predicted, measured))
+                if side_phase_reliable:
+                    predicted = main_value + woofer_value
+                    predicted_db = 20.0 * math.log10(max(abs(predicted), 1.0e-15))
+                    magnitude_errors.append(abs(predicted_db - measured_db))
+                    if simultaneous_phase_reliable:
+                        pair_key = f"{side}_woofer"
+                        residual = phase_reference.get("pairs", {}).get(pair_key, {}).get("delay_fit_residual_p90_deg")
+                        if isinstance(residual, (int, float)):
+                            phase_errors.append(float(residual))
+                    else:
+                        phase_errors.append(wrapped_phase_error_degrees(predicted, measured))
+                else:
+                    # Separate USB playback/capture clocks cannot preserve an
+                    # absolute phase origin between independent sweeps. Check
+                    # the physical sum against the triangle-inequality bounds
+                    # instead of manufacturing a complex notch from start-time
+                    # jitter. This still catches routing and relative-level
+                    # errors without claiming exact phase closure.
+                    lower = abs(abs(main_value) - abs(woofer_value))
+                    upper = abs(main_value) + abs(woofer_value)
+                    lower_db = 20.0 * math.log10(max(lower, 1.0e-15))
+                    upper_db = 20.0 * math.log10(max(upper, 1.0e-15))
+                    magnitude_errors.append(max(0.0, lower_db - measured_db, measured_db - upper_db))
+                    predicted_db = upper_db
                 if position == 1 and (not graph_frequency or frequency / graph_frequency[-1] >= 1.06):
                     graph_frequency.append(round(frequency, 3))
                     graph_measured.append(round(measured_db, 3))
@@ -2753,13 +4041,17 @@ def evaluate_premeasured_sum_model(
         magnitude_pass = bool(magnitude_errors) and magnitude_mae <= thresholds["magnitude_mae_db"] and magnitude_p90 <= thresholds["magnitude_p90_db"]
         phase_pass = side_phase_reliable and bool(phase_errors) and phase_median <= thresholds["phase_median_deg"] and phase_p90 <= thresholds["phase_p90_deg"]
         snr_pass = minimum_snr is not None and minimum_snr >= thresholds["minimum_snr_db"]
-        channel_pass = magnitude_pass and phase_pass and snr_pass
+        # U7 playback and UMIK capture do not share a hardware clock.  Accept
+        # magnitude closure with usable SNR, while reporting absolute phase as
+        # limited evidence when its direct-delay reference is unreliable.
+        channel_pass = magnitude_pass and snr_pass
         all_pass = all_pass and channel_pass
         all_phase_reliable = all_phase_reliable and side_phase_reliable
         channels[side] = {
             "pass": channel_pass,
             "magnitude_pass": magnitude_pass,
             "phase_pass": phase_pass,
+            "phase_applicable": side_phase_reliable,
             "snr_pass": snr_pass,
             "magnitude_mae_db": round(magnitude_mae, 3),
             "magnitude_p90_abs_error_db": round(magnitude_p90, 3),
@@ -2772,17 +4064,28 @@ def evaluate_premeasured_sum_model(
         }
     minimum_snr = min(all_snrs) if all_snrs else None
     if all_pass:
-        status = "pass_premeasured_complex_sum"
-        action = "추가 조치 없음. 4 · FIR 계산에서 원하는 ‘기준 음색 Target’과 ‘디지털 Crossover’를 선택하고 ‘설정으로 32768탭 FIR 생성’을 누르세요."
+        status = (
+            "pass_premeasured_magnitude_plus_simultaneous_relative_phase"
+            if simultaneous_phase_reliable else
+            "pass_premeasured_complex_sum" if all_phase_reliable else
+            "pass_premeasured_magnitude_phase_limited"
+        )
+        action = "추가 조치 없음. 4 · FIR 계산에서 타깃과 디지털 크로스오버를 선택하고 ‘FIR 계산’을 누르세요."
     elif minimum_snr is None or minimum_snr < thresholds["minimum_snr_db"]:
         status = "fail_premeasured_sum_snr"
-        action = f"2 · 레벨 확인에서 ‘Sweep 출력’ 또는 ‘Sweep 길이’를 한 단계 올리고 ‘이 출력 설정으로 레벨 검사 시작’을 누르세요. 통과 후 3 · 위치 측정에서 ‘{positions_total}위치 처음부터 재측정’을 실행하세요."
-    elif not all_phase_reliable:
-        status = "fail_premeasured_sum_phase_reference"
-        action = f"3 · 위치 측정에서 마이크를 각 표시 위치에 고정하고 ‘{positions_total}위치 처음부터 재측정’을 실행하세요. 계속 실패하면 1 · 연결·Cal에서 UMIK-1 연결과 90° Calibration을 확인하세요."
+        try:
+            configured_level = int(load_current().get("level_dbfs", DEFAULT_SWEEP_LEVEL_DBFS))
+        except Exception:
+            configured_level = DEFAULT_SWEEP_LEVEL_DBFS
+        raise_db = max(1, int(math.ceil(MINIMUM_USABLE_SNR_DB - float(minimum_snr or -120.0))))
+        recommended_level = min(0, configured_level + raise_db)
+        action = (
+            f"2 · 레벨 확인에서 스윕 출력을 {configured_level} → {recommended_level} dBFS (+{raise_db} dB)로 바꾸고 ‘레벨 확인’을 누르세요. "
+            f"그 다음 3 · 위치 측정에서 ‘{positions_total}곳 처음부터 재측정’을 실행하세요."
+        )
     else:
         status = "fail_premeasured_complex_sum"
-        action = f"T5S의 극성·LPF 노브와 Rear L/R 케이블을 확인한 뒤 3 · 위치 측정에서 ‘{positions_total}위치 처음부터 재측정’을 실행하세요. 해결되지 않으면 1 · 연결·Cal > ‘측정 구성’을 ‘표준 분리 SISO · L/R/W · 위치당 3회’로 바꾸고 ‘측정 구성 변경 적용’을 누르세요."
+        action = f"T5S 극성·LPF 노브와 우퍼 L/R 케이블을 확인한 뒤 3 · 위치 측정에서 ‘{positions_total}곳 처음부터 재측정’을 실행하세요. 계속되면 1 · 출력 설정의 ‘측정 구성’을 ‘표준 분리 SISO’로 바꾸고 ‘구성 적용’을 누르세요."
     return {
         "required": True,
         "pass": all_pass,
@@ -2791,8 +4094,14 @@ def evaluate_premeasured_sum_model(
         "woofer_measurement_attenuation_db": float(woofer_attenuation_db),
         "normalization_applied": False,
         "normalization_policy": "absolute transfer closure; never normalize L/R/W or measured sums independently",
-        "design_usage": "constraint and validation only; combined captures do not receive filters and are not averaged into L/R/W",
+        "phase_clock_shared": PHASE_CLOCK_SHARED,
+        "simultaneous_phase_reference": simultaneous_phase_reliable,
+        "limited_phase_method": None if all_phase_reliable else "measured physical sum must remain inside |Front|-|Woofer| .. |Front|+|Woofer| magnitude bounds",
+        "design_usage": "L/R/W ESS magnitudes drive FIR design; simultaneous phase references drive relative timing; combined captures validate magnitude/routing only and are never averaged into L/R/W",
         "phase_reference_reliable": all_phase_reliable,
+        "phase_verification_status": "pass" if all_phase_reliable and all(
+            bool(item.get("phase_pass")) for item in channels.values()
+        ) else "limited" if not all_phase_reliable else "fail",
         "minimum_snr_db": round(minimum_snr, 2) if minimum_snr is not None else None,
         "thresholds": thresholds,
         "channels": channels,
@@ -2926,6 +4235,7 @@ def evaluate_post_filter_sum(directory: Path, state: dict[str, Any], post: dict[
         "coverage": "fast_single_position" if positions_total == 1 else "standard_three_position",
         "level_dbfs": int(post["level_dbfs"]),
         "gain_recovery": "input sweep amplitude is included in the deconvolution reference; test dBFS affects SNR/headroom only",
+        "output_reference": "U7 PCM hardware unity (0 dB); saved listening volume is restored before normal input reconnects",
         "channels": channels,
         "target_pass": target_pass,
         "crossover_pass": crossover_pass,
@@ -2960,7 +4270,7 @@ def post_filter_validation_worker(level_dbfs: int) -> None:
         result.get("crossover", {}).get("enabled")
         or result.get("crossover", {}).get("sum_guard_enabled")
     ):
-        raise MeasurementError("필터 적용 후 합산 검증은 독립 Front/Woofer 합산 guard 또는 MIMO 구성에서 사용합니다.")
+        raise MeasurementError("필터 적용 후 합산 검증은 독립 프런트/우퍼 합산 보호 또는 MIMO 구성에서 사용합니다.")
     if not state.get("preview_active") or not state.get("preview_profile"):
         raise MeasurementError("먼저 이번 튜닝 Preview를 적용하세요.")
     ensure_post_preview_output_path(state)
@@ -2990,7 +4300,7 @@ def post_filter_validation_worker(level_dbfs: int) -> None:
         input_path = directory / f"post_p{position}_{side}_sum_input.wav"
         recorded = directory / f"post_p{position}_{side}_sum_recorded.wav"
         references[side] = write_filtered_stereo_sweep(input_path, side, level_dbfs, int(state["sweep_seconds"]))
-        pending.append((input_path, recorded, f"위치 {position}/{positions_total} · {side.title()}+Woofer"))
+        pending.append((input_path, recorded, f"위치 {position}/{positions_total} · {'L' if side == 'left' else 'R'}+우퍼"))
     run_filtered_capture_batch(pending, 0.0, 70.0)
     measurements = list(post.get("measurements", []))
     for index, side in enumerate(("left", "right")):
@@ -3106,7 +4416,8 @@ def reset_post_filter_validation() -> dict[str, Any]:
         )
         if crossover_required:
             prediction_pass = bool(
-                state["result"].get("crossover", {}).get("overall_acoustic_prediction_pass")
+                state["result"].get("crossover", {}).get("safe_deploy_pass")
+                or state["result"].get("crossover", {}).get("overall_acoustic_prediction_pass")
                 or state["result"].get("crossover", {}).get("model_prediction_pass")
             )
             if state.get("mode") in PREMEASURED_SUM_MODES:
@@ -3832,7 +5143,7 @@ def finalize_graph_with_fir(graph: dict[str, Any], impulse: list[float], fft: FF
                 else "insufficient_data"
             ),
             "pass": median_error is not None and abs(median_error) <= 2.0,
-            "note": "공통 Front 기준의 Woofer 유효 저역 branch 레벨입니다. 측정 감쇄는 deconvolution으로 제거됩니다. 최종 Target은 표준 구성에서는 같은 clock의 L/R/W 복소합으로, 정밀 구성에서는 미리 측정한 L+Woofer/R+Woofer로 모델을 검증한 뒤 전체 합산으로 판정합니다.",
+            "note": "공통 프런트 기준의 우퍼 유효 저역 분기 레벨입니다. 측정 감쇄는 역컨볼루션으로 제거됩니다. 최종 타깃은 감쇄 전용 합산 상한으로 판정하고, 정밀 구성은 미리 측정한 L+우퍼/R+우퍼로 물리 합산 크기를 추가 검증합니다.",
         }
         graph["target_fit"] = {
             "applicable": False,
@@ -3840,8 +5151,8 @@ def finalize_graph_with_fir(graph: dict[str, Any], impulse: list[float], fft: FF
             "mae_db": None,
             "p90_abs_error_db": None,
             "pass": None,
-            "reason": "독립 Woofer branch는 전체 L+Woofer/R+Woofer 시스템 타겟의 판정 대상이 아닙니다.",
-            "note": "Woofer 단독은 유효 저역 상대레벨만 진단하고, Crossover ON/OFF 모두 최종 합산 응답으로 타겟을 판정합니다.",
+            "reason": "독립 우퍼 분기는 전체 L+우퍼/R+우퍼 시스템 타깃의 판정 대상이 아닙니다.",
+            "note": "우퍼 단독은 유효 저역 상대레벨만 진단하고, 크로스오버 켜짐/꺼짐 모두 최종 합산 응답으로 타깃을 판정합니다.",
         }
     else:
         graph["target_fit"] = {
@@ -4094,6 +5405,61 @@ def response_complex(response: dict[str, Any], frequency: float) -> complex:
     return magnitude * complex(math.cos(phase), math.sin(phase))
 
 
+def load_phase_reference_results(directory: Path, positions_total: int) -> list[dict[str, Any]]:
+    results = []
+    for position in range(1, positions_total + 1):
+        path = directory / f"p{position}_phase_reference.json"
+        if not path.is_file():
+            return []
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(value, dict) or not value.get("reliable"):
+            return []
+        if not all(source in value.get("sources", {}) for source in ("left", "right", "woofer")):
+            return []
+        results.append(value)
+    return results
+
+
+def phase_referenced_response_complex(
+    response: dict[str, Any],
+    phase_reference: dict[str, Any] | None,
+    source: str,
+    frequency: float,
+) -> complex:
+    """Use ESS magnitude with same-recording phase; never renormalize a branch."""
+    if phase_reference is None:
+        return response_complex(response, frequency)
+    source_phase = phase_reference.get("sources", {}).get(source, {})
+    frequencies = source_phase.get("frequencies")
+    phases = source_phase.get("phase_rad")
+    if not isinstance(frequencies, list) or not isinstance(phases, list) or len(frequencies) != len(phases) or len(frequencies) < 2:
+        return response_complex(response, frequency)
+    if not float(frequencies[0]) <= frequency <= float(frequencies[-1]):
+        return response_complex(response, frequency)
+    magnitude_db = interpolate_log(response["frequencies"], response["db"], frequency)
+    phase = interpolate_linear([float(value) for value in frequencies], [float(value) for value in phases], frequency)
+    magnitude = 10.0 ** (magnitude_db / 20.0)
+    return magnitude * complex(math.cos(phase), math.sin(phase))
+
+
+def phase_reference_coverage(results: list[dict[str, Any]], sources: tuple[str, ...]) -> tuple[float, float] | None:
+    if not results:
+        return None
+    lows, highs = [], []
+    for result in results:
+        for source in sources:
+            frequencies = result.get("sources", {}).get(source, {}).get("frequencies", [])
+            if not isinstance(frequencies, list) or len(frequencies) < 2:
+                return None
+            lows.append(float(frequencies[0]))
+            highs.append(float(frequencies[-1]))
+    low, high = max(lows), min(highs)
+    return (low, high) if low < high else None
+
+
 def multiply_firs(first: list[float], second: list[float], fft: FFTBackend) -> list[float]:
     fft_length = TAPS * 2
     first_spectrum = fft.rfft(first, fft_length)
@@ -4163,6 +5529,24 @@ def apply_joint_crossover_guard(
         for source in ("left", "right", "woofer"):
             row[source] = json.loads((directory / f"p{position}_{source}_response.json").read_text(encoding="utf-8"))
         positions.append(row)
+    phase_references = load_phase_reference_results(directory, positions_total)
+    simultaneous_phase_coverage = phase_reference_coverage(
+        phase_references, ("left", "right", "woofer")
+    )
+    simultaneous_phase_reliable = bool(
+        len(phase_references) == positions_total and simultaneous_phase_coverage
+    )
+
+    def phase_available(frequency: float) -> bool:
+        if simultaneous_phase_reliable and simultaneous_phase_coverage is not None:
+            return simultaneous_phase_coverage[0] <= frequency <= simultaneous_phase_coverage[1]
+        return bool(time_alignment_reliable)
+
+    def acoustic_value(position_index: int, source: str, frequency: float) -> complex:
+        reference = phase_references[position_index] if simultaneous_phase_reliable else None
+        return phase_referenced_response_complex(
+            positions[position_index][source], reference, source, frequency,
+        )
     frequency_grid = [float(value) for value in positions[0]["left"]["frequencies"]]
     target_f, target_db = target_curve(target_name)
     fft_length = TAPS * 2
@@ -4178,6 +5562,9 @@ def apply_joint_crossover_guard(
         initial_rear_spectra = [fft.rfft(rear_channels[0], fft_length), fft.rfft(rear_channels[1], fft_length)]
         phase_low = max(30.0, crossover_frequency_hz * 0.55)
         phase_high = min(300.0, crossover_frequency_hz * 1.80)
+        if simultaneous_phase_coverage is not None:
+            phase_low = max(phase_low, simultaneous_phase_coverage[0])
+            phase_high = min(phase_high, simultaneous_phase_coverage[1])
         phase_frequencies: list[float] = []
         for frequency in frequency_grid:
             if phase_low <= frequency <= phase_high and (
@@ -4207,14 +5594,14 @@ def apply_joint_crossover_guard(
                         math.sin(-2.0 * math.pi * frequency * rear_delay / RATE),
                     )
                     position_errors = []
-                    for position in positions:
+                    for position_index, position in enumerate(positions):
                         main = (
-                            response_complex(position[source], frequency)
+                            acoustic_value(position_index, source, frequency)
                             * fir_value(initial_front_spectra[channel], frequency)
                             * front_rotation
                         )
                         woofer = (
-                            response_complex(position["woofer"], frequency)
+                            acoustic_value(position_index, "woofer", frequency)
                             * fir_value(initial_rear_spectra[channel], frequency)
                             * rear_rotation
                         )
@@ -4228,11 +5615,37 @@ def apply_joint_crossover_guard(
             score = mae + 0.45 * p90 + abs(relative_delay_samples) * 1.0e-6
             return score, mae, p90
 
-        search_limit = min(MAX_PHASE_SHIFT, max(240, round(RATE / max(phase_low, 1.0))))
+        if len(phase_frequencies) < 3:
+            time_alignment_reliable = False
+            phase_optimization["reason"] = "동시 위상 기준의 crossover 공통 tone이 3개 미만이라 상대 지연을 적용하지 않았습니다."
+        search_limit = min(MAX_PHASE_SHIFT, round(RATE * 0.015))
+        search_center = 0
+        search_radius = search_limit
+        reference_delay_estimates = []
+        reference_fit_residuals = []
+        if simultaneous_phase_reliable:
+            for reference in phase_references:
+                for pair_key in ("left_woofer", "right_woofer"):
+                    pair = reference.get("pairs", {}).get(pair_key, {})
+                    delay = pair.get("second_minus_first_delay_samples")
+                    residual = pair.get("delay_fit_residual_p90_deg")
+                    if isinstance(delay, (int, float)) and isinstance(residual, (int, float)):
+                        reference_delay_estimates.append(float(delay))
+                        reference_fit_residuals.append(float(residual))
+            if reference_delay_estimates and percentile(reference_fit_residuals, 0.90) <= 60.0:
+                front_filter_delay = statistics.median((fir_energy_delay(left_ir), fir_energy_delay(right_ir)))
+                rear_filter_delay = statistics.median((fir_energy_delay(rear_channels[0]), fir_energy_delay(rear_channels[1])))
+                total_woofer_minus_front = statistics.median(reference_delay_estimates) + rear_filter_delay - front_filter_delay
+                search_center = max(-search_limit, min(search_limit, round(-total_woofer_minus_front)))
+                search_radius = min(search_limit, 240)
         coarse_step = 4
         candidates: list[tuple[float, int, int, float, float, int]] = []
         for polarity in (1, -1):
-            for relative_delay in range(-search_limit, search_limit + 1, coarse_step):
+            for relative_delay in range(
+                max(-search_limit, search_center - search_radius),
+                min(search_limit, search_center + search_radius) + 1,
+                coarse_step,
+            ):
                 score, mae, p90 = alignment_score(relative_delay, polarity)
                 candidates.append((score, abs(relative_delay), relative_delay, mae, p90, polarity))
         coarse_best = min(candidates)
@@ -4247,17 +5660,30 @@ def apply_joint_crossover_guard(
             fine_candidates.append((score, abs(relative_delay), relative_delay, mae, p90, best_polarity))
         best = min(fine_candidates)
         best_relative, best_mae, best_p90, best_polarity = best[2], best[3], best[4], best[5]
-        if best_relative < 0:
-            left_ir = delay_fir(left_ir, -best_relative)
-            right_ir = delay_fir(right_ir, -best_relative)
-        elif best_relative > 0:
-            rear_channels = [delay_fir(channel, best_relative) for channel in rear_channels]
-        if best_polarity < 0:
-            rear_channels = [[-value for value in channel] for channel in rear_channels]
+        baseline_score, baseline_mae, baseline_p90 = alignment_score(0, 1)
+        improvement = baseline_score - best[0]
+        apply_alignment = (
+            len(phase_frequencies) >= 3
+            and math.isfinite(best[0])
+            and (best_relative != 0 or best_polarity != 1)
+            and improvement >= 0.25
+            and best_p90 <= baseline_p90 + 0.25
+        )
+        if apply_alignment:
+            if best_relative < 0:
+                left_ir = delay_fir(left_ir, -best_relative)
+                right_ir = delay_fir(right_ir, -best_relative)
+            elif best_relative > 0:
+                rear_channels = [delay_fir(channel, best_relative) for channel in rear_channels]
+            if best_polarity < 0:
+                rear_channels = [[-value for value in channel] for channel in rear_channels]
+        else:
+            best_relative, best_polarity = 0, 1
+            best_mae, best_p90 = baseline_mae, baseline_p90
         phase_optimization = {
             "requested": True,
-            "enabled": True,
-            "method": "measured complex-sum robust search across both L/R and all positions",
+            "enabled": apply_alignment,
+            "method": "same-recording relative-phase constrained robust search across L/R and all positions" if simultaneous_phase_reliable else "measured complex-sum robust search across both L/R and all positions",
             "evaluation_band_hz": [round(phase_low, 1), round(phase_high, 1)],
             "relative_delay_samples": best_relative,
             "relative_delay_ms": round(best_relative * 1000.0 / RATE, 4),
@@ -4265,16 +5691,24 @@ def apply_joint_crossover_guard(
             "polarity": best_polarity,
             "predicted_mae_db_before_guard": round(best_mae, 3),
             "predicted_p90_db_before_guard": round(best_p90, 3),
+            "baseline_mae_db": round(baseline_mae, 3),
+            "baseline_p90_db": round(baseline_p90, 3),
+            "score_improvement": round(max(0.0, improvement), 4),
+            "reason": None if apply_alignment else "0.25 dB 이상의 안정적인 합산 개선이 없어 지연·극성을 변경하지 않았습니다.",
             "search_limit_samples": search_limit,
+            "search_center_samples": search_center,
+            "search_radius_samples": search_radius,
         }
     elif optimize_relative_phase:
         phase_optimization["reason"] = "직접음 bulk delay가 신뢰되지 않아 자동 극성·상대 지연 최적화를 적용하지 않았습니다."
 
     front_spectra = [fft.rfft(left_ir, fft_length), fft.rfft(right_ir, fft_length)]
     rear_spectra = [fft.rfft(rear_channels[0], fft_length), fft.rfft(rear_channels[1], fft_length)]
-    phase_reliable = bool(time_alignment_reliable) and all(
-        bool(position[source].get("bulk_delay_reliable", position[source].get("bulk_delay", {}).get("reliable", True)))
-        for position in positions for source in ("left", "right", "woofer")
+    phase_reliable = simultaneous_phase_reliable or (
+        bool(time_alignment_reliable) and all(
+            bool(position[source].get("bulk_delay_reliable", position[source].get("bulk_delay", {}).get("reliable", True)))
+            for position in positions for source in ("left", "right", "woofer")
+        )
     )
     # With LR4 enabled the overlap is intentionally local to the crossover.
     # With LR4 disabled both independently measured branches remain full range,
@@ -4301,18 +5735,18 @@ def apply_joint_crossover_guard(
             )
             upper_values = []
             complex_values = []
-            for position in positions:
-                main = response_complex(position[source], frequency) * fir_value(front_spectra[channel], frequency)
-                woofer = response_complex(position["woofer"], frequency) * fir_value(rear_spectra[channel], frequency)
+            for position_index, position in enumerate(positions):
+                main = acoustic_value(position_index, source, frequency) * fir_value(front_spectra[channel], frequency)
+                woofer = acoustic_value(position_index, "woofer", frequency) * fir_value(rear_spectra[channel], frequency)
                 upper_values.append(20.0 * math.log10(max(abs(main) + abs(woofer), 1.0e-15)) - target_absolute)
                 complex_values.append(20.0 * math.log10(max(abs(main + woofer), 1.0e-15)) - target_absolute)
             # Reliable complex measurements let us guard the maximum actually
             # observed L+W/R+W sum.  Cutting against |L|+|W| regardless of phase
             # can over-attenuate by ~6 dB and create a false target failure.
             # Fall back to the coherent mathematical upper bound only when the
-            # phase reference is unavailable, in which case acoustic PASS is
-            # intentionally withheld until a filtered post-measurement exists.
-            upper_excess = max(complex_values if phase_reliable else upper_values)
+            # phase reference is unavailable. In that case the conservative
+            # bound is a deployable safety PASS and exact phase remains WARN.
+            upper_excess = max(complex_values if phase_available(frequency) else upper_values)
             initial_upper_excess[channel].append(upper_excess)
             taper = 1.0
             if frequency < 20.0 or frequency > guard_high:
@@ -4344,13 +5778,14 @@ def apply_joint_crossover_guard(
     channels: dict[str, Any] = {}
     all_upper_pass = True
     all_complex_pass = True
+    all_target_estimate_pass = True
     for channel, source in enumerate(("left", "right")):
         upper_excesses = []
         complex_errors = []
         complex_signed_errors = []
-        graph_frequency, graph_target, graph_complex, graph_upper, graph_guard = [], [], [], [], []
+        graph_frequency, graph_target, graph_complex, graph_energy, graph_upper, graph_guard = [], [], [], [], [], []
         for frequency, guard_db in zip(frequency_grid, smoothed_guards[channel]):
-            if not 20.0 <= frequency <= guard_high:
+            if not 20.0 <= frequency <= 20_000.0:
                 continue
             target_absolute = (
                 interpolate_log(target_f, target_db, frequency)
@@ -4359,46 +5794,77 @@ def apply_joint_crossover_guard(
                 - shared_target_reference_db
                 + shared_front_reference_db
             )
-            complex_levels, upper_levels = [], []
-            for position in positions:
-                main = response_complex(position[source], frequency) * fir_value(final_front_spectra[channel], frequency)
-                woofer = response_complex(position["woofer"], frequency) * fir_value(final_rear_spectra[channel], frequency)
+            complex_levels, energy_levels, upper_levels = [], [], []
+            for position_index, position in enumerate(positions):
+                main = acoustic_value(position_index, source, frequency) * fir_value(final_front_spectra[channel], frequency)
+                woofer = acoustic_value(position_index, "woofer", frequency) * fir_value(final_rear_spectra[channel], frequency)
                 complex_levels.append(20.0 * math.log10(max(abs(main + woofer), 1.0e-15)))
+                energy_levels.append(10.0 * math.log10(max(abs(main) ** 2 + abs(woofer) ** 2, 1.0e-30)))
                 upper_levels.append(20.0 * math.log10(max(abs(main) + abs(woofer), 1.0e-15)))
             predicted = statistics.median(complex_levels)
+            energy_sum = statistics.median(energy_levels)
             upper = max(upper_levels)
-            guarded_upper = max(complex_levels) if phase_reliable else upper
-            upper_excesses.append(max(0.0, guarded_upper - target_absolute))
-            signed_error = predicted - target_absolute
-            complex_signed_errors.append(signed_error)
-            complex_errors.append(abs(signed_error))
+            reliable_here = phase_available(frequency)
+            guarded_upper = max(complex_levels) if reliable_here else upper
+            target_estimate = predicted if reliable_here else energy_sum
+            signed_error = target_estimate - target_absolute
+            if frequency <= guard_high:
+                upper_excesses.append(max(0.0, guarded_upper - target_absolute))
+                complex_signed_errors.append(signed_error)
+                complex_errors.append(abs(signed_error))
             if not graph_frequency or frequency / graph_frequency[-1] >= 1.04:
                 graph_frequency.append(round(frequency, 2))
                 graph_target.append(round(target_absolute - shared_front_reference_db, 3))
                 graph_complex.append(round(predicted - shared_front_reference_db, 3))
+                graph_energy.append(round(energy_sum - shared_front_reference_db, 3))
                 graph_upper.append(round(upper - shared_front_reference_db, 3))
                 graph_guard.append(round(guard_db, 3))
         upper_p95 = percentile(upper_excesses, 0.95)
         complex_mae = sum(complex_errors) / len(complex_errors) if complex_errors else 0.0
         complex_p90 = percentile(complex_errors, 0.90)
+        target_graph_values = graph_complex if phase_reliable else graph_energy
+        crossover_dips = [
+            (frequency, predicted - target)
+            for frequency, predicted, target in zip(graph_frequency, target_graph_values, graph_target)
+            if max(30.0, crossover_frequency_hz * 0.55) <= frequency <= min(300.0, crossover_frequency_hz * 2.0)
+        ]
+        deepest_dip_frequency, deepest_dip_db = min(crossover_dips, key=lambda item: item[1]) if crossover_dips else (None, 0.0)
         upper_pass = bool(upper_excesses) and upper_p95 <= 1.0
-        complex_pass = phase_reliable and bool(complex_errors) and complex_mae <= 3.5 and complex_p90 <= 7.0
+        target_estimate_pass = bool(complex_errors) and complex_mae <= 3.5 and complex_p90 <= 7.0
+        complex_pass = phase_reliable and target_estimate_pass
         all_upper_pass = all_upper_pass and upper_pass
         all_complex_pass = all_complex_pass and complex_pass
+        all_target_estimate_pass = all_target_estimate_pass and target_estimate_pass
         channels[source] = {
             "frequency": graph_frequency,
             "target_db": graph_target,
             "predicted_complex_db": graph_complex,
+            "phase_agnostic_energy_db": graph_energy,
             "coherent_upper_db": graph_upper,
             "overlap_guard_db": graph_guard,
             "coherent_upper_excess_p95_db": round(upper_p95, 3),
             "guarded_upper_excess_p95_db": round(upper_p95, 3),
-            "guard_basis": "maximum measured complex sum" if phase_reliable else "phase-agnostic |Front|+|Woofer| upper bound",
+            "guard_basis": "same-recording complex sum inside phase coverage; phase-agnostic upper bound outside" if simultaneous_phase_reliable else "maximum measured complex sum" if phase_reliable else "phase-agnostic |Front|+|Woofer| upper bound",
             "complex_target_mae_db": round(complex_mae, 3),
             "complex_target_p90_db": round(complex_p90, 3),
-            "complex_target_median_error_db": round(statistics.median(complex_signed_errors), 3) if complex_signed_errors else None,
+            "complex_target_median_error_db": round(statistics.median(complex_signed_errors), 3) if phase_reliable and complex_signed_errors else None,
+            "target_estimate_basis": "same-recording complex sum inside phase coverage; energy sum outside" if simultaneous_phase_reliable else "measured complex sum" if phase_reliable else "phase-agnostic energy sum",
+            "target_estimate_mae_db": round(complex_mae, 3),
+            "target_estimate_p90_db": round(complex_p90, 3),
+            "target_estimate_median_error_db": round(statistics.median(complex_signed_errors), 3) if complex_signed_errors else None,
+            "target_estimate_pass": target_estimate_pass,
             "complex_prediction_reliable": phase_reliable,
-            "pass": upper_pass and complex_pass,
+            "graph_range_hz": [20.0, 20_000.0],
+            "metric_range_hz": [20.0, round(guard_high, 2)],
+            "deepest_crossover_dip_hz": round(deepest_dip_frequency, 1) if deepest_dip_frequency is not None else None,
+            "deepest_crossover_dip_db": round(deepest_dip_db, 2),
+            "deep_notch_detected": deepest_dip_db <= -6.0,
+            "deep_notch_action": (
+                "부스트하지 마세요. 4 · FIR 계산에서 위상 방식을 ‘저역 음량+excess phase’로 두고 크로스오버 주파수를 한 단계 바꿔 비교하세요. 계속되면 우퍼 극성·거리·위치를 확인하세요."
+                if deepest_dip_db <= -6.0 else
+                "추가 조치 없음"
+            ),
+            "pass": upper_pass and target_estimate_pass,
         }
     return left_ir, right_ir, rear_channels, {
         "enabled": bool(crossover_enabled),
@@ -4414,20 +5880,29 @@ def apply_joint_crossover_guard(
         "additional_runtime_filters": 0,
         "additional_block_latency_samples": 0,
         "phase_alignment_reliable": phase_reliable,
+        "simultaneous_phase_reference": simultaneous_phase_reliable,
+        "simultaneous_phase_coverage_hz": (
+            [round(simultaneous_phase_coverage[0], 3), round(simultaneous_phase_coverage[1], 3)]
+            if simultaneous_phase_coverage is not None else None
+        ),
         "relative_phase_optimization": phase_optimization,
-        "sum_guard_basis": "maximum measured complex sum" if phase_reliable else "phase-agnostic coherent upper bound",
+        "sum_guard_basis": "same-recording L/R/W phase in crossover coverage plus conservative upper bound outside" if simultaneous_phase_reliable else "maximum measured complex sum" if phase_reliable else "phase-agnostic coherent upper bound",
         "coherent_upper_guard_pass": all_upper_pass,
         "complex_sum_target_pass": all_complex_pass if phase_reliable else None,
+        "phase_agnostic_target_pass": all_target_estimate_pass if not phase_reliable else None,
         "overall_acoustic_prediction_pass": all_upper_pass and all_complex_pass if phase_reliable else False,
-        "status": "pass" if phase_reliable and all_upper_pass and all_complex_pass else "limited_unverified_phase" if all_upper_pass and not phase_reliable else "fail_target" if all_upper_pass else "fail_upper_guard",
+        "safe_deploy_pass": all_upper_pass and all_target_estimate_pass,
+        "phase_verification_status": "pass" if phase_reliable and all_complex_pass else "fail" if phase_reliable else "limited",
+        "status": "pass" if phase_reliable and all_upper_pass and all_complex_pass else "pass_safe_upper_phase_limited" if all_upper_pass and all_target_estimate_pass and not phase_reliable else "fail_target" if all_upper_pass else "fail_upper_guard",
         "channels": channels,
-        "policy": "Never boost to repair a crossover null; cap the worst measured-position constructive upper envelope and require a reliable same-clock complex prediction before claiming model success. Precision L+Woofer/R+Woofer captures additionally verify absolute model closure before FIR calculation.",
+        "policy": "Never boost to repair a crossover null; cap the worst measured-position constructive upper envelope. Reliable phase additionally verifies the complex target; limited phase remains an explicit warning and uses the conservative cut-only upper bound instead of blocking a safe FIR.",
     }
 
 
 def build_mimo_worker(state: dict[str, Any], options: dict[str, Any]) -> None:
-    if not platform_capabilities()["mimo_supported"]:
-        raise MeasurementError("MIMO 계산과 활성화는 Raspberry Pi 4/5 전용입니다.")
+    capability = platform_capabilities()
+    if not capability["mimo_supported"]:
+        raise MeasurementError(f"MIMO 계산을 시작할 수 없습니다: {capability.get('reason', '플랫폼 또는 timing reference 조건 미충족')}")
     directory = Path(state["session_dir"])
     session_path = directory / "session.json"
     options_path = directory / "mimo-build-options.json"
@@ -4486,7 +5961,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     if state.get("mode") == "lr" and crossover_enabled:
         raise MeasurementError(
             "디지털 crossover ON은 L/R/W 개별 측정이 필요합니다. "
-            "L+Woofer/R+Woofer 합산 모드는 Front와 Woofer를 독립 HPF/LPF로 나눌 수 없습니다."
+            "L+우퍼/R+우퍼 합산 모드는 프런트와 우퍼를 독립 HPF/LPF로 나눌 수 없습니다."
         )
     if state.get("mode") in MIMO_MODES:
         build_mimo_worker(state, {
@@ -4506,10 +5981,15 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     measured_woofer_attenuation_db = int(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB))
     if state.get("mode") == "lr" and woofer_trim_db != measured_woofer_attenuation_db:
         raise MeasurementError(
-            "L+Woofer / R+Woofer 합산 측정에서는 최종 Woofer trim이 "
+            "L+우퍼/R+우퍼 합산 측정에서는 최종 우퍼 트림이 "
             f"측정 상대레벨({measured_woofer_attenuation_db} dB)과 같아야 합니다."
         )
     directory = Path(state["session_dir"])
+    phase_reference_results = load_phase_reference_results(directory, positions_total)
+    phase_reference_reliable = bool(
+        len(phase_reference_results) == positions_total
+        and phase_reference_coverage(phase_reference_results, ("left", "right", "woofer"))
+    )
     update_current(state="processing", stage="공간 평균 응답 계산", progress=5.0, eta_seconds=build_eta)
     fft = FFTBackend()
     left_source, right_source = (
@@ -4575,7 +6055,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     rear_graph = None
     rear_channels = None
     if state["mode"] in SEPARATE_WOOFER_MODES:
-        update_current(stage="Woofer 32768탭 FIR 계산", progress=72.0, eta_seconds=round(build_eta * 0.30))
+        update_current(stage="우퍼 32768탭 FIR 계산", progress=72.0, eta_seconds=round(build_eta * 0.30))
         woofer_response = load_average_response(directory, "woofer", spatial_mode, positions_total)
         woofer_f, woofer_db = woofer_response["frequencies"], woofer_response["average_db"]
         woofer_phase_reliable = bool(woofer_response.get("center_bulk_delay_reliable", True))
@@ -4616,11 +6096,15 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     }
     if state["mode"] in SEPARATE_WOOFER_MODES and phase_mode == "bass" and rear_channels is not None:
         alignment_limit = MAX_PHASE_SHIFT + 960
-        alignment_reliable = bool(front_phase_reliable and woofer_response.get("center_bulk_delay_reliable", True))
+        alignment_reliable = bool(
+            PHASE_CLOCK_SHARED
+            and front_phase_reliable
+            and woofer_response.get("center_bulk_delay_reliable", True)
+        )
         if not alignment_reliable:
             time_alignment.update({
                 "reliable": False,
-                "reason": "Front/Woofer direct impulse delay is not reliable; no relative delay was applied",
+                "reason": "U7/UMIK hardware clock 또는 프런트/우퍼 직접음 지연 기준이 공유·검증되지 않아 상대 지연을 적용하지 않았습니다.",
                 "front_bulk_delay_reliable": front_phase_reliable,
                 "rear_bulk_delay_reliable": bool(woofer_response.get("center_bulk_delay_reliable", True)),
                 "rear_bulk_delay": woofer_response.get("center_bulk_delay"),
@@ -4688,10 +6172,10 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         "additional_runtime_filters": 0,
         "additional_block_latency_samples": 0,
         "status": "disabled",
-        "reason": "사용자가 crossover를 OFF로 선택했습니다." if not crossover_enabled else "이 측정 topology에는 독립 Front/Woofer branch가 없습니다.",
+        "reason": "사용자가 크로스오버를 꺼짐으로 선택했습니다." if not crossover_enabled else "이 측정 구성에는 독립 프런트/우퍼 분기가 없습니다.",
     }
     if state["mode"] in SEPARATE_WOOFER_MODES and rear_channels is not None:
-        update_current(stage="Front+Woofer 전체 합산 안전 투영", progress=86.0, eta_seconds=round(build_eta * 0.10))
+        update_current(stage="프런트+우퍼 전체 합산 안전 투영", progress=86.0, eta_seconds=round(build_eta * 0.10))
         left_ir, right_ir, rear_channels, crossover_summary = apply_joint_crossover_guard(
             directory,
             left_ir,
@@ -4709,11 +6193,34 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             # A reliable absolute impulse reference is sufficient for complex
             # prediction even when the user selected magnitude-only phase and
             # therefore requested no relative-delay correction.
-            time_alignment_reliable=bool(front_phase_reliable and woofer_phase_reliable),
+            time_alignment_reliable=bool(
+                phase_reference_reliable
+                or (PHASE_CLOCK_SHARED and front_phase_reliable and woofer_phase_reliable)
+            ),
             optimize_relative_phase=phase_mode == "bass",
             positions_total=positions_total,
             fft=fft,
         )
+        phase_optimization = crossover_summary.get("relative_phase_optimization", {})
+        if phase_optimization.get("enabled"):
+            relative_delay = int(phase_optimization.get("relative_delay_samples", 0))
+            time_alignment = {
+                "requested": phase_mode == "bass",
+                "enabled": True,
+                "reliable": True,
+                "aligned": True,
+                "front_delay_samples": max(0, -relative_delay),
+                "rear_delay_samples": max(0, relative_delay),
+                "relative_delay_samples": relative_delay,
+                "relative_delay_ms": round(relative_delay * 1000.0 / RATE, 4),
+                "woofer_polarity": int(phase_optimization.get("polarity", 1)),
+                "method": phase_optimization.get("method"),
+                "reference": (
+                    "simultaneous L/R/W multisine at every microphone position"
+                    if phase_reference_reliable else
+                    "shared hardware timing reference"
+                ),
+            }
         for graph, channel_name in ((left_graph, "left"), (right_graph, "right"), (rear_graph, "left")):
             guard_graph = crossover_summary["channels"][channel_name]
             guard_frequencies = guard_graph["frequency"]
@@ -4764,6 +6271,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     lr_differences = [abs(l_value - r_value) for frequency, l_value, r_value in zip(left_f, left_db, right_db) if 80.0 <= frequency <= 10_000.0]
     all_variation = [value for frequency, value in zip(left_f, left_response["spatial_std_db"]) if 20.0 <= frequency <= 20_000.0] + [value for frequency, value in zip(right_f, right_response["spatial_std_db"]) if 20.0 <= frequency <= 20_000.0]
     measurement_snrs = []
+    measurement_peaks = []
     reused_measurements = []
     reused_keys: set[tuple[int, str]] = set()
     seen_response_signatures: dict[str, tuple[int, str]] = {}
@@ -4774,6 +6282,8 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             quality = response_value.get("measurement_quality", {})
             if isinstance(quality.get("snr_db"), (int, float)):
                 measurement_snrs.append(float(quality["snr_db"]))
+            if isinstance(quality.get("peak_dbfs"), (int, float)):
+                measurement_peaks.append(float(quality["peak_dbfs"]))
             reused_from = response_value.get("measurement", {}).get("reused_from_position")
             if reused_from is not None:
                 reused_measurements.append({"position": position, "source": source, "reused_from_position": reused_from, "detected_by": "capture_metadata"})
@@ -4849,30 +6359,30 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         crossover_sum_pass = bool(
             premeasured_sum_model
             and premeasured_sum_model.get("pass")
-            and crossover_summary.get("overall_acoustic_prediction_pass")
+            and crossover_summary.get("safe_deploy_pass")
         )
-        crossover_sum_status = (
-            "pass_premeasured_model"
-            if crossover_sum_pass else
-            str(
+        if crossover_sum_pass:
+            precise_phase_pass = bool(
+                (premeasured_sum_model or {}).get("phase_verification_status") == "pass"
+                and crossover_summary.get("phase_verification_status") == "pass"
+            )
+            crossover_sum_status = "pass_premeasured_complex_model" if precise_phase_pass else "pass_safe_sum_phase_limited"
+        else:
+            crossover_sum_status = str(
                 (premeasured_sum_model or {}).get("status")
                 if not (premeasured_sum_model or {}).get("pass")
                 else crossover_summary.get("status") or "fail_model"
             )
-        )
     else:
-        # The independently measured L/R/W sweeps share one capture/playback
-        # clock and retain their absolute impulse reference.  Their complex
-        # transfer functions therefore provide a deployable pre-build sum
-        # prediction; a second sweep after FIR generation is useful evidence,
-        # but must never be a mandatory wizard step.  Precision mode adds the
-        # physical L+W/R+W captures to verify this model closure before build.
+        # The independently measured L/R/W responses provide a deployable
+        # conservative upper-bound prediction even when U7 playback and UMIK
+        # capture do not provide a reliable shared phase reference. Precision
+        # mode adds physical L+W/R+W captures before the build.
         prediction_status = str(crossover_summary.get("status") or "")
-        crossover_sum_pass = bool(crossover_summary.get("overall_acoustic_prediction_pass"))
+        crossover_sum_pass = bool(crossover_summary.get("safe_deploy_pass"))
         crossover_sum_status = (
-            "pass_independent_complex_model"
-            if crossover_sum_pass else
-            prediction_status or "fail_model"
+            ("pass_independent_complex_model" if crossover_summary.get("phase_verification_status") == "pass" else "pass_safe_upper_phase_limited")
+            if crossover_sum_pass else (prediction_status or "fail_model")
         )
     overall_pass = core_target_pass and (
         not crossover_required or crossover_sum_pass is True
@@ -4886,6 +6396,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         "spatial_high_variance_percent": round(100.0 * sum(value >= 6.0 for value in all_variation) / len(all_variation), 1) if all_variation else None,
         "measurement_snr_min_db": round(min(measurement_snrs), 2) if measurement_snrs else None,
         "measurement_snr_median_db": round(statistics.median(measurement_snrs), 2) if measurement_snrs else None,
+        "measurement_peak_max_dbfs": round(max(measurement_peaks), 2) if measurement_peaks else None,
         "warnings": [],
     }
     if diagnostics["lr_median_difference_db"] is not None and diagnostics["lr_median_difference_db"] > 4.0:
@@ -4897,23 +6408,23 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     if reused_measurements:
         diagnostics["warnings"].append("하나 이상의 위치 응답이 다른 위치 측정을 재사용했습니다. 기능 시험에는 쓸 수 있지만 3위치 acoustic 검증으로 판정하지 않습니다.")
     if positions_total == 1:
-        diagnostics["warnings"].append("Fast 1위치 결과입니다. 기준 청취점은 보정하지만 위치 이동에 따른 공간 안정성은 검증하지 않았습니다.")
+        diagnostics["warnings"].append("빠른 측정 1위치 결과입니다. 기준 청취점은 보정하지만 위치 이동에 따른 공간 안정성은 검증하지 않았습니다.")
     if not all(item is None or item.get("applicable") is False or item.get("pass") for item in target_fit.values()):
         diagnostics["warnings"].append("안전 제한 때문에 일부 채널이 선택 타겟을 허용 오차 안에서 완전히 달성하지 못했습니다.")
     if time_alignment.get("requested") and not time_alignment.get("enabled"):
-        diagnostics["warnings"].append(f"Front/Woofer 시간 정렬 미적용: {time_alignment.get('reason', '신뢰도 부족')}")
+        diagnostics["warnings"].append(f"프런트/우퍼 시간 정렬 미적용: {time_alignment.get('reason', '신뢰도 부족')}")
     if state["mode"] == "lrw":
         diagnostics["warnings"].append(
-            "Crossover ON/OFF와 관계없이 같은 clock의 L/R/W 복소응답으로 전체 합산을 예측하고 cut-only guard를 WAV에 반영했습니다. 별도 사후 sweep은 요구하지 않지만, 물리 L+Woofer/R+Woofer 합산까지 검증하려면 다음 Session에서 ‘정밀 분리+합산’을 선택하세요."
+                "크로스오버 ON/OFF와 관계없이 L/R/우퍼 응답으로 전체 합산을 예측하고 cut-only 가드를 WAV에 반영했습니다. 별도 사후 스윕은 필수가 아니며, 물리 L+우퍼/R+우퍼 합산까지 확인하려면 다음 세션에서 ‘정밀 분리+합산’을 선택하세요."
         )
     elif state["mode"] in PREMEASURED_SUM_MODES:
         if crossover_sum_pass:
             diagnostics["warnings"].append(
-                "정밀 측정의 L+Woofer/R+Woofer가 개별 L/R/W 복소 합산 모델과 일치해 추가 사후 sweep 없이 모델 검증을 통과했습니다."
+                "정밀 측정의 L+우퍼/R+우퍼가 개별 L/R/우퍼 합산 모델과 일치해 추가 사후 스윕 없이 합산 안전성 검증을 통과했습니다."
             )
         elif premeasured_sum_model and premeasured_sum_model.get("pass"):
             diagnostics["warnings"].append(
-                "필터 전 복소 합산 모델은 PASS했지만 현재 4단계 Target/trim/억제/Crossover 조합의 최종 합산 예측이 허용 오차를 벗어났습니다. 4단계 설정을 조정해 다시 계산하세요."
+                "필터 전 복소 합산 모델은 PASS했지만 현재 4단계 타깃/트림/억제/크로스오버 조합의 최종 합산 예측이 허용 오차를 벗어났습니다. 4단계 설정을 조정해 다시 계산하세요."
             )
         else:
             diagnostics["warnings"].append(
@@ -4925,8 +6436,19 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
     ]
     if long_bass_decay:
         diagnostics["warnings"].append("125 Hz 이하 잔향이 길어 해당 공진 대역에 최대 3 dB cut-only 감쇄를 적용했습니다.")
+    acquisition_revision = state.get("measurement_acquisition_revision")
+    unity_acquisition = acquisition_revision == "u7-pcm-unity-v1"
     result = {
         "algorithm_revision": RESULT_ALGORITHM_REVISION,
+        "measurement_output_reference": {
+            "acquisition_revision": acquisition_revision or "legacy-listening-volume-dependent",
+            "u7_pcm_hardware_gain_db": MEASUREMENT_OUTPUT_GAIN_DB if unity_acquisition else None,
+            "listening_volume_ignored_during_sweep": unity_acquisition,
+            "safety_order": (
+                ["input_off", "u7_pcm_unity", "sweep", "restore_volume", "input_on"]
+                if unity_acquisition else None
+            ),
+        },
         "preset": preset,
         "target": target_name,
         "woofer_trim_db": woofer_trim_db,
@@ -5017,6 +6539,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             "measurement_snr_db": {
                 "minimum": diagnostics["measurement_snr_min_db"],
                 "median": diagnostics["measurement_snr_median_db"],
+                "maximum_peak_dbfs": diagnostics["measurement_peak_max_dbfs"],
                 "recommended_minimum": 15.0,
             },
         },
@@ -5048,17 +6571,19 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
                 "phase_alignment_reliable": crossover_summary.get("phase_alignment_reliable"),
                 "coherent_upper_guard_pass": crossover_summary.get("coherent_upper_guard_pass"),
                 "complex_sum_target_pass": crossover_summary.get("complex_sum_target_pass"),
+                "safe_deploy_pass": crossover_summary.get("safe_deploy_pass"),
+                "phase_verification_status": crossover_summary.get("phase_verification_status"),
                 "premeasured_sum_model": premeasured_sum_model,
             }
             if state.get("mode") in PREMEASURED_SUM_MODES:
                 audit_item["action"] = (
-                    "3단계에서 위치별 L/R/W와 L+Woofer/R+Woofer를 모두 측정하고 절대 복소 합산 모델을 검증. "
+                    "3단계에서 위치별 L/R/우퍼와 L+우퍼/R+우퍼를 모두 측정하고 절대 복소 합산 모델을 검증. "
                     "통과 시 WAV 내장 LR4/guard 예측을 같은 모델로 판정하므로 별도 사후 sweep을 요구하지 않음"
                 )
             elif state.get("mode") in SEPARATE_WOOFER_MODES:
                 audit_item["action"] = "같은 clock의 L/R/W 절대 복소응답으로 WAV 내장 LR4 HPF/LPF와 cut-only 합산 guard를 계산. 별도 사후 sweep은 필수가 아니며, 물리 합산 model closure가 필요하면 다음 Session에서 정밀 분리+합산을 선택"
             else:
-                audit_item["action"] = "독립 Front/Woofer 출력이 없어 디지털 crossover를 적용하지 않음"
+                audit_item["action"] = "독립 프런트/우퍼 출력이 없어 디지털 크로스오버를 적용하지 않음"
     result["report_json"] = "Room_Tuning_Report.json"
     result["report_md"] = "Room_Tuning_Report.md"
     atomic_json(directory / result["report_json"], result)
@@ -5189,7 +6714,15 @@ def cancel() -> dict[str, Any]:
 
 
 def worker_guard(action) -> int:
+    previous_handlers: dict[int, Any] = {}
+
+    def request_safe_stop(signum: int, _frame: Any) -> None:
+        raise MeasurementError(f"측정 worker 종료 신호({signum})를 받아 안전 복원 후 중단합니다.")
+
     try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_safe_stop)
         # The parent records our PID while holding the state lock. Waiting here
         # closes the launch race without delaying normal workers noticeably.
         for _ in range(100):
@@ -5206,6 +6739,9 @@ def worker_guard(action) -> int:
         save_current(state)
         print(str(exc), file=sys.stderr)
         return 1
+    finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
 
 
 def self_test() -> dict[str, Any]:
@@ -5631,6 +7167,7 @@ def main() -> int:
     configure.add_argument("woofer_measurement_attenuation_db", type=int, nargs="?", default=None)
     configure.add_argument("position_count", type=int, choices=ALLOWED_POSITION_COUNTS, nargs="?", default=None)
     sub.add_parser("start-level")
+    sub.add_parser("start-level-reprocess")
     sub.add_parser("start-position")
     sub.add_parser("restart-positions")
     sub.add_parser("start-validation")
@@ -5643,6 +7180,8 @@ def main() -> int:
     reprocess_recording = sub.add_parser("reprocess-recording")
     reprocess_recording.add_argument("position", type=int, choices=range(1, POSITIONS + 1))
     reprocess_recording.add_argument("source", choices=tuple(SOURCE_LABELS))
+    sub.add_parser("start-reprocess-saved")
+    sub.add_parser("_worker-reprocess-saved")
     build = sub.add_parser("start-build")
     build.add_argument("target", choices=tuple(TARGET_FILES))
     build.add_argument("preset", choices=("none", "primus360", "strong"))
@@ -5668,6 +7207,7 @@ def main() -> int:
     sub.add_parser("restore")
     sub.add_parser("cancel")
     sub.add_parser("_worker-level")
+    sub.add_parser("_worker-level-reprocess")
     sub.add_parser("_worker-position")
     sub.add_parser("_worker-validation")
     post_validation_worker_parser = sub.add_parser("_worker-post-validation")
@@ -5740,10 +7280,15 @@ def main() -> int:
         elif args.command == "start-level":
             prepare_level_check()
             result = spawn_worker("_worker-level")
+        elif args.command == "start-level-reprocess":
+            state = load_current()
+            if not (state.get("level_recording_inventory") or {}).get("can_reprocess_all"):
+                raise MeasurementError("빠른 검사 저장 원본이 모두 있어야 무음 재계산할 수 있습니다.")
+            result = spawn_worker("_worker-level-reprocess")
         elif args.command == "start-position":
             state = load_current()
             if state.get("orientation") != "90":
-                raise MeasurementError("UMIK를 천장 방향 90°로 놓고 새 session을 만드세요.")
+                raise MeasurementError("UMIK를 천장 방향 90°로 놓고 새 세션을 만드세요.")
             result = spawn_worker("_worker-position")
         elif args.command == "restart-positions":
             prepare_position_restart()
@@ -5758,6 +7303,8 @@ def main() -> int:
             result = inspect_saved_recording(args.position, args.source)
         elif args.command == "reprocess-recording":
             result = inspect_saved_recording(args.position, args.source, reprocess=True)
+        elif args.command == "start-reprocess-saved":
+            result = spawn_worker("_worker-reprocess-saved")
         elif args.command == "start-build":
             prepare_build()
             save_correction_preferences({
@@ -5790,8 +7337,12 @@ def main() -> int:
             result = cancel()
         elif args.command == "_worker-level":
             return worker_guard(level_check_worker)
+        elif args.command == "_worker-level-reprocess":
+            return worker_guard(level_check_reprocess_worker)
         elif args.command == "_worker-position":
             return worker_guard(measure_position_worker)
+        elif args.command == "_worker-reprocess-saved":
+            return worker_guard(reprocess_saved_recordings_worker)
         elif args.command == "_worker-validation":
             return worker_guard(validation_worker)
         elif args.command == "_worker-post-validation":

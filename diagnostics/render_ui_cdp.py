@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.request import urlopen
@@ -30,6 +31,7 @@ async def inspect(
     height: int,
     wait_seconds: float,
     capture_screenshot: bool = True,
+    final_step: int | None = None,
 ) -> tuple[bytes, dict]:
     command_id = 0
     navigation_events = 0
@@ -147,6 +149,15 @@ async def inspect(
             value = tab_result.get("result", {}).get("value")
             if value is not None:
                 tab_exercise.append(value)
+        if final_step is not None:
+            await command(
+                "Runtime.evaluate",
+                {
+                    "expression": f"document.querySelector('[data-measurement-tab=\"{final_step}\"]')?.click()",
+                    "returnByValue": True,
+                },
+            )
+            await asyncio.sleep(0.2)
         detail_result = await command(
             "Runtime.evaluate",
             {
@@ -169,13 +180,32 @@ async def inspect(
             None
         )
         metrics = result["result"]["value"]
+        graph_result = await command(
+            "Runtime.evaluate",
+            {
+                "expression": """(() => {
+                  const graph = document.getElementById('measurement-result-graph');
+                  return {
+                    liveState: document.getElementById('job-live-state')?.textContent?.trim() || '',
+                    graphExists: Boolean(graph),
+                    graphChildren: graph?.childElementCount || 0,
+                    graphPolylines: graph?.querySelectorAll('polyline').length || 0,
+                    graphSummary: document.getElementById('measurement-result-summary')?.textContent || '',
+                  };
+                })()""",
+                "returnByValue": True,
+            },
+        )
         metrics["tabExercise"] = tab_exercise
         metrics["detailsToggle"] = detail_result.get("result", {}).get("value")
+        metrics["resultGraph"] = graph_result.get("result", {}).get("value")
         metrics["unexpectedNavigationsDuringWait"] = max(0, navigation_events - initial_navigation_events)
         return base64.b64decode(screenshot["data"]) if screenshot else b"", metrics
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser()
     parser.add_argument("--chrome", type=Path, required=True)
     parser.add_argument("--url", required=True)
@@ -184,6 +214,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--wait-seconds", type=float, default=4.0)
     parser.add_argument("--skip-screenshot", action="store_true")
+    parser.add_argument("--final-step", type=int, choices=range(1, 7))
     args = parser.parse_args()
     port = free_port()
     with tempfile.TemporaryDirectory(prefix="audiodsp-chrome-") as profile:
@@ -227,6 +258,7 @@ def main() -> int:
                 args.height,
                 args.wait_seconds,
                 not args.skip_screenshot,
+                args.final_step,
             ))
             if image:
                 args.output.parent.mkdir(parents=True, exist_ok=True)

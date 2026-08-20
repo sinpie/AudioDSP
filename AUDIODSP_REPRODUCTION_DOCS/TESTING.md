@@ -91,7 +91,11 @@ sudo /usr/local/bin/audiodsp-measurement.py self-test-targets
 조절 가능한 Woofer 측정/reference 비율, 적응형 -3 dB 통과대역 SNR, 정상 0.4초·cold-start 앞부분 절단·1.1초 USB 지연 sweep timing 복구, 잔향 cut-only,
 음향+FIR 총지연 정렬과 중단 worker 복구도 확인한다. 또한 정상 2000-sample direct peak는 허용하고, 518895-sample ESS artifact와 FFT 끝에 감긴 음수 지연 peak는 거부하는 0~250 ms bulk-delay gate를 검사한다.
 
-물리 출력 경로 시험은 임시 boot-ID/selector JSON으로 Speaker 경로를 bind한 뒤 같은 경로 허용, Headphone 잭으로 변경 시 `MeasurementError`, 다른 profile 결과 적용 거부를 확인한다. 이는 실제 U7 selector를 누르거나 소리를 내지 않는다. 실제 sweep 재생 함수는 별도 수락 시험에서만 실행한다.
+물리 출력 경로 시험은 임시 boot-ID/selector JSON으로 Speaker 경로를 bind한 뒤 같은 경로 허용, Headphone 잭으로 변경 시 `MeasurementError`, 다른 profile 결과 적용 거부를 확인한다. 같은 무음 fixture는 `Camilla stop → Mic nocap → Line nocap → PCM 0 dB → 원래 PCM 복원 → Camilla start` 순서와 복원 실패 시 Camilla 미시작도 검사한다. 이는 실제 U7 selector를 누르거나 소리를 내지 않는다. 실제 sweep 재생 함수는 별도 수락 시험에서만 실행한다.
+
+`test_profile_matrix.py`는 응답 fixture에 `inf/-inf/nan`을 주입해 API 직렬화가 표준 JSON `null`만 내고 브라우저 parser를 깨지 않는지 확인한다. 실제 Pi UI는 CDP smoke test에서 `liveState=실시간`, 결과 SVG/polyline 존재, 20 Hz–20 kHz 요약을 확인한다.
+
+`test_session_migration.py`는 실제 session export/import 왕복에서 ID, 모든 파일 byte 수와 SHA-256, current pointer를 검증하고 `../` 경로를 포함한 악성 archive를 거부한다. SD writer `-ValidateOnly -WindowsWifiProfile <profile> -SessionMigrationArchive <archive>`는 key를 출력하지 않은 채 WLAN profile과 archive hash까지 검사한다.
 
 `test_measurement_engine.py`는 `lrw_sum` 정밀 fixture에서 위치당 L/R/W/L+W/R+W를 모두 준비한 뒤에만 FIR 계산이 열리는지 확인한다. L+W/R+W는 합산 closure에만 쓰이고 FIR 평균·정규화에는 들어가지 않아야 한다. 측정 level -9 dB를 reference와 함께 바꿔도 복원된 전달함수와 생성 FIR이 같아야 하며, combined response를 독립 normalize하거나 두 번 보정한 fixture는 실패해야 한다. Crossover ON/OFF 모두 `pass_premeasured_model`이면 추가 사후 sweep 없이 Apply 가능해야 한다.
 
@@ -169,21 +173,25 @@ Invoke-RestMethod -Uri 'http://<PI-IP>:8080/api/volume' -Method Put -ContentType
 
 실제 음향 시험은 사용자가 허용한 시간에만 한다.
 
+2026-08-20 Pi2 실제 Fast 1위치 5경로 시험의 원본 SNR, coherent integration,
+합산 closure, FIR 옵션별 PASS/FAIL과 정식 FIR 불변 확인은
+[PI2_ACOUSTIC_ACCEPTANCE_20260820.md](PI2_ACOUSTIC_ACCEPTANCE_20260820.md)에 기록했다.
+
 - 90° calibration serial/point 확인
-- -48 또는 -42 dBFS level check, clipping 없음, SNR OK
-- 세 위치 L/R, 표준 L/R/Woofer, 권장 정밀 L/R/W/L+W/R+W 또는 Pi4/5의 독립 제어원 MIMO 완료
+- 현재 세션 dBFS로 모든 출력 조합의 2초 빠른 ESS, clipping 없음, 최저 SNR 6 dB 이상(15 dB 권장)
+- 빠른 측정 1위치 또는 표준 측정 3위치의 L/R/우퍼와 선택형 L+우퍼/R+우퍼 완료
 - build progress/ETA와 Pi 응답성 유지
 - 결과 WAV 48k/float32/stereo/32768
 - L/R/Woofer 개별 모드의 기본 crossover ON/100 Hz, Front HPF/Rear LPF actual FIR response, 추가 runtime filter/block latency 0 확인
-- 신뢰 가능한 phase에서는 세 위치 실제 복소합 최대값 guard와 target을 확인하고, phase 불신뢰에서는 `|Front|+|Woofer|` fallback 상한만 사용하며 acoustic PASS로 표시하지 않는지 확인
-- 표준 구성은 동일-clock L/R/W 복소합의 `pass_independent_complex_model`, 정밀 구성은 같은 위치 L+W/R+W closure와 polarity/상대 delay를 포함한 `pass_premeasured_model`을 확인한다. 둘 다 뒤늦은 필수 사후 측정을 요구하지 않아야 한다.
+- 독립-clock 기본 구성은 위상 비의존 에너지 타깃과 `|Front|+|Woofer|` cut-only 상한을 함께 통과해 `pass_safe_upper_phase_limited` 또는 `pass_safe_sum_phase_limited`가 되는지 확인한다. 그래프에 clock-drift 복소 딥을 표시하지 않아야 한다.
+- 공통 timing reference를 명시한 합성 fixture에서만 복소 위상·극성·상대 delay와 MIMO 수치 경로를 확인한다. 어떤 SISO 구성도 뒤늦은 필수 사후 측정을 요구하지 않아야 한다.
 - maximum transfer ≤ 0 dB
-- 개별 sweep SNR ≥ 6 dB(15 dB 이상 권장), octave T20 신뢰도 확인
+- 개별 sweep 유효 SNR ≥ 6 dB(15 dB 이상 권장), 긴 ESS는 원신호 SNR과 2초 기준 coherent integration 이득을 별도 기록, octave T20 신뢰도 확인
 - `self_validation.overall_pass=true`, target-fit MAE/P90와 actual FIR FFT 확인
 - preview에서 기존/이번 전환, apply 전 profile hash 불변
 - apply 후 backup 생성 및 새 hash 반영
 - restore 기존 튜닝 정상
-- MIMO이면 네 WAV/manifest/report, 8 convolution, coherence/headroom과 `pass_multichannel_complex_model`을 확인한다. 적용 후 저레벨 검증 위치 측정은 선택 acoustic audit로 기록한다.
+- MIMO이면 공통 timing reference 확인 후 네 WAV/manifest/report, 8 convolution, coherence/headroom과 `pass_multichannel_complex_model`을 확인한다. reference가 없으면 생성·활성화가 차단되어야 한다.
 
 ## 8. 장시간 성능
 
@@ -195,7 +203,7 @@ pidstat -p "$(pgrep -x camilladsp)" 5 120
 
 XRUN, service restart, thermal throttling, 지속 90% 이상 CPU가 없어야 한다. chunksize 1024를 선택했다면 2048과 별도 비교한다. Pi 4/5도 같은 방식으로 측정하되 architecture 차이를 이유로 Pi 2 수치를 그대로 복사하지 않는다.
 
-MIMO 8-path는 Pi4/5에서 chunksize 1024 이상으로 최소 10분 측정한다. 합성 수치 PASS나 CamillaDSP parser PASS를 실제 CPU/XRUN 수락으로 대신하지 않는다.
+MIMO 8-path는 공통 timing reference를 갖춘 Pi4/5에서 chunksize 1024 이상으로 최소 10분 측정한다. 합성 수치 PASS나 CamillaDSP parser PASS를 실제 CPU/XRUN 수락으로 대신하지 않는다.
 
 ## 9. Web UI 접근성·반응형 회귀
 

@@ -1,12 +1,21 @@
 ﻿param(
     [string]$DefaultWifiSsid = 'StarryNight',
+    [string]$WindowsWifiProfile = '',
     [int]$TargetDiskNumber = -1,
+    [string]$TargetConfirmation = '',
+    [string]$SessionMigrationArchive = '',
+    [switch]$EthernetOnly,
     [switch]$ValidateOnly,
     [switch]$NoPause
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+    $utilityModule = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1'
+    Import-Module $utilityModule -ErrorAction Stop
+}
 
 $script:StageRoot = $PSScriptRoot
 $script:RepoRoot = Split-Path -Parent (Split-Path -Parent $script:StageRoot)
@@ -164,6 +173,7 @@ function Assert-FinalBundle {
     $profileManager = Join-Path $payload 'audiodsp-profile-manager.py'
     $profileWeb = Join-Path $payload 'audiodsp-profile-web.py'
     $measurement = Join-Path $payload 'audiodsp-measurement.py'
+    $sessionImporter = Join-Path $payload 'audiodsp-import-session.py'
     $mimo = Join-Path $payload 'audiodsp-mimo.py'
     $cal0 = Join-Path $payload '7200660.txt'
     $cal90 = Join-Path $payload '7200660_90deg.txt'
@@ -188,7 +198,7 @@ function Assert-FinalBundle {
 
     foreach ($requiredFile in @(
         $image, $firstRun, $networkTemplate, $starter, $config, $camilla,
-        $fir, $service, $asound, $outputProfile, $profileManager, $profileWeb, $measurement, $mimo,
+        $fir, $service, $asound, $outputProfile, $profileManager, $profileWeb, $measurement, $sessionImporter, $mimo,
         $cal0, $cal90, $targetHarman,
         $profileWebService, $u7Monitor, $u7Service, $dspReady, $dspReadyService,
         $dspReadyWave, $speakerWave, $headphoneWave, $matrixTest, $measurementTest, $targetOptionTest, $mimoAlgorithmTest, $mimoTest, $resourceTest,
@@ -214,7 +224,7 @@ function Assert-FinalBundle {
     foreach ($linuxTextFile in @(
         $firstRun, $networkTemplate, $starter, $config, $service, $asound,
         $outputProfile, $profileManager, $profileWeb, $profileWebService,
-        $u7Monitor, $u7Service, $dspReady, $dspReadyService, $measurement, $mimo,
+        $u7Monitor, $u7Service, $dspReady, $dspReadyService, $measurement, $sessionImporter, $mimo,
         $matrixTest, $measurementTest, $targetOptionTest, $mimoAlgorithmTest, $mimoTest, $resourceTest
     )) {
         Assert-LfNoBom -Path $linuxTextFile
@@ -255,6 +265,7 @@ function Assert-FinalBundle {
     if ($managerText -notmatch 'set-bypass' -or
         $managerText -notmatch 'set-chunksize' -or
         $managerText -notmatch 'set-output-volume' -or
+        $managerText -notmatch 'AUDIO_LOCK = Path' -or
         $managerText -notmatch 'output_volume_db' -or
         $managerText -notmatch 'restore-snapshot' -or
         $managerText -notmatch 'install-mimo' -or
@@ -293,8 +304,8 @@ function Assert-FinalBundle {
         $webText -notmatch 'summary::after' -or
         $webText -notmatch 'room_tuning_audit' -or
         $webText -notmatch 'output-level-warning' -or
-        $webText -notmatch '−42부터 시작' -or
-        $webText -notmatch '실제 측정음을 재생합니다' -or
+        $webText -notmatch '기본 −42 dBFS' -or
+        $webText -notmatch '출력별 2초 빠른 검사' -or
         $webText -notmatch '저역 late/early' -or
         $webText -notmatch 'live_u7_status_poll' -or
         $webText -notmatch "fetch\('/api/status'" -or
@@ -344,6 +355,9 @@ function Assert-FinalBundle {
         'install-pair',
         'MIMO_MODES',
         'ensure_measurement_output_path',
+        'begin_measurement_audio_window',
+        'restore_measurement_audio_window',
+        'volume_restored_before_input',
         'validate_result_profile',
         'validate_result_revision',
         'RESULT_ALGORITHM_REVISION',
@@ -386,6 +400,8 @@ function Assert-FinalBundle {
         'audiodsp-profile-manager.py set-chunksize 1024 --no-restart',
         'audiodsp-web.service',
         'audiodsp-measurement.py self-test',
+        'audiodsp-import-session.py "$SESSION_MIGRATION"',
+        'session_migration=success',
         'audiodsp-mimo.py',
         'audiodsp-ready.service',
         'test ! -e /etc/ssh/sshd_config.d/rename_user.conf'
@@ -447,6 +463,69 @@ function Read-WifiCredential {
     }
 }
 
+function Read-WindowsWifiCredential {
+    param([Parameter(Mandatory)][string]$ProfileName)
+
+    $profile = $ProfileName.Trim()
+    $ssidByteCount = [Text.Encoding]::UTF8.GetByteCount($profile)
+    if ($ssidByteCount -lt 1 -or $ssidByteCount -gt 32 -or $profile -match '[\r\n]') {
+        throw 'Windows Wi-Fi profile/SSID must be 1-32 UTF-8 bytes without line breaks.'
+    }
+
+    # Exporting XML avoids parsing localized netsh labels. The temporary XML
+    # is an exact, newly-created target and is always removed before returning.
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+    $temporaryDirectory = Join-Path $temporaryRoot ("audiodsp-wlan-" + [guid]::NewGuid().ToString('N'))
+    $temporaryItem = New-Item -ItemType Directory -Path $temporaryDirectory -ErrorAction Stop
+    if (($temporaryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [IO.Path]::GetFullPath($temporaryItem.FullName).StartsWith(($temporaryRoot + '\'), [StringComparison]::OrdinalIgnoreCase) -ne $true) {
+        throw 'Unsafe temporary WLAN export directory.'
+    }
+
+    $plainPassword = $null
+    try {
+        $netshOutput = (& "$env:SystemRoot\System32\netsh.exe" wlan export profile name="$profile" folder="$temporaryDirectory" key=clear 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+            $netshOutput = $null
+            throw "Windows Wi-Fi profile could not be exported: $profile"
+        }
+        $netshOutput = $null
+        $exportedFiles = @(Get-ChildItem -LiteralPath $temporaryDirectory -File -ErrorAction Stop)
+        if ($exportedFiles.Count -ne 1 -or $exportedFiles[0].Extension -ne '.xml' -or
+            ($exportedFiles[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Windows Wi-Fi export did not create exactly one safe XML profile: $profile"
+        }
+        [xml]$profileXml = Get-Content -LiteralPath $exportedFiles[0].FullName -Raw -ErrorAction Stop
+        $keyNode = $profileXml.SelectSingleNode("//*[local-name()='keyMaterial']")
+        if ($null -eq $keyNode -or [string]::IsNullOrWhiteSpace($keyNode.InnerText)) {
+            throw "Windows Wi-Fi profile has no recoverable WPA/WPA2/WPA3 personal key: $profile"
+        }
+        $plainPassword = $keyNode.InnerText.Trim()
+        if ($plainPassword.Length -lt 8 -or $plainPassword.Length -gt 63 -or $plainPassword -match '[\r\n]') {
+            throw 'Recovered Wi-Fi password must be 8-63 characters without line breaks.'
+        }
+        return [pscustomobject]@{
+            Ssid = $profile
+            SsidB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($profile))
+            PasswordB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($plainPassword))
+        }
+    }
+    finally {
+        $plainPassword = $null
+        $profileXml = $null
+        $keyNode = $null
+        $exportedFiles = @(Get-ChildItem -LiteralPath $temporaryDirectory -File -ErrorAction SilentlyContinue)
+        foreach ($exportedFile in $exportedFiles) {
+            if (($exportedFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($exportedFile.FullName)) -ne [IO.Path]::GetFullPath($temporaryDirectory)) {
+                throw 'Unsafe WLAN export cleanup target.'
+            }
+            Remove-Item -LiteralPath $exportedFile.FullName -Force -ErrorAction Stop
+        }
+        Remove-Item -LiteralPath $temporaryDirectory -Force -ErrorAction Stop
+    }
+}
+
 try {
     Start-Transcript -LiteralPath $script:WriterLog -Force | Out-Null
     $script:TranscriptStarted = $true
@@ -455,15 +534,36 @@ try {
     Invoke-BundleAssembly
     Write-Host 'Validating the complete AudioDSP Pi 4/5 SD bundle...' -ForegroundColor Cyan
     $bundle = Assert-FinalBundle
+    $migrationArchive = $null
+    $migrationHash = $null
+    if (-not [string]::IsNullOrWhiteSpace($SessionMigrationArchive)) {
+        $migrationArchive = (Resolve-Path -LiteralPath $SessionMigrationArchive -ErrorAction Stop).Path
+        $migrationItem = Get-Item -LiteralPath $migrationArchive -ErrorAction Stop
+        if ($migrationItem.PSIsContainer -or $migrationItem.Length -le 0 -or $migrationItem.Length -gt 1GB) {
+            throw 'Session migration archive must be a non-empty regular file no larger than 1 GB.'
+        }
+        $migrationHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $migrationArchive).Hash
+    }
+    if ($EthernetOnly -and -not [string]::IsNullOrWhiteSpace($WindowsWifiProfile)) {
+        throw 'Choose either -EthernetOnly or -WindowsWifiProfile, not both.'
+    }
     Write-Host 'Bundle validation: PASS' -ForegroundColor Green
 
     if ($ValidateOnly) {
+        if (-not [string]::IsNullOrWhiteSpace($WindowsWifiProfile)) {
+            $validatedWifi = Read-WindowsWifiCredential -ProfileName $WindowsWifiProfile
+            Write-Host "Windows Wi-Fi profile: verified / $($validatedWifi.Ssid)" -ForegroundColor Green
+            $validatedWifi = $null
+        }
         Write-Host ''
         Write-Host 'AUDIODSP PI 4/5 BUNDLE VALIDATION COMPLETE' -ForegroundColor Green
         Write-Host '  Raspberry Pi OS Lite 64-bit image: verified'
         Write-Host '  CamillaDSP 4.1.3 aarch64: verified'
         Write-Host '  FIR NoPreamp SHA256: verified'
         Write-Host '  Account/network/U7 scripts: syntax and policy verified'
+        if ($migrationArchive) {
+            Write-Host "  Session migration archive: verified / SHA256 $migrationHash"
+        }
         return
     }
 
@@ -475,12 +575,25 @@ try {
     Write-Host "  Disk $($targetDisk.Number) / $($targetDisk.FriendlyName) / $([math]::Round($targetDisk.Size / 1GB, 2)) GB"
     Write-Host '  ALL EXISTING CONTENTS ON THIS SD CARD WILL BE OVERWRITTEN.' -ForegroundColor Yellow
     $expectedConfirmation = "WRITE DISK $($targetDisk.Number)"
-    $confirmation = Read-Host "Type $expectedConfirmation to continue"
+    $confirmation = if ([string]::IsNullOrWhiteSpace($TargetConfirmation)) {
+        Read-Host "Type $expectedConfirmation to continue"
+    }
+    else {
+        $TargetConfirmation
+    }
     if ($confirmation -cne $expectedConfirmation) {
         throw 'Confirmation did not match; no write was started.'
     }
 
-    $wifi = Read-WifiCredential -DefaultSsid $DefaultWifiSsid
+    $wifi = if ($EthernetOnly) {
+        [pscustomobject]@{ Ssid = 'Ethernet only'; SsidB64 = ''; PasswordB64 = '' }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($WindowsWifiProfile)) {
+        Read-WindowsWifiCredential -ProfileName $WindowsWifiProfile
+    }
+    else {
+        Read-WifiCredential -DefaultSsid $DefaultWifiSsid
+    }
     $networkTemplateText = Get-Content -LiteralPath $bundle.NetworkTemplate -Raw
     $generatedNetworkScript = $networkTemplateText.Replace('__SSID_B64__', $wifi.SsidB64)
     $generatedNetworkScript = $generatedNetworkScript.Replace('__PSK_B64__', $wifi.PasswordB64)
@@ -598,7 +711,17 @@ network:
     if (-not (Test-Path -LiteralPath $sshMarker)) {
         New-Item -ItemType File -Path $sshMarker -ErrorAction Stop | Out-Null
     }
+    $cardMigrationArchive = $null
+    if ($migrationArchive) {
+        $cardMigrationArchive = Join-Path $bootRoot 'audiodsp-session-migration.tar.gz'
+        Copy-Item -LiteralPath $migrationArchive -Destination $cardMigrationArchive -ErrorAction Stop
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $cardMigrationArchive).Hash -ne $migrationHash) {
+            throw 'Session migration archive changed while copying to the SD card.'
+        }
+    }
 
+    $migrationSummary = if ($migrationArchive) { 'single-session' } else { 'none' }
+    $migrationHashSummary = if ($migrationHash) { $migrationHash } else { 'none' }
     $manifest = @(
         'AudioDSP Raspberry Pi 4/5 SD build'
         'build_date=2026-08-18'
@@ -622,6 +745,8 @@ network:
         "fir_sha256=$($bundle.FirSha)"
         'first_boot=automatic_reboot_then_network_provisioning'
         'wifi_boot_payload=deleted_during_first_boot'
+        "session_migration=$migrationSummary"
+        "session_migration_sha256=$migrationHashSummary"
     ) -join "`n"
     [IO.File]::WriteAllText((Join-Path $bootRoot 'AudioDSP-PI4-PI5-BUILD.txt'), ($manifest + "`n"), $utf8NoBom)
 
@@ -653,7 +778,7 @@ network:
     if ($writtenCmdline.Contains("`r") -or $writtenCmdline.Contains("`n")) {
         throw 'cmdline.txt must contain exactly one line.'
     }
-    $runTokens = $writtenCmdline.Split(' ') | Where-Object { $_ -match '^systemd\.run=' }
+    $runTokens = @($writtenCmdline.Split(' ') | Where-Object { $_ -match '^systemd\.run=' })
     if ($runTokens.Count -ne 1 -or $runTokens[0] -ne 'systemd.run=/boot/firmware/firstrun.sh') {
         throw 'cmdline.txt does not contain exactly one correct first-run command.'
     }
@@ -662,7 +787,7 @@ network:
     }
 
     $writtenNetworkConfig = Get-Content -LiteralPath (Join-Path $bootRoot 'network-config') -Raw
-    if ($writtenNetworkConfig -match [regex]::Escape($wifiSsidForSummary) -or
+    if ((-not $EthernetOnly -and $writtenNetworkConfig -match [regex]::Escape($wifiSsidForSummary)) -or
         $writtenNetworkConfig -match '(?i)password|psk') {
         throw 'Plain cloud-init network-config unexpectedly contains Wi-Fi data.'
     }
@@ -689,6 +814,9 @@ network:
     Write-Host '  Web UI: http://audiodsp-pi.local:8080 (chunk size 512/1024/2048/4096)'
     Write-Host '  U7 analog output: -10 dB'
     Write-Host "  Wi-Fi: $wifiSsidForSummary / KR (credential is never printed)"
+    if ($migrationArchive) {
+        Write-Host '  Session migration: one verified session will be restored on first boot'
+    }
     Write-Host '  First boot: installs everything, scrubs FAT credential, reboots once'
     Write-Host '  Expected first availability: about 2-3 minutes after power-on'
 

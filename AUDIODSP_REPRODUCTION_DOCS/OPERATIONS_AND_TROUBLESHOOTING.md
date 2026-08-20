@@ -45,6 +45,8 @@ curl -v http://127.0.0.1:8080/api/health
 
 서비스 restart 직후 1~2초는 listener가 아직 없을 수 있다. Web만 고쳤으면 `sudo systemctl restart audiodsp-web`만 실행하고 CamillaDSP는 그대로 둔다.
 
+측정 결과 그래프만 비어 있고 상태가 `연결 재시도`라면 `/api/measurement/status`가 표준 JSON인지 먼저 확인한다. Python의 `Infinity`/`NaN`은 브라우저 JSON parser가 거부하므로 API는 이를 `null`로 직렬화해야 한다. 현재 release는 모든 JSON 응답에 이 규칙을 강제한다.
+
 ## 볼륨 문제
 
 - API 쓰기: `PUT /api/volume`에 정수 -60~0만 보낸다.
@@ -63,7 +65,7 @@ sudo journalctl -u audiodsp-profile-monitor -n 80 --no-pager
 cat /var/lib/audiodsp/u7-selector-state.json
 ```
 
-물리 상태가 바뀌면 웹은 1초 polling으로 요청/유효 profile을 갱신하고 필요한 경우 새 화면을 reload한다.
+물리 상태가 바뀌면 웹은 약 1.5초 polling으로 요청/유효 profile을 갱신하고 필요한 경우 새 화면을 한 번 reload한다.
 
 ## UMIK/측정 오류
 
@@ -100,3 +102,5 @@ free -h
 - ACT LED가 멈춰도 OS가 DHCP를 기다리거나 service retry 중일 수 있다.
 
 Windows에서 boot FAT의 `audiodsp-firstboot.log`와 `audiodsp-firstboot-success.txt`를 확인할 수 있다. success marker가 없으면 log 마지막 오류부터 해결한다.
+
+세션 migration을 넣은 카드의 success marker에는 `session_migration=success`가 있어야 한다. 부팅 후 `/var/lib/audiodsp/measurements/current.json`의 ID와 Web의 활성 세션이 archive ID와 같은지 확인한다. migration은 측정 결과와 FIR을 보존하지만 실행 중 worker, 취소 요청, 임시 Preview/적용 상태는 의도적으로 복원하지 않는다.

@@ -76,7 +76,7 @@ Sub가 있는 topology는 기본 ON/100 Hz LR4 crossover의 complex minimum-phas
 MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재생한다. 현재 구현은 중앙과 그 주변의 작은 청취영역 세 위치를 사용한다. UMIK-1은 실제 룸 측정 시 90° calibration과 천장 방향을 사용한다.
 
 1. U7/UMIK 연결과 90° calibration을 확인한다.
-2. 5초 무음과 5초 백색소음 검사를 사용자가 직접 시작한다. SNR 15 dB 이상을 권장하고, 6 dB 미만 또는 clipping은 적용을 차단한다.
+2. 현재 구성의 모든 제어원을 본 측정과 같은 2초 ESS로 빠르게 검사한다. SNR 15 dB 이상을 권장하고, 6 dB 미만 또는 clipping은 측정을 차단한다.
 3. 위치 1–3에서 각 제어원을 독립 sweep한다. 측정 재생 동안 기존 DSP는 direct bypass이고 U7 input monitor는 mute다.
 4. 타깃, T5S 저역 억제, 보정 범위, boost/cut, MIMO 상한·강도·지원 penalty를 고른다.
 5. 계산 결과의 예측 그래프, headroom, 제어원 coherence, 전체 분류표와 보고서를 검토한다.
@@ -91,7 +91,7 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 
 | 요소 | 분류 | AudioDSP 처리 | 필터 밖의 한계/조치 |
 |---|---|---|---|
-| 배경소음·SNR·clipping | measurement gate | 무음/백색소음과 각 sweep 품질 검사 | 기기 볼륨·환경 소음을 사용자가 조정 |
+| 배경소음·SNR·clipping | measurement gate | 모든 제어원의 빠른 ESS와 각 본 스윕 품질 검사 | 기기 볼륨·환경 소음을 사용자가 조정 |
 | 주파수 응답·타깃 | FIR 보정 가능 | 공간 가중, 가변 smoothing, boost/cut 제한 | 시간변화와 미측정 위치는 보장하지 않음 |
 | 자연 저역 확장·headroom | 제한적 | roll-off 아래 boost 억제 | 드라이버 변위, 앰프 출력, 왜곡은 늘릴 수 없음 |
 | 좌석 간 저역 편차 | MIMO 개선 가능 | 저역 복소 pressure matching | 제어원 독립성과 측정영역에 의존 |
@@ -135,7 +135,7 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 - `Flat / 추가 억제 없음 / Woofer trim 0 dB` 기준 합성 session은 MIMO Stereo, MIMO 2.1, MIMO 2.2 모두 finite/headroom/causality/타깃·공간 비악화/modal-tail 비악화 모델 검증을 PASS했다.
 - MIMO 전용 UI 값 19개를 실제 32768탭×8경로로 생성했다. 구조·형식·headroom 검사는 19/19 PASS했다.
 - 비기준 조합 중 crossover 60/70/80 Hz, Harman target, `Safe · 높은 안정성 + 지원 제어원 제한 12 dB`의 다섯 합성 조합은 평활 전달함수 impulse-tail proxy가 허용 비악화 범위를 넘어서 `fail_model`로 안전 차단됐다. 이는 프로그램 오류가 아니라 해당 합성 room에서 기준을 만족하지 못한 결과이며, Web은 `4 · FIR 계산`의 실제 항목명으로 강도·상한·지원 제한·crossover 조정 순서를 안내한다.
-- Sub topology의 기준 모델 PASS는 동일-clock 복소 전달행렬에 대한 적용 게이트이며 `pass_multichannel_complex_model`로 표시된다. FIR 생성 뒤 합산 sweep을 필수로 요구하지 않는다. 다만 이것이 곧 방 전체의 실기 PASS라는 뜻은 아니다. 선택적인 저레벨 acoustic audit와 Pi5 10분 CPU/XRUN 검증을 별도 수행해야 실제 하드웨어 성능을 수락할 수 있다.
+- 합성 MIMO 기준 모델 PASS는 `AUDIODSP_PHASE_CLOCK_SHARED=1`인 공통-clock fixture의 수치 검증이다. 현재 U7+UMIK-1 독립 USB clock 실측에서는 복소 전달행렬의 절대 위상을 보장할 수 없어 production 생성과 활성화를 차단한다. 향후 loopback/reference channel 등 공통 timing reference가 추가된 뒤에도 선택적인 저레벨 acoustic audit와 Pi5 10분 CPU/XRUN 검증을 별도 수행해야 실제 하드웨어 성능을 수락할 수 있다.
 
 ## 의도적으로 하지 않는 것
 

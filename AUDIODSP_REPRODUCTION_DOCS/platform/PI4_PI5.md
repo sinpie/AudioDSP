@@ -22,10 +22,10 @@
 
 ## MIMO 운용
 
-- MIMO는 Pi 4/5 전용 기능이다. 입력 L/R 각각을 Front L, Front R, Rear L, Rear R로 보내는 8 convolution과 2→8→4 matrix를 사용한다.
+- MIMO solver와 8경로 runtime은 Pi 4/5 전용이지만, 생성·활성화에는 검증된 공통 timing reference도 필요하다. 기본 U7 출력+UMIK-1 입력은 독립 USB clock이므로 현재 production UI는 MIMO를 차단하고 SISO를 유지한다.
 - 한 T5S의 stereo 입력은 같은 물리 음원을 구동하므로 `MIMO 2.1`에서는 Rear L/R에 각각 0.5를 배분한다. 독립 배치·배선된 서브우퍼 두 대만 `MIMO 2.2`의 네 독립 actuator로 취급한다.
 - MIMO가 활성화되면 effective chunksize 하한은 1024다. 512를 저장해도 실행 config는 1024로 올려 XRUN 위험을 줄인다.
-- 합성·parser 검증은 통과했지만 실제 방 성능과 Pi 4/5 지속 부하는 아직 실기 인증 전이다. 10분 이상의 CPU/XRUN/온도/USB 검사와 사용하지 않은 위치의 전후 재측정이 필수다.
+- shared-clock 합성·parser 검증은 통과했지만 실제 방 성능과 Pi 4/5 지속 부하는 아직 실기 인증 전이다. 공통 reference를 구성한 뒤 10분 이상의 CPU/XRUN/온도/USB 검사와 사용하지 않은 위치의 전후 재측정이 필수다.
 - Pi 5는 설계상 호환 대상이며, 실제 U7 장시간 시험 전까지 하드웨어 검증 완료로 표시하지 않는다.
 
 ### Pi 5 2 GB 메모리 판정
@@ -35,7 +35,7 @@
 ## 설치
 
 1. `WRITE_FINAL_SD_CARD.cmd`를 관리자 권한으로 실행한다.
-2. SSID/password를 prompt에 넣는다. 화면/log에는 password가 나오지 않아야 한다.
+2. SSID/password를 prompt에 넣는다. 화면/log에는 password가 나오지 않아야 한다. Windows에 저장된 프로필은 `-WindowsWifiProfile <이름>`으로 읽는다. 언어별 `netsh` 문구를 파싱하지 않고 고유 임시 WLAN XML을 사용하며, key를 출력하지 않고 즉시 삭제를 검증한다.
 3. exact disk 확인 후 기록한다.
 4. U7과 가능하면 Ethernet도 연결하고 전원을 넣는다.
 5. 첫 install/reboot에 약 2~3분을 준다.
@@ -48,6 +48,7 @@
 - 다음 boot의 oneshot service가 NetworkManager Ethernet/Wi-Fi를 설정하고 성공 후 helper가 self-delete한다.
 - static/fallback address를 만들지 않는다.
 - 초기 manager chunksize를 1024로 설정한다.
+- 선택한 단일 session migration archive는 manifest의 size/SHA-256과 경로 안전성을 검사한 뒤 atomic import하고, worker/Preview 임시 상태를 지운 뒤 FAT 사본을 제거한다.
 
 ## Pi 5 수락 시험
 

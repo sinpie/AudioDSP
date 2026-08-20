@@ -1,6 +1,6 @@
 # AudioDSP
 
-AudioDSP is a Raspberry Pi audio processor for Xonar U7, CamillaDSP and UMIK-1. It provides 48 kHz convolution, independent Speaker/Headphone profiles, optional Front/Woofer routing, hardware-volume API control, a responsive Web UI, and a guided one/three-position room-correction workflow that produces 32768-tap stereo FIR WAV files. The recommended precision SISO mode measures L/R/W and L+Woofer/R+Woofer before FIR design so crossover closure can be verified without a later surprise sweep. Pi 4/5 additionally support an experimental robust 2-input×4-output MIMO FIR bank; Pi 2 deliberately remains SISO-only.
+AudioDSP is a Raspberry Pi audio processor for Xonar U7, CamillaDSP and UMIK-1. It provides 48 kHz convolution, independent Speaker/Headphone profiles, optional Front/Woofer routing, hardware-volume API control, a responsive Web UI, and a guided one/three-position room-correction workflow that produces 32768-tap stereo FIR WAV files. The recommended precision SISO mode measures L/R/W and L+Woofer/R+Woofer before FIR design so crossover closure can be verified without a later surprise sweep. Pi 4/5 contain an experimental robust 2-input×4-output MIMO solver, but generation requires a verified common timing reference; Pi 2 deliberately remains SISO-only.
 
 ## Source and release bundles
 
@@ -21,16 +21,17 @@ Downloaded Raspberry Pi OS images, CamillaDSP binaries, private SSH keys, device
 - Front output: independent L/R FIR
 - Rear output: Front copy after one 2-channel convolution, or a separate stereo Woofer FIR
 - No digital preamp in the DSP graph; volume uses the U7 hardware mixer
+- Every quick, room and post-FIR sweep uses its selected dBFS as the U7 DAC reference: normal input is disconnected, U7 PCM is temporarily verified at 0 dB, and the exact listening volume is restored and read back before input reconnects
 - Missing Speaker/Headphone FIR falls back to the other profile and then the immutable Factory FIR
 - Uploads and generated tuning can be previewed, compared, discarded and backed up before Apply
 
-Room correction combines three nearby measurements, guarded/regularized cut-biased magnitude correction, optional low-frequency excess-phase correction, bass-mode control and octave-band decay diagnostics. The optional MIMO path jointly optimizes independently measured speakers/subwoofers at the three positions, with frequency-dependent regularization, natural-rolloff penalties, correlated-input headroom limits and causal-delay checks. Late reverberation, nonlinear distortion and structural noise are diagnosed or marked unmeasured—not claimed as fixed by FIR.
+Room correction combines one or three nearby measurements, guarded/regularized cut-biased magnitude correction, optional low-frequency excess-phase correction, bass-mode control and octave-band decay diagnostics. Xonar U7 playback and UMIK-1 capture do not normally share a hardware sample clock, so the SISO crossover gate uses a conservative cut-only coherent upper bound plus a phase-agnostic target estimate; it does not draw clock-drift notches as verified acoustic dips. The optional MIMO solver exists for Pi 4/5, but production generation is blocked until the measurement setup provides an explicit common timing reference. Late reverberation, nonlinear distortion and structural noise are diagnosed or marked unmeasured—not claimed as fixed by FIR.
 
 ## Documentation
 
 Start with [the reproduction documentation](AUDIODSP_REPRODUCTION_DOCS/README.md), then read the platform release README. Architecture, API, UI/UX, backup compatibility, testing, safety and algorithm details have one canonical copy in `AUDIODSP_REPRODUCTION_DOCS`; release folders contain only platform entry points and immutable external inputs.
 
-The latest silent regression records are [SILENT_CALIBRATION_SELF_VALIDATION_20260818.md](AUDIODSP_REPRODUCTION_DOCS/SILENT_CALIBRATION_SELF_VALIDATION_20260818.md) and [MIMO_VALIDATION_REPORT_20260818.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_VALIDATION_REPORT_20260818.md). The algorithm, topology and correction limits are documented in [MIMO_ROOM_TUNING.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md).
+The latest hardware acceptance record is [PI2_ACOUSTIC_ACCEPTANCE_20260820.md](AUDIODSP_REPRODUCTION_DOCS/PI2_ACOUSTIC_ACCEPTANCE_20260820.md). Silent regression records are [SILENT_CALIBRATION_SELF_VALIDATION_20260818.md](AUDIODSP_REPRODUCTION_DOCS/SILENT_CALIBRATION_SELF_VALIDATION_20260818.md) and [MIMO_VALIDATION_REPORT_20260818.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_VALIDATION_REPORT_20260818.md). The algorithm, topology and correction limits are documented in [MIMO_ROOM_TUNING.md](AUDIODSP_REPRODUCTION_DOCS/MIMO_ROOM_TUNING.md).
 
 For a deliberately conservative follow-up to a low-level sweep A/B, `diagnostics/refine_tonal_fir.py` can derive a listening-preview FIR from `frequency_comparison.csv`. It locks 0–120 Hz, applies only broad correction of at most about 1 dB above 120 Hz, preserves the approved FIR phase/peak tap and emits a WAV, JSON audit, CSV comparison and vector SVG. It is not a substitute for multi-position acoustic validation; preview the result before installing it.
 

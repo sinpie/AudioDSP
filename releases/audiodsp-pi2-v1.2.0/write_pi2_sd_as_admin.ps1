@@ -262,6 +262,7 @@ function Assert-FinalBundle {
         $managerText -notmatch 'set-bypass' -or
         $managerText -notmatch 'set-chunksize' -or
         $managerText -notmatch 'set-output-volume' -or
+        $managerText -notmatch 'AUDIO_LOCK = Path' -or
         $managerText -notmatch 'output_volume_db' -or
         $managerText -notmatch 'set-woofer-trim' -or
         $managerText -notmatch 'install-pair' -or
@@ -309,8 +310,8 @@ function Assert-FinalBundle {
         $webText -notmatch 'summary::after' -or
         $webText -notmatch 'room_tuning_audit' -or
         $webText -notmatch 'output-level-warning' -or
-        $webText -notmatch '−42부터 시작' -or
-        $webText -notmatch '실제 측정음을 재생합니다' -or
+        $webText -notmatch '기본 −42 dBFS' -or
+        $webText -notmatch '출력별 2초 빠른 검사' -or
         $webText -notmatch '저역 late/early' -or
         $webText -notmatch 'ThreadingHTTPServer\(\(WEB_HOST, WEB_PORT\)' -or
         $webText -notmatch 'active-profile' -or
@@ -359,6 +360,9 @@ function Assert-FinalBundle {
         'install-pair',
         'MIMO_MODES',
         'ensure_measurement_output_path',
+        'begin_measurement_audio_window',
+        'restore_measurement_audio_window',
+        'volume_restored_before_input',
         'validate_result_profile',
         'validate_result_revision',
         'RESULT_ALGORITHM_REVISION',

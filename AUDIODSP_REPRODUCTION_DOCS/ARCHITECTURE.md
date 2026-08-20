@@ -31,8 +31,8 @@ flowchart LR
 | HID 감시 | `/usr/local/bin/audiodsp-profile-monitor.py` | U7 Speaker/Headphones 실제 상태 읽기, 프로필 전환, 안내음 요청 |
 | 출력 전환 helper | `/usr/local/bin/audiodsp-output-profile` | manager 호출과 Front L/R 안내음 믹스 |
 | 웹 | `/usr/local/bin/audiodsp-profile-web.py` | 세 화면, HTTP API, staged upload/backup, client SVG, 실제 볼륨 polling |
-| 측정 엔진 | `/usr/local/bin/audiodsp-measurement.py` | 독점 측정, L/R/W 및 선택적 L+W/R+W 복소 closure, sweep 분석, 공간 결합, FIR 계산, 진행 상태 |
-| MIMO 엔진 | `/usr/local/bin/audiodsp-mimo.py` | Pi4/5 전용 2×4 robust pressure matching, 8-path FIR bank와 영구 한계 보고서 생성 |
+| 측정 엔진 | `/usr/local/bin/audiodsp-measurement.py` | 독점 측정, L/R/우퍼 및 선택적 합산 closure, ESS/SNR 분석, 독립-clock 안전 합산, FIR 계산, 진행 상태 |
+| MIMO 엔진 | `/usr/local/bin/audiodsp-mimo.py` | Pi4/5와 공통 timing reference 조건의 2×4 robust pressure matching, 8-path FIR bank와 영구 한계 보고서 생성 |
 | 준비 안내 | `/usr/local/bin/audiodsp-dsp-ready` | CamillaDSP 준비 확인 후 `DSP ready` 재생 |
 
 모든 서비스는 root로 동작한다. 이는 ALSA/HID, `/etc/camilladsp`, systemd 제어에 필요한 현재 설계 선택이며, 웹이 인증 없는 LAN 서비스라는 점과 함께 보안 경계를 결정한다.
@@ -44,7 +44,7 @@ flowchart LR
 - `copy_front`: L/R을 각각 한 번 convolution한 뒤 Front와 Rear로 복사한다. convolution 2개다.
 - `separate`: 입력을 Front/Rear로 복제한 뒤 각 L/R에 Front와 Rear FIR을 별도로 적용한다. convolution 4개다.
 - `bypass`: convolution 없이 입력 L/R을 Front/Rear에 복사한다.
-- `mimo_2x4`: 입력을 8개 경로로 펼쳐 각 물리 출력마다 L/R 전달 FIR을 적용하고 네 출력으로 합산한다. Pi4/5 전용이며 chunksize는 최소 1024다.
+- `mimo_2x4`: 입력을 8개 경로로 펼쳐 각 물리 출력마다 L/R 전달 FIR을 적용하고 네 출력으로 합산한다. Pi4/5, chunksize 1024 이상, 검증된 공통 timing reference가 모두 필요하다.
 - Rear FIR이 없으면 설정이 `separate`여도 유효 모드는 `copy_front`다.
 
 안내 WAV는 4채널 공유 dmix에 재생되지만 음성 샘플은 Front L/R에만 있고 Rear L/R은 무음이다.
@@ -84,6 +84,8 @@ MIMO bank는 `/etc/camilladsp/profiles/mimo`의 manifest와 네 stereo float32 W
 ## 볼륨 제어
 
 U7 `PCM Playback Volume`은 raw 0~127, -127~0 dB이며 8개 재생 채널을 가진다. AudioDSP API는 사용 실수를 줄이기 위해 -60~0 dB만 허용하고 `raw = 127 + dB`로 쓴다. 웹/API 쓰기는 JSON에 저장한 뒤 하드웨어에 즉시 적용한다. 하드웨어 쓰기가 실패해도 저장값은 유지되고 다음 CamillaDSP 시작 시 시작 래퍼가 다시 적용한다.
+
+측정 dBFS는 평상시 청취 볼륨과 독립된 U7 DAC 기준이다. 모든 audible measurement window는 오디오 전용 lock을 잡고 CamillaDSP와 U7 Mic/Line 입력을 먼저 끈 다음 8개 PCM 채널을 0 dB로 맞춰 read-back한다. 마지막 sweep/녹음 프로세스를 종료한 뒤 저장해 둔 동일 8채널 볼륨을 복원·read-back한 경우에만 Line/CamillaDSP 입력을 다시 연결한다. 복원 실패는 silent fail-closed이며 같은 lock 동안 manager mutation은 거부된다.
 
 실제값과 저장값은 구분된다. 물리 노브 변경은 실제값에 즉시 나타나지만 저장 JSON은 바꾸지 않는다. 따라서 재부팅·USB reset 후 마지막 웹/API 저장값으로 복원된다.
 

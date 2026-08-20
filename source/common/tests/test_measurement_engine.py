@@ -239,9 +239,23 @@ def main() -> int:
             "AUDIODSP_PREFERENCES_PATH": str(root / "correction-preferences.json"),
             "AUDIODSP_SELECTOR_STATE_PATH": str(selector_state_path),
             "AUDIODSP_BOOT_ID_PATH": str(boot_id_path),
+            "AUDIODSP_PLATFORM_CLASS": "test",
         })
         engine = load_module("audiodsp_measurement_test", args.engine)
         enable_windows_offline_fft(engine)
+
+        original_kill = engine.os.kill
+        try:
+            def permission_denied_for_live_pid(_pid: int, _signal: int) -> None:
+                raise PermissionError("different service user")
+
+            engine.os.kill = permission_denied_for_live_pid
+            require(
+                engine.measurement_worker_alive({"worker_pid": 999_999}),
+                "a live root-owned worker was reported dead to a non-root status client",
+            )
+        finally:
+            engine.os.kill = original_kill
 
         bound_state = {"mode": "lrw"}
         engine.bind_measurement_output(bound_state)
@@ -261,6 +275,94 @@ def main() -> int:
             "profile": "speaker", "state_byte": "0xa0", "source": "offline-test",
             "boot_id": "measurement-test-boot",
         }), encoding="utf-8")
+        engine.save_current(bound_state)
+
+        # Every audible path must disconnect the normal U7 input before forcing
+        # the hardware PCM stage to unity, then restore the exact old volume
+        # before CamillaDSP can reconnect the input. Exercise the common
+        # transaction directly without playing sound.
+        audio_events: list[str] = []
+        fake_audio = {"camilla_active": True, "raw": 117, "fail_raw": None}
+
+        class FakeCompleted:
+            def __init__(self, returncode: int = 0, stdout: str = "") -> None:
+                self.returncode = returncode
+                self.stdout = stdout
+
+        def fake_audio_run(command, **_kwargs):
+            tokens = [str(value) for value in command]
+            if tokens[0] == engine.SYSTEMCTL:
+                action = tokens[1]
+                audio_events.append(f"systemctl:{action}")
+                if action == "is-active":
+                    return FakeCompleted(0 if fake_audio["camilla_active"] else 3)
+                if action == "stop":
+                    fake_audio["camilla_active"] = False
+                    return FakeCompleted()
+                if action == "start":
+                    fake_audio["camilla_active"] = True
+                    return FakeCompleted()
+            if tokens[0] == engine.AMIXER:
+                if "cget" in tokens:
+                    audio_events.append("amixer:cget")
+                    raw = int(fake_audio["raw"])
+                    return FakeCompleted(stdout=(
+                        "numid=6,iface=MIXER,name='PCM Playback Volume'\n"
+                        "; type=INTEGER,access=rw---R--,values=8,min=0,max=127,step=0\n"
+                        f"  : values={','.join([str(raw)] * 8)}\n"
+                        "  | dBminmax-min=-12700,max=0\n"
+                    ))
+                if "PCM,0" in tokens:
+                    raw = int(tokens[-1])
+                    audio_events.append(f"amixer:volume:{raw}")
+                    if fake_audio["fail_raw"] == raw:
+                        return FakeCompleted(1, "injected restore failure")
+                    fake_audio["raw"] = raw
+                    return FakeCompleted(stdout=f"PCM Playback Volume set to {raw}")
+                action = tokens[-1]
+                name = tokens[-2]
+                audio_events.append(f"amixer:{name}:{action}")
+                return FakeCompleted()
+            raise AssertionError(f"unexpected offline audio command: {tokens}")
+
+        original_audio_run = engine.subprocess.run
+        original_sleep = engine.time.sleep
+        engine.subprocess.run = fake_audio_run
+        engine.time.sleep = lambda _seconds: None
+        try:
+            window = engine.begin_measurement_audio_window(require_camilla=True)
+            require(fake_audio["raw"] == 127 and not fake_audio["camilla_active"], "measurement did not force U7 PCM unity after input disconnect")
+            engine.ensure_measurement_audio_window(window)
+            engine.restore_measurement_audio_window(window)
+            require(fake_audio["raw"] == 117 and fake_audio["camilla_active"], "measurement did not restore listening volume and input")
+            stop_index = audio_events.index("systemctl:stop")
+            mic_off_index = audio_events.index("amixer:Mic:nocap")
+            line_off_index = audio_events.index("amixer:Line:nocap")
+            unity_index = audio_events.index("amixer:volume:127")
+            restore_index = audio_events.index("amixer:volume:117")
+            start_index = audio_events.index("systemctl:start")
+            require(
+                stop_index < mic_off_index < line_off_index < unity_index < restore_index < start_index,
+                f"unsafe measurement audio order: {audio_events}",
+            )
+
+            audio_events.clear()
+            fake_audio.update(camilla_active=True, raw=117, fail_raw=None)
+            failed_window = engine.begin_measurement_audio_window(require_camilla=True)
+            fake_audio["fail_raw"] = 117
+            try:
+                engine.restore_measurement_audio_window(failed_window)
+            except engine.MeasurementError:
+                pass
+            else:
+                raise AssertionError("injected U7 volume restore failure was accepted")
+            require(not fake_audio["camilla_active"], "input was reconnected after U7 volume restore failure")
+            require("systemctl:start" not in audio_events, "CamillaDSP started before volume restore PASS")
+        finally:
+            engine.subprocess.run = original_audio_run
+            engine.time.sleep = original_sleep
+            fake_audio.update(camilla_active=True, raw=117, fail_raw=None)
+            engine.CURRENT.unlink(missing_ok=True)
         engine.validate_result_profile({"measurement_profile": "speaker"}, "speaker")
         try:
             engine.validate_result_profile({"measurement_profile": "speaker"}, "headphone")
@@ -323,11 +425,11 @@ def main() -> int:
         header = noise_path.read_bytes()[:44]
         require(header[:4] == b"RIFF" and header[8:12] == b"WAVE", "level noise is not WAV")
         require(struct.unpack_from("<H", header, 22)[0] == 4 and struct.unpack_from("<I", header, 24)[0] == 48_000, "level noise is not 4ch/48k")
-        require(struct.unpack_from("<H", header, 34)[0] == 24 and noise_path.stat().st_size == 44 + 5 * 48_000 * 12, "level noise format/length mismatch")
+        require(struct.unpack_from("<H", header, 34)[0] == 24 and noise_path.stat().st_size == 44 + 2 * 48_000 * 12, "quick level sweep format/length mismatch")
         count = 4 * engine.RATE
         background = [0.001 * math.sin(2 * math.pi * index / 101.0) for index in range(count)]
         good = [background[index] + 0.05 * math.sin(2 * math.pi * index / 37.0) for index in range(count)]
-        low = [background[index] + 0.003 * math.sin(2 * math.pi * index / 37.0) for index in range(count)]
+        low = [background[index] + 0.0018 * math.sin(2 * math.pi * index / 37.0) for index in range(count)]
         clipped = list(good)
         clipped[count // 2] = 0.99
         transient_background = list(background)
@@ -337,6 +439,40 @@ def main() -> int:
         require(engine.evaluate_level_samples(transient_background, good, 24)["ok"], "one switching transient contaminated robust background RMS")
         require(not engine.evaluate_level_samples(background, low, 24)["ok"], "low-SNR level was accepted")
         require(not engine.evaluate_level_samples(background, clipped, 24)["ok"], "clipping level was accepted")
+        quick_low = engine.normalize_level_check(
+            {"snr_db": 5.99, "peak_dbfs": -20.0, "requested_level_dbfs": -30}, -30,
+        )
+        quick_pass = engine.normalize_level_check(
+            {"snr_db": 6.0, "peak_dbfs": -20.0, "requested_level_dbfs": -30}, -30,
+        )
+        quick_current = engine.normalize_level_check(
+            {"snr_db": 9.53, "peak_dbfs": -30.0, "requested_level_dbfs": -30}, -30,
+        )
+        quick_legacy_quieter_sweep = engine.normalize_level_check(
+            {"snr_db": 18.0, "peak_dbfs": -20.0, "requested_level_dbfs": -30}, -36,
+        )
+        quick_incomplete_coverage = engine.normalize_level_check(
+            {"snr_db": 30.0, "peak_dbfs": -20.0, "requested_level_dbfs": -30},
+            -30,
+            ["left", "right", "woofer", "left_woofer", "right_woofer"],
+        )
+        require(not quick_low["ok"] and quick_pass["ok"], "quick-sweep 6 dB PASS boundary is wrong")
+        require(
+            quick_current["ok"] and quick_current["recommended_sweep_level_dbfs"] == -24
+            and quick_current["recommended_raise_db"] == 6,
+            "quick-sweep usable PASS / optional 15 dB guidance is wrong",
+        )
+        require(
+            quick_legacy_quieter_sweep["ok"] and not quick_legacy_quieter_sweep["quality_recommended"]
+            and quick_legacy_quieter_sweep["assessment_snr_db"] == 12.0,
+            "legacy quick check was not projected to the configured full-sweep level",
+        )
+        require(not quick_incomplete_coverage["ok"] and not quick_incomplete_coverage["coverage_ok"], "legacy partial quick check was accepted for a five-output session")
+        require(
+            abs(engine.coherent_sweep_integration_gain_db(2.0)) < 1.0e-12
+            and abs(engine.coherent_sweep_integration_gain_db(14.0) - 8.45098) < 1.0e-4,
+            "full-sweep matched-filter SNR gain is not referenced to the 2 s preflight",
+        )
         desired_rt60 = 0.60
         tau = desired_rt60 / 6.907755
         decaying = [math.exp(-(index / engine.RATE) / tau) for index in range(2 * engine.RATE)]
@@ -375,6 +511,28 @@ def main() -> int:
         require(full_quality["analysis_band_hz"] == [15.0, 22_000.0], "combined quality gate lost full-band analysis")
         require(woofer_quality["snr_db"] > full_quality["snr_db"] + 2.5, "subwoofer-only SNR still averages its silent high-frequency interval")
 
+        # A real T5S quick capture exposed a boundary condition: its sustained
+        # 53-95 Hz acoustic passband occupies only about 160 ms of a two-second
+        # logarithmic sweep. It is valid measurement evidence, not a missing
+        # signal, so the quality gate must not retain the former 200 ms floor.
+        narrow_capture = [0.0001 * math.sin(2.0 * math.pi * index / 83.0) for index in range(capture_lead + len(woofer_reference))]
+        narrow_low = active_indices[0] + round(
+            (active_indices[-1] + 1 - active_indices[0])
+            * math.log(53.0 / 15.0) / math.log(22_000.0 / 15.0)
+        )
+        narrow_high = active_indices[0] + round(
+            (active_indices[-1] + 1 - active_indices[0])
+            * math.log(95.0 / 15.0) / math.log(22_000.0 / 15.0)
+        )
+        for index in range(narrow_low, narrow_high):
+            narrow_capture[capture_lead + index] += 12.0 * woofer_reference[index]
+        narrow_quality = engine.sweep_capture_quality(narrow_capture, woofer_reference, "woofer")
+        narrow_interval = narrow_quality["active_interval_samples"]
+        require(
+            narrow_quality["usable"] and narrow_interval[1] - narrow_interval[0] < engine.RATE // 5,
+            "valid narrow subwoofer passband was rejected by a fixed 200 ms floor",
+        )
+
         plausible_delay, plausible_details = engine.assess_bulk_delay(2_000, 1_048_576)
         late_delay, late_details = engine.assess_bulk_delay(518_895, 1_048_576)
         wrapped_delay, wrapped_details = engine.assess_bulk_delay(1_048_576 - 500, 1_048_576)
@@ -400,6 +558,18 @@ def main() -> int:
         require(abs(standard_quality["capture_delay_ms"] - 400.0) <= 60.0, "normal capture arm delay was not recovered")
         require(abs(truncated_quality["capture_delay_ms"]) <= 60.0, "truncated cold-start capture timing was not recovered")
         require(abs(delayed_quality["capture_delay_ms"] - 1100.0) <= 60.0, "long USB capture startup delay was not recovered")
+
+        # A selector/stream transition may contaminate the pre-roll while the
+        # post-roll remains representative. It must be reported, not promoted
+        # to the stationary floor that previously produced a negative SNR.
+        transient_timing = list(standard_timing)
+        for index in range(round(0.10 * engine.RATE), round(0.62 * engine.RATE)):
+            transient_timing[index] += 0.02 * math.sin(2.0 * math.pi * index / 31.0)
+        transient_quality = engine.sweep_capture_quality(transient_timing, front_reference, "left")
+        require(transient_quality["usable"], "pre-roll switching transient caused a false SNR failure")
+        require(transient_quality["switching_transient_suspected"], "pre/post noise imbalance was not reported")
+        guidance = engine.measurement_level_guidance({"snr_db": 6.4}, -30, -50.0)
+        require(guidance["recommended_level_dbfs"] == -21 and guidance["recommended_raise_db"] == 9, "exact SNR level guidance is wrong")
 
         frequencies = [round(20.0 * (1000.0 ** (index / 511.0)), 6) for index in range(512)]
         measurements_index = []
@@ -437,7 +607,8 @@ def main() -> int:
         # Reference acceptance case: Flat target, no extra bass suppression,
         # 0 dB Woofer trim and otherwise default safe settings.  The isolated
         # LPF Woofer branch is diagnostic-only; the final Front+Woofer sum is
-        # the target gate and therefore remains pending until post-FIR capture.
+        # the target gate; the conservative joint sum guard is calculated in
+        # the FIR bank and a later post-FIR capture remains optional evidence.
         baseline_started = time.monotonic()
         engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 6, 18, crossover_enabled=True, crossover_frequency_hz=100)
         baseline_state = engine.load_current()
@@ -446,8 +617,13 @@ def main() -> int:
         baseline_target_fit = baseline_validation["target_fit"]
         require(baseline_target_fit["left"]["pass"] and baseline_target_fit["right"]["pass"], "Flat/none/0 Front branches missed the selected target")
         require(baseline_target_fit["woofer"]["applicable"] is False and baseline_target_fit["woofer"]["pass"] is None, "Flat/none/0 incorrectly grades an isolated LPF Woofer against the full-system target")
-        require(baseline_validation["overall_pass"] and baseline_validation["crossover_sum"]["status"] == "pass_independent_complex_model", "Flat/none/0 did not pass the same-clock L/R/W complex sum gate")
-        require(baseline_state["result"]["crossover"]["complex_sum_target_pass"], "Flat/none/0 calculated Front+Woofer crossover sum missed Flat")
+        require(baseline_validation["overall_pass"] and baseline_validation["crossover_sum"]["status"] == "pass_safe_upper_phase_limited", "Flat/none/0 did not pass the clock-safe L/R/W sum guard")
+        require(baseline_state["result"]["crossover"]["safe_deploy_pass"] and baseline_state["result"]["crossover"]["complex_sum_target_pass"] is None, "Flat/none/0 did not separate safe sum PASS from unavailable absolute phase")
+        for side in ("left", "right"):
+            crossover_graph = baseline_state["result"]["crossover"]["channels"][side]
+            require(crossover_graph["frequency"][0] <= 20.1 and crossover_graph["frequency"][-1] >= 19_000.0, "A/B sum graph is not full range")
+            require(crossover_graph["metric_range_hz"][1] <= 300.0, "crossover target metric escaped its guarded low-frequency band")
+            require(len(crossover_graph["phase_agnostic_energy_db"]) == len(crossover_graph["frequency"]), "phase-agnostic graph fallback is incomplete")
         flat_target = engine.effective_combined_target(baseline_state["result"], frequencies)
         require(max(abs(value) for value in flat_target) <= 1.0e-6, "Flat/none/0 effective system target is not 0 dB")
         baseline_front_hash = baseline_state["result"]["front_sha256"]
@@ -479,7 +655,8 @@ def main() -> int:
         validate_result(engine, precise_built, phase=True)
         precise_validation = precise_built["result"]["self_validation"]
         require(precise_validation["premeasured_sum_model"]["pass"], "exact premeasured complex sums failed model closure")
-        require(precise_validation["crossover_sum"]["status"] == "pass_premeasured_model", "precision mode still requires a later acoustic sweep")
+        require(precise_validation["crossover_sum"]["status"] == "pass_safe_sum_phase_limited", "precision mode still requires a later acoustic sweep")
+        require(precise_validation["premeasured_sum_model"]["phase_verification_status"] == "limited", "independent U7/UMIK clocks falsely claimed exact phase")
         require(precise_built["result"]["front_sha256"] == baseline_front_hash and precise_built["result"]["rear_sha256"] == baseline_rear_hash, "diagnostic L+W/R+W responses changed or double-normalized the designed FIR bank")
         require(precise_built["result"]["filter_bank_normalization"]["relative_branch_gain_preserved"], "precision mode did not use one common bank normalization")
 
@@ -489,7 +666,7 @@ def main() -> int:
         validate_result(engine, precise_full_range, phase=True)
         require(not precise_full_range["result"]["crossover"]["enabled"], "Crossover OFF unexpectedly embedded LR4 branches")
         require(precise_full_range["result"]["crossover"]["sum_guard_enabled"], "Crossover OFF disabled the mandatory full-system overlap guard")
-        require(precise_full_range["result"]["self_validation"]["crossover_sum"]["status"] == "pass_premeasured_model", "Crossover OFF graded Front/Woofer independently instead of validating their sum")
+        require(precise_full_range["result"]["self_validation"]["crossover_sum"]["status"] == "pass_safe_sum_phase_limited", "Crossover OFF graded Front/Woofer independently instead of validating their sum")
 
         engine.save_current(precise_state)
         engine.build_worker("harman", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 6, 18, crossover_enabled=True, crossover_frequency_hz=100)
@@ -506,7 +683,7 @@ def main() -> int:
         corrupted["db"] = [value + 8.0 for value in corrupted["db"]]
         corrupted_path.write_text(json.dumps(corrupted), encoding="utf-8")
         failed_model = engine.evaluate_premeasured_sum_model(session, 3, -9.0, 100)
-        require(not failed_model["pass"] and "3 · 위치 측정" in failed_model["action"] and "3위치 처음부터 재측정" in failed_model["action"], "sum-model FAIL lacks an executable wizard-menu action")
+        require(not failed_model["pass"] and "3 · 위치 측정" in failed_model["action"] and "3곳 처음부터 재측정" in failed_model["action"], "sum-model FAIL lacks an executable wizard-menu action")
         corrupted_path.write_text(json.dumps(exact_combined), encoding="utf-8")
 
         # Measurement playback levels are acquisition/SNR controls only.  With
@@ -561,13 +738,12 @@ def main() -> int:
         require(any(value < -0.1 for value in phase_state["result"]["graphs"]["woofer"]["decay_control_db"]), "long bass decay did not activate cut-only damping")
         require(phase_state["result"]["room_decay"]["policy"], "room decay policy metadata missing")
         alignment = phase_state["result"]["time_alignment"]
-        require(alignment.get("aligned") and alignment.get("residual_total_delay_samples") == 0, "Front/Woofer total acoustic+FIR delay was not aligned")
-        require("front_fir_energy_delay_samples" in alignment and "rear_fir_energy_delay_samples" in alignment, "FIR delay was omitted from crossover alignment")
+        require(not alignment.get("enabled") and alignment.get("requested") and "clock" in str(alignment.get("reason", "")), "independent U7/UMIK clocks incorrectly enabled Front/Woofer delay alignment")
         crossover = phase_state["result"]["crossover"]
         require(crossover.get("enabled") and crossover.get("embedded_in_fir") and crossover.get("frequency_hz") == 100, "default digital crossover was not embedded in FIR")
         require(crossover.get("additional_runtime_filters") == 0 and crossover.get("additional_block_latency_samples") == 0, "embedded crossover incorrectly adds runtime/block latency")
         require(crossover.get("coherent_upper_guard_pass"), "joint Front+Woofer constructive-sum guard failed")
-        require(crossover.get("complex_sum_target_pass"), "joint Front+Woofer complex target verification failed")
+        require(crossover.get("safe_deploy_pass") and crossover.get("complex_sum_target_pass") is None, "joint Front+Woofer clock-safe target guard failed")
         bank_normalization = phase_state["result"]["filter_bank_normalization"]
         require(bank_normalization["relative_branch_gain_preserved"] and bank_normalization["channels"] == 4, "FIR bank did not use one common normalization gain")
         require(bank_normalization["peak_transfer_after_db"] <= 0.01, "common FIR bank normalization exceeded 0 dB")
@@ -678,7 +854,7 @@ def main() -> int:
         engine.build_worker("flat", "none", 0, "magnitude", 200, crossover_enabled=False)
         fast_result = engine.load_current()["result"]
         fast_seconds = round(time.monotonic() - fast_started, 3)
-        require(fast_result["self_validation"]["overall_pass"] and fast_result["self_validation"]["crossover_sum"]["status"] == "pass_independent_complex_model", "Fast standard SISO did not complete its one-position complex sum validation")
+        require(fast_result["self_validation"]["overall_pass"] and fast_result["self_validation"]["crossover_sum"]["status"] == "pass_safe_upper_phase_limited", "Fast standard SISO did not complete its one-position clock-safe sum validation")
         require(fast_result["measurement_coverage"]["mode"] == "fast_single_position", "Fast coverage metadata is wrong")
         require(fast_result["measurement_coverage"]["spatial_stability_applicable"] is False, "Fast mode falsely claims spatial stability")
         require(fast_result["self_validation"]["independent_positions"]["spatial_stability_applicable"] is False, "Fast independent-position check is mislabeled")
@@ -689,24 +865,28 @@ def main() -> int:
         dependency_state["level_check"] = {
             "ok": True,
             "snr_db": 30.0,
-            "requested_white_noise_level_dbfs": -36,
+            "requested_level_dbfs": -42,
             "peak_dbfs": -20.0,
+            "channels": [
+                {"source": source, "snr_db": 30.0, "peak_dbfs": -20.0, "requested_level_dbfs": -42}
+                for source in dependency_state["sources"]
+            ],
         }
         engine.save_current(dependency_state)
         same = engine.reconfigure_session("lrw", "90", -42, 8)
         require(same.get("result") and len(same["measurements"]) == 9 and same["level_check"]["ok"], "unchanged settings discarded data")
         mode_changed = engine.reconfigure_session("lr", "90", -42, 8)
-        require(mode_changed["result"] is None and mode_changed["measurements"] == [] and mode_changed["level_check"]["ok"], "mode change invalidation scope is wrong")
+        require(mode_changed["result"] is None and mode_changed["measurements"] == [] and mode_changed["level_check"] is None, "mode change did not invalidate the incomplete quick-check coverage")
         require(mode_changed["sources"] == ["left_woofer", "right_woofer"], "combined mode source routing metadata is wrong")
         engine.save_current(dependency_state)
         level_changed = engine.reconfigure_session("lrw", "90", -36, 8)
-        require(level_changed["result"] is None and level_changed["measurements"] == [] and level_changed.get("level_check", {}).get("ok"), "sweep below the tested white-noise level discarded a valid level check")
+        require(level_changed["result"] is None and level_changed["measurements"] == [] and level_changed.get("level_check") is None, "sweep-level change preserved a quick check captured at another level")
         engine.save_current(dependency_state)
         noise_changed = engine.reconfigure_session("lrw", "90", -42, 8, -30, -9)
-        require(noise_changed.get("level_check") is None and noise_changed["noise_level_dbfs"] == -30, "white-noise slider did not invalidate level check")
+        require(noise_changed.get("level_check", {}).get("ok") and noise_changed["noise_level_dbfs"] == -42, "hidden legacy noise field diverged from the authoritative sweep level")
         engine.save_current(dependency_state)
         woofer_level_changed = engine.reconfigure_session("lrw", "90", -42, 8, -36, -6)
-        require(woofer_level_changed.get("level_check", {}).get("ok") and len(woofer_level_changed["measurements"]) == 6 and all(item["source"] in ("left", "right") for item in woofer_level_changed["measurements"]) and woofer_level_changed["woofer_measurement_attenuation_db"] == -6, "woofer measurement slider did not preserve independent Front measurements")
+        require(woofer_level_changed.get("level_check") is None and len(woofer_level_changed["measurements"]) == 6 and all(item["source"] in ("left", "right") for item in woofer_level_changed["measurements"]) and woofer_level_changed["woofer_measurement_attenuation_db"] == -6, "woofer measurement attenuation did not invalidate quick check while preserving independent Front measurements")
         engine.save_current(dependency_state)
         prepared = engine.prepare_build()
         require(prepared["result"] is None and len(prepared["measurements"]) == 9 and prepared["level_check"]["ok"], "FIR rebuild invalidated raw measurements")
@@ -716,7 +896,16 @@ def main() -> int:
         # Session notes are metadata only. Saving them must not invalidate any
         # completed wizard stage, while loading a saved session restores the
         # exact verified checkpoint and rejects fake completion metadata.
-        dependency_state["level_check"] = {"ok": True, "snr_db": 30.0}
+        dependency_state["level_check"] = {
+            "ok": True,
+            "snr_db": 30.0,
+            "peak_dbfs": -20.0,
+            "requested_level_dbfs": -42,
+            "channels": [
+                {"source": source, "snr_db": 30.0, "peak_dbfs": -20.0, "requested_level_dbfs": -42}
+                for source in dependency_state["sources"]
+            ],
+        }
         engine.save_current(dependency_state)
         engine.atomic_json(session / "session.json", dependency_state)
         before_note = engine.load_current()
@@ -767,18 +956,67 @@ def main() -> int:
         persisted = json.loads(engine.CURRENT.read_text(encoding="utf-8"))
         require(persisted["state"] == "processing", "status-only stale-worker recovery unexpectedly mutated the session")
 
+        # A batch raw-WAV recovery must retain its owner PID until the outer
+        # worker finishes. Clearing it after each channel made the status API
+        # falsely report an interrupted job while Pi 2 was still calculating.
+        batch_dir = measurements / "batch-reprocess"
+        batch_dir.mkdir()
+        for source in ("left", "right"):
+            (batch_dir / f"p1_{source}_recorded.wav").write_bytes(b"saved raw placeholder")
+        batch_state = dict(dependency_state)
+        batch_state.update({
+            "session_id": "batch-reprocess", "session_dir": str(batch_dir),
+            "state": "processing", "worker_pid": os.getpid(), "active_pids": [],
+            "mode": "lrw", "sources": ["left", "right"], "positions_total": 1,
+            "positions_completed": 0, "measurements": [], "result": None,
+        })
+        engine.save_current(batch_state)
+        original_helpers = (
+            engine.reference_sweep_for_source, engine.read_pcm_wav,
+            engine.sweep_capture_quality, engine.response_from_recording,
+            engine.calibration_for,
+        )
+        engine.reference_sweep_for_source = lambda *_args, **_kwargs: [0.0, 0.1, -0.1]
+        engine.read_pcm_wav = lambda _path: (48_000, 24, [0.0, 0.1, -0.1])
+        engine.sweep_capture_quality = lambda *_args, **_kwargs: {"snr_db": 20.0, "recommended": True}
+        engine.response_from_recording = lambda *_args, **_kwargs: {
+            "peak_dbfs": -20.0, "rms_dbfs": -30.0,
+            "measurement_quality": {"snr_db": 20.0, "recommended": True},
+        }
+        engine.calibration_for = lambda _orientation: {}
+        try:
+            engine.inspect_saved_recording(1, "left", reprocess=True, batch_reprocess=True)
+            midway = json.loads(engine.CURRENT.read_text(encoding="utf-8"))
+            require(midway["state"] == "processing" and midway["worker_pid"] == os.getpid(), "batch recovery lost its live worker after the first channel")
+            engine.inspect_saved_recording(1, "right", reprocess=True, batch_reprocess=True)
+            finished_batch = json.loads(engine.CURRENT.read_text(encoding="utf-8"))
+            require(finished_batch["state"] == "measured" and finished_batch["worker_pid"] == os.getpid(), "batch recovery lost its worker before outer completion")
+        finally:
+            (
+                engine.reference_sweep_for_source, engine.read_pcm_wav,
+                engine.sweep_capture_quality, engine.response_from_recording,
+                engine.calibration_for,
+            ) = original_helpers
+            engine.save_current(dependency_state)
+
         report = {
             "result": "PASS",
             "fft": fft_test,
             "targets": len(catalog["targets"]),
             "level_check_offline": True,
+            "quick_sweep_pass_snr_db": engine.PREFLIGHT_TARGET_SNR_DB,
+            "quick_sweep_recommended_snr_db": engine.RECOMMENDED_SNR_DB,
             "variable_smoothing": True,
             "natural_rolloff_guard": True,
             "woofer_measurement_attenuation_db": engine.WOOFER_MEASUREMENT_ATTENUATION_DB,
-            "independent_white_noise_and_sweep_sliders": True,
+            "single_authoritative_sweep_level": True,
+            "sweep_hardware_unity_independent_of_listening_volume": True,
+            "volume_restored_before_input_reconnect": True,
+            "restore_failure_keeps_input_disconnected": True,
             "combined_lr_routing": "L+Woofer / R+Woofer",
             "woofer_quality_analysis_band": "adaptive sustained -3 dB acoustic passband; 15-300 Hz fallback",
             "capture_then_batch_response_processing": True,
+            "batch_reprocess_worker_liveness": True,
             "combined_build_seconds": combined_seconds,
             "combined_single_convolution_then_copy": True,
             "embedded_lr4_crossover_default_on": True,
@@ -801,8 +1039,8 @@ def main() -> int:
             "bass_phase_build_seconds": phase_seconds,
             "flat_none_trim0_baseline_build_seconds": baseline_seconds,
             "flat_none_trim0_measurement_level_invariant": True,
-            "flat_none_trim0_final_sum_gate": "PASS · same-clock independent L/R/W complex model",
-            "precision_premeasured_sum_no_post_sweep": precise_validation["crossover_sum"]["status"] == "pass_premeasured_model",
+            "flat_none_trim0_final_sum_gate": "PASS: clock-safe upper guard plus phase-agnostic target estimate",
+            "precision_premeasured_sum_no_post_sweep": precise_validation["crossover_sum"]["status"] == "pass_safe_sum_phase_limited",
             "magnitude": magnitude,
             "bass_phase": phase_result,
         }

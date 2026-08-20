@@ -7,8 +7,10 @@ if [ ! -d "$BOOT_ROOT" ]; then
 fi
 exec > >(tee -a /var/log/audiodsp-network-apply.log "$BOOT_ROOT/audiodsp-network-apply.log") 2>&1
 
-ssid="$(printf '%s' '__SSID_B64__' | base64 --decode)"
-psk="$(printf '%s' '__PSK_B64__' | base64 --decode)"
+ssid_b64='__SSID_B64__'
+psk_b64='__PSK_B64__'
+ssid="$(printf '%s' "$ssid_b64" | base64 --decode)"
+psk="$(printf '%s' "$psk_b64" | base64 --decode)"
 
 systemctl start NetworkManager.service
 for attempt in $(seq 1 30); do
@@ -26,7 +28,6 @@ if command -v iw >/dev/null 2>&1; then
     iw reg set KR || true
 fi
 
-nmcli radio wifi on
 nmcli device set eth0 managed yes || true
 nmcli device set wlan0 managed yes || true
 
@@ -42,27 +43,31 @@ nmcli connection add \
 # Let NetworkManager obtain Ethernet DHCP in parallel. A router that does not
 # answer DHCP must not delay Wi-Fi provisioning.
 
-nmcli connection delete audiodsp-wifi >/dev/null 2>&1 || true
-wifi_ok=0
-for attempt in $(seq 1 6); do
-    nmcli device wifi rescan ifname wlan0 ssid "$ssid" >/dev/null 2>&1 || true
-    if nmcli --wait 30 device wifi connect "$ssid" password "$psk" ifname wlan0 name audiodsp-wifi; then
-        wifi_ok=1
-        break
+if [ -n "$ssid_b64" ] && [ -n "$psk_b64" ]; then
+    nmcli radio wifi on
+    nmcli connection delete audiodsp-wifi >/dev/null 2>&1 || true
+    wifi_ok=0
+    for attempt in $(seq 1 6); do
+        nmcli device wifi rescan ifname wlan0 ssid "$ssid" >/dev/null 2>&1 || true
+        if nmcli --wait 30 device wifi connect "$ssid" password "$psk" ifname wlan0 name audiodsp-wifi; then
+            wifi_ok=1
+            break
+        fi
+        sleep 5
+    done
+    if [ "$wifi_ok" -ne 1 ]; then
+        echo 'Wi-Fi activation failed; systemd will retry this service.' >&2
+        exit 1
     fi
-    sleep 5
-done
-if [ "$wifi_ok" -ne 1 ]; then
-    echo 'Wi-Fi activation failed; systemd will retry this service.' >&2
-    exit 1
+    nmcli connection modify audiodsp-wifi \
+        connection.autoconnect yes \
+        connection.autoconnect-priority 100 \
+        ipv4.method auto \
+        ipv4.route-metric 600 \
+        ipv6.method auto
+else
+    echo 'Wi-Fi credential was intentionally omitted; Ethernet DHCP only.'
 fi
-
-nmcli connection modify audiodsp-wifi \
-    connection.autoconnect yes \
-    connection.autoconnect-priority 100 \
-    ipv4.method auto \
-    ipv4.route-metric 600 \
-    ipv6.method auto
 
 ethernet_ipv4="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | paste -sd, - || true)"
 wifi_ipv4="$(ip -4 -o addr show dev wlan0 2>/dev/null | awk '{print $4}' | paste -sd, - || true)"
@@ -71,7 +76,7 @@ if [ -z "$ethernet_ipv4" ] && [ -z "$wifi_ipv4" ]; then
     exit 1
 fi
 
-unset psk
+unset psk psk_b64
 {
     echo 'status=success'
     echo "completed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
