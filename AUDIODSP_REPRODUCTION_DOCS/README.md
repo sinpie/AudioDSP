@@ -18,6 +18,8 @@
 - [API.md](API.md): HTTP API와 폼 경로
 - [UI_UX_SPEC.md](UI_UX_SPEC.md): PC·모바일 화면과 상호작용 규칙
 - [MEASUREMENT_AND_DSP.md](MEASUREMENT_AND_DSP.md): 측정, FIR 설계, 안전 제한
+- [ROOM_TUNING_MATH.md](ROOM_TUNING_MATH.md): SISO 응답 추정·공간 평균·역필터·위상·크로스오버·검증의 수식과 감사 기준
+- [ROOM_TUNING_MATH_AUDIT_20260821.md](ROOM_TUNING_MATH_AUDIT_20260821.md): 저장 Pi5 세션의 v21/v22 계산 비교, 실제 사후 sweep, v23 출력 안정화 감사 결과
 - [MIMO_ROOM_TUNING.md](MIMO_ROOM_TUNING.md): 다중 음원 최적화, 최신 연구 채택 범위와 필터 한계
 - [MIMO_VALIDATION_REPORT_20260818.md](MIMO_VALIDATION_REPORT_20260818.md): 무음 합성·실제 Camilla parser 검증과 남은 실기 항목
 - [BACKUP_AND_MIGRATION.md](BACKUP_AND_MIGRATION.md): 백업 스키마와 이름 변경 호환성

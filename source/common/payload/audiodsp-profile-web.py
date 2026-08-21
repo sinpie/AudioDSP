@@ -55,6 +55,7 @@ QUICK_SWEEP_PASS_SNR_DB = 6.0
 MEASUREMENT_RECOMMENDED_SNR_DB = 15.0
 CROSSOVER_STATUS_LABELS = {
     "pass_measured": "사후 합산 실측 PASS",
+    "warning_post_measurement_switching_transient": "사후 합산 판정 보류 · 출력 전환 감지",
     "warning_post_measurement_low_snr": "사후 합산 판정 보류 · SNR 부족",
     "fail_measured": "사후 합산 실측 FAIL",
     "fail_premeasured_sum_snr": "정밀 합산 측정 SNR 부족",
@@ -112,7 +113,26 @@ def measurement_algorithm_revision() -> str:
     return "measurement-engine-unavailable"
 
 
+def measurement_response_revision() -> str:
+    """Read the response-estimator revision from the authoritative engine."""
+    override = environment("RESPONSE_ALGORITHM_REVISION", "").strip()
+    if override:
+        return override
+    try:
+        match = re.search(
+            r'^RESPONSE_ALGORITHM_REVISION\s*=\s*"([^"]+)"',
+            Path(MEASUREMENT).read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        if match:
+            return match.group(1)
+    except OSError:
+        pass
+    return "measurement-engine-unavailable"
+
+
 RESULT_ALGORITHM_REVISION = measurement_algorithm_revision()
+RESPONSE_ALGORITHM_REVISION = measurement_response_revision()
 DEFAULT_CORRECTION_PREFERENCES = {
     "target": "flat", "preset": "none", "woofer_trim_db": 0,
     "phase_mode": "bass", "phase_cutoff": 200, "spatial_mode": "equal",
@@ -408,6 +428,29 @@ def normalize_level_check_status(level_check: dict, configured_sweep_level_dbfs:
     return result
 
 
+_RESPONSE_REVISION_CACHE: dict[str, tuple[int, int, str]] = {}
+
+
+def saved_response_revision(path: Path) -> str:
+    """Return a cached response revision without reparsing every 1 s UI poll."""
+    try:
+        stat = path.stat()
+        cache_key = str(path)
+        cached = _RESPONSE_REVISION_CACHE.get(cache_key)
+        signature = (int(stat.st_mtime_ns), int(stat.st_size))
+        if cached and cached[:2] == signature:
+            return cached[2]
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        revision = str(payload.get("response_algorithm_revision") or "legacy-db-domain-smoothing")
+        _RESPONSE_REVISION_CACHE[cache_key] = (signature[0], signature[1], revision)
+        if len(_RESPONSE_REVISION_CACHE) > 128:
+            oldest = next(iter(_RESPONSE_REVISION_CACHE))
+            _RESPONSE_REVISION_CACHE.pop(oldest, None)
+        return revision
+    except (OSError, ValueError, TypeError):
+        return "unreadable-response"
+
+
 def measurement_status() -> dict:
     """Read the atomically-written job JSON directly; spawning the FFT engine each second is costly on Pi 2."""
     global MEASUREMENT_DEFAULT
@@ -438,11 +481,20 @@ def measurement_status() -> dict:
         if session_dir.is_dir() and expected:
             raw = [item for item in expected if (session_dir / f"p{item[0]}_{item[1]}_recorded.wav").is_file()]
             responses = [item for item in expected if (session_dir / f"p{item[0]}_{item[1]}_response.json").is_file()]
+            response_revisions = [
+                saved_response_revision(session_dir / f"p{item[0]}_{item[1]}_response.json")
+                for item in responses
+            ]
+            current_response_count = sum(revision == RESPONSE_ALGORITHM_REVISION for revision in response_revisions)
             value["capture_inventory"] = {
                 "expected": len(expected),
                 "raw_count": len(raw),
                 "response_count": len(responses),
                 "can_reprocess_all": len(raw) == len(expected),
+                "expected_response_revision": RESPONSE_ALGORITHM_REVISION,
+                "current_response_count": current_response_count,
+                "legacy_response_count": len(responses) - current_response_count,
+                "needs_algorithm_reprocess": bool(responses) and current_response_count < len(responses),
             }
             phase_expected = (
                 list(range(1, int(value.get("positions_total", 0)) + 1))
@@ -1435,6 +1487,9 @@ def measurement_panel(job: dict, preview: dict) -> str:
     phase_capture_inventory = job.get("phase_capture_inventory") or {}
     raw_capture_count = int(capture_inventory.get("raw_count", 0))
     response_count = int(capture_inventory.get("response_count", 0))
+    current_response_count = int(capture_inventory.get("current_response_count", response_count))
+    legacy_response_count = int(capture_inventory.get("legacy_response_count", max(0, response_count - current_response_count)))
+    needs_algorithm_reprocess = bool(capture_inventory.get("needs_algorithm_reprocess"))
     expected_capture_count = int(capture_inventory.get("expected", total * len(job.get("sources") or ())))
     phase_expected_count = int(phase_capture_inventory.get("expected", total if job.get("mode") in ("lrw", "lrw_sum") else 0))
     phase_result_count = int(phase_capture_inventory.get("result_count", len(job.get("phase_references") or ())))
@@ -1778,11 +1833,13 @@ def measurement_panel(job: dict, preview: dict) -> str:
             all_raw_reprocessable = bool(capture_inventory.get("can_reprocess_all")) and (
                 not phase_reference_included or bool(phase_capture_inventory.get("can_reprocess_all"))
             )
-            needs_reprocess = response_count < expected_capture_count or phase_result_count < phase_expected_count or phase_reliable_count < phase_expected_count
+            needs_reprocess = needs_algorithm_reprocess or response_count < expected_capture_count or phase_result_count < phase_expected_count or phase_reliable_count < phase_expected_count
             if all_raw_reprocessable and needs_reprocess and not busy:
                 recovery_action = '''<form method="post" action="/measurement/reprocess-saved"><button class="secondary">원본 재계산</button></form>'''
             phase_inventory_text = f" · 위상 원본 {phase_capture_inventory.get('raw_count', 0)}/{phase_expected_count} · 결과 {phase_result_count}/{phase_expected_count}" if phase_reference_included else ""
-            capture_recovery_html = f'''<section class="capture-recovery" data-measurement-step-content="3"><div><small>저장 상태</small><b>ESS 녹음 {raw_capture_count}/{expected_capture_count} · 응답 {response_count}/{expected_capture_count}{phase_inventory_text}</b><span>‘원본 재계산’은 저장 WAV만 사용하며 소리를 재생하지 않습니다.</span></div>{recovery_action}</section>'''
+            revision_text = f" · 새 계산 {current_response_count}/{response_count}" if response_count else ""
+            revision_note = f" 이전 방식 응답 {legacy_response_count}개는 새 파워 평균 계산 전 원본 재계산이 필요합니다." if legacy_response_count else ""
+            capture_recovery_html = f'''<section class="capture-recovery {'diagnostic-warning' if legacy_response_count else ''}" data-measurement-step-content="3"><div><small>저장 상태</small><b>ESS 녹음 {raw_capture_count}/{expected_capture_count} · 응답 {response_count}/{expected_capture_count}{revision_text}{phase_inventory_text}</b><span>‘원본 재계산’은 저장 WAV만 사용하며 소리를 재생하지 않습니다.{revision_note}</span></div>{recovery_action}</section>'''
 
         controls = f"""
         {session_settings}
@@ -1937,6 +1994,29 @@ def measurement_panel(job: dict, preview: dict) -> str:
         high_frequency_ceiling_reached = bool(high_frequency_compensation.get("ceiling_reached"))
         bank_scope = str(bank_normalization.get("scope", ""))
         common_scope_label = "L/R/우퍼 전체" if "woofer" in bank_scope or "mimo" in bank_scope else "L/R 전체"
+        spatial_aggregation = result.get("spatial_aggregation") or {}
+        spatial_positions = int(result.get("measurement_coverage", {}).get("positions", total))
+        spatial_channels = [
+            spatial_aggregation.get(name) for name in ("left", "right", "woofer")
+            if isinstance(spatial_aggregation.get(name), dict)
+        ]
+        spatial_lifts = [
+            float(item["median_power_mean_lift_db"])
+            for item in spatial_channels
+            if isinstance(item.get("median_power_mean_lift_db"), (int, float))
+        ]
+        spatial_lift_label = (
+            "1위치 · 수학적으로 동일" if spatial_positions == 1 else
+            " / ".join(f"{value:+.2f} dB" for value in spatial_lifts[:3]) if spatial_lifts else
+            "이전 결과 · 원본 재계산 권장"
+        )
+        spatial_legacy = int(spatial_aggregation.get("legacy_response_count", 0))
+        spatial_aggregation_card = (
+            f'<div class="{"diagnostic-warning" if spatial_legacy else ""}"><small>공간 통합 계산</small>'
+            f'<b>가중 평균 파워 · {html.escape(spatial_lift_label)}</b>'
+            f'<span>{"L/R/우퍼의 dB 기하평균 대비 상승량" if spatial_positions > 1 else "Fast는 위치가 하나라 평균 방식의 영향 없음"}'
+            f'{f" · 이전 응답 {spatial_legacy}개 재계산 필요" if spatial_legacy else ""}</span></div>'
+        )
         preference = result.get("preference", {})
         crossover = result.get("crossover", {})
         crossover_check = self_validation.get("crossover_sum", {})
@@ -2222,10 +2302,21 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 f'<div><small>우퍼 복소합 정렬</small><b>극성 {phase_polarity} · {phase_branch}</b>'
                 f'<span>{abs(int(relative_phase.get("relative_delay_samples", 0)))} 샘플 · '
                 f'{abs(float(relative_phase.get("relative_delay_ms", 0.0))):.3f} ms · MAE '
-                f'{relative_phase.get("predicted_mae_db_before_guard", "?")} dB</span></div>'
+                f'{relative_phase.get("predicted_mae_db_before_guard", "?")} dB · 상쇄 P90 '
+                f'{relative_phase.get("cancellation_deficit_p90_db", "?")} dB</span></div>'
+            )
+        elif relative_phase.get("evaluated"):
+            phase_alignment_card = (
+                '<div><small>우퍼 복소합 정렬</small><b>현재 지연·극성 유지</b>'
+                f'<span>{html.escape(str(relative_phase.get("reason") or "안전한 개선 후보가 없습니다."))}<br>'
+                f'현재 상쇄 P90 {relative_phase.get("baseline_cancellation_deficit_p90_db", "?")} dB · '
+                f'후보 {relative_phase.get("candidate_cancellation_deficit_p90_db", "?")} dB</span></div>'
             )
         else:
-            phase_alignment_card = '<div><small>우퍼 복소합 정렬</small><b>자동 정렬 미사용</b><span>‘위상 방식’이 음량만이거나 직접음 위상 신뢰도가 부족합니다.</span></div>'
+            phase_alignment_card = (
+                '<div><small>우퍼 복소합 정렬</small><b>자동 정렬 미사용</b>'
+                f'<span>{html.escape(str(relative_phase.get("reason") or "‘위상 방식’이 음량만이거나 직접음 위상 신뢰도가 부족합니다."))}</span></div>'
+            )
         raw_crossover_status = str(crossover.get("status", ""))
         crossover_status_text = CROSSOVER_STATUS_LABELS.get(
             raw_crossover_status,
@@ -2290,20 +2381,24 @@ def measurement_panel(job: dict, preview: dict) -> str:
             post_evaluation = post.get("evaluation") or self_validation.get("post_filter_sum") or {}
             if post_evaluation:
                 post_channels = post_evaluation.get("channels", {})
-                inconclusive_post = bool(post_evaluation.get("inconclusive_low_snr"))
+                inconclusive_low_snr = bool(post_evaluation.get("inconclusive_low_snr"))
+                inconclusive_transient = bool(post_evaluation.get("inconclusive_switching_transient"))
+                inconclusive_post = inconclusive_low_snr or inconclusive_transient
                 post_metrics = ''.join(
                     f'<div class="{"validation-fail" if values.get("target_pass") is False and not inconclusive_post else "diagnostic-warning" if values.get("target_pass") is False else ""}"><small>{"L" if side == "left" else "R"}+우퍼 실측↔타깃</small><b>MAE {values.get("target_mae_db", "?")} / P90 {values.get("target_p90_abs_error_db", "?")} dB</b><span>크로스오버 MAE {values.get("crossover_mae_db", "?")} dB · 물리 한계 {values.get("physical_extension_limit_hz", "?")} Hz</span></div>'
                     f'<div class="{"validation-fail" if values.get("prediction_pass") is False and not inconclusive_post else "diagnostic-warning" if values.get("prediction_pass") is False else ""}"><small>{"L" if side == "left" else "R"}+우퍼 예상↔실측</small><b>MAE {values.get("prediction_mae_db", "?")} / P90 {values.get("prediction_p90_abs_error_db", "?")} dB</b><span>크로스오버 MAE {values.get("crossover_prediction_mae_db", "?")} dB · 채널별 0 dB 재정규화 없음</span></div>'
                     for side, values in post_channels.items()
                 )
                 prediction_consistency = post_evaluation.get("prediction_consistency") or {}
-                prediction_status = {"pass": "PASS", "fail": "FAIL", "inconclusive_low_snr": "판정 보류 · SNR 부족", "warning_phase_limited": "권장 · 위상 제한"}.get(str(prediction_consistency.get("status")), "판정 없음")
+                prediction_status = {"pass": "PASS", "fail": "FAIL", "inconclusive_switching_transient": "판정 보류 · 출력 전환 감지", "inconclusive_low_snr": "판정 보류 · SNR 부족", "warning_phase_limited": "권장 · 위상 제한"}.get(str(prediction_consistency.get("status")), "판정 없음")
                 post_failure_guide = "" if post_evaluation.get("overall_pass") else (
+                    f'<p class="diagnostic-note"><b>판정 보류 · 출력 전환 감지</b> · {html.escape(str((post_evaluation.get("recommended_retry") or {}).get("action", "5 · 적용 전 검토에서 ‘검증 초기화’ 후 같은 레벨로 다시 측정하세요.")))}</p>'
+                    if inconclusive_transient else
                     f'<p class="diagnostic-note"><b>판정 보류 · SNR 부족</b> · {html.escape(str((post_evaluation.get("recommended_retry") or {}).get("action", "5 · 적용 전 검토에서 ‘검증 초기화’ 후 ‘검증 sweep 입력 -25 dBFS’로 다시 측정하세요.")))}</p>'
-                    if inconclusive_post else
+                    if inconclusive_low_snr else
                     '<p class="failure"><b>조치</b> · 먼저 <b>5 · 적용 전 검토 → 기존 튜닝</b>으로 복귀한 뒤 U7 경로·마이크 위치가 원측정과 같은지 확인하세요. 예상↔실측만 FAIL이면 <b>3 · 위치 측정 → 저장 원본 재계산</b> 후 <b>4 · FIR 계산</b>을 다시 실행하세요. 실측↔타깃도 FAIL이면 <b>4 · FIR 계산</b>의 크로스오버·최종 우퍼 트림·추가 억제를 한 항목씩 바꿔 비교하세요.</p>'
                 )
-                post_verdict_label = "PASS" if post_evaluation.get("overall_pass") else "판정 보류 · SNR 부족" if inconclusive_post else "FAIL"
+                post_verdict_label = "PASS" if post_evaluation.get("overall_pass") else "판정 보류 · 출력 전환 감지" if inconclusive_transient else "판정 보류 · SNR 부족" if inconclusive_low_snr else "FAIL"
                 post_verdict_class = "success" if post_evaluation.get("overall_pass") else "diagnostic-note" if inconclusive_post else "failure"
                 post_snr = post_evaluation.get("snr") or {}
                 post_snr_minimum = post_snr.get("minimum_db")
@@ -2320,7 +2415,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
             next_position = min(post_total, post_completed + 1)
             post_button_disabled = " disabled" if not preview_active or busy or post_completed >= post_total else ""
             post_action_note = (
-                "검증을 완료했습니다. 다시 측정하려면 ‘검증 초기화’를 누른 뒤 ‘이번 튜닝’을 적용하세요."
+                "검증을 완료했습니다. 소리 없이 최신 판정만 적용하려면 ‘저장 결과 재판정’, 다시 측정하려면 ‘검증 초기화’ 후 ‘이번 튜닝’을 누르세요."
                 if post_completed >= post_total else
                 "먼저 위의 ‘이번 튜닝’을 눌러 Preview를 적용하세요."
                 if not preview_active else
@@ -2332,13 +2427,17 @@ def measurement_panel(job: dict, preview: dict) -> str:
             )
             post_reset_control = ""
             if post_completed:
-                post_reset_control = '''<form method="post" action="/measurement/reset-post-validation" onsubmit="return confirm('사후 합산 검증 진행값만 초기화합니다. 원측정과 생성 FIR은 유지됩니다. 계속할까요?')"><button class="secondary">검증 초기화</button></form>'''
-            post_pill_class = "" if post_evaluation.get("overall_pass") else "neutral" if post_evaluation.get("inconclusive_low_snr") else "error" if post_evaluation else ""
+                post_reprocess_control = (
+                    '<form method="post" action="/measurement/reprocess-post-validation"><button class="secondary">저장 결과 재판정</button></form>'
+                    if post_completed >= post_total else ""
+                )
+                post_reset_control = f'''<div class="actions compact">{post_reprocess_control}<form method="post" action="/measurement/reset-post-validation" onsubmit="return confirm('사후 합산 검증 진행값만 초기화합니다. 원측정과 생성 FIR은 유지됩니다. 계속할까요?')"><button class="secondary">검증 초기화</button></form></div>'''
+            post_pill_class = "" if post_evaluation.get("overall_pass") else "neutral" if (post_evaluation.get("inconclusive_low_snr") or post_evaluation.get("inconclusive_switching_transient")) else "error" if post_evaluation else ""
             post_validation_html = f'''
             <section class="post-validation-card" aria-labelledby="post-validation-title">
               <div class="section-head"><div><h4 id="post-validation-title">선택 사항 · Preview FIR 적용 후 합산 실측</h4><p class="muted">실제 스테레오 입력 → 현재 프런트/우퍼 FIR → U7 4채널 → 방 → UMIK-1 경로를 측정합니다. 정식 적용 필수 단계가 아니며 원측정과 생성 FIR은 유지됩니다.</p></div><span class="pill {post_pill_class}">{post_completed}/{post_total} 위치</span></div>
               <form method="post" action="/measurement/post-validation" class="measure-form" onsubmit="return confirm('현재 Preview FIR을 통과한 L+우퍼/R+우퍼 검증 스윕을 재생합니다. 원측정과 생성 FIR은 유지됩니다. 시작할까요?')">
-                <label>검증 sweep 입력<select name="level_dbfs"{' disabled' if post_completed else ''}>{level_options}</select>{post_level_hidden}<span>U7 청취 볼륨과 무관한 FIR 입력 기준입니다. 현재 FIR의 공통 감쇄는 {common_attenuation_label}이므로 대부분의 실제 출력은 선택값보다 그만큼 낮을 수 있습니다. 입력 OFF → PCM 0 dB → 28초 ESS → 원래 볼륨 복원 → 입력 복귀 순서로 실행합니다.</span></label>
+                <label>검증 sweep 입력<select name="level_dbfs"{' disabled' if post_completed else ''}>{level_options}</select>{post_level_hidden}<span>U7 청취 볼륨과 무관한 FIR 입력 기준입니다. 현재 FIR의 공통 감쇄는 {common_attenuation_label}이므로 대부분의 실제 출력은 선택값보다 그만큼 낮을 수 있습니다. 입력 OFF → PCM 0 dB → 출력 안정화용 무음 2초 → 28초 ESS → 원래 볼륨 복원 → 입력 복귀 순서로 실행합니다.</span></label>
               <button{post_button_disabled}>위치 {next_position}/{post_total} 합산 측정</button>
               </form>
               <p class="form-note">{html.escape(post_action_note)}</p>
@@ -2351,7 +2450,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
           {result_path_note}
           <p><b>{html.escape(dict(target_labels).get(str(result.get('target')), str(result.get('target'))))}</b> · {html.escape(dict((('none', '추가 억제 없음'), ('primus360', 'Primus 360 수준'), ('strong', 'T5S 강한 억제'))).get(str(result.get('preset')), str(result.get('preset'))))} · {result.get('taps')}탭 · 프런트 피크 {left.get('peak_tap', '?')}탭 ({left.get('peak_delay_ms', '?')} ms)</p>
           <p><code>{html.escape(str(result.get('front_sha256', '')))}</code></p>
-          <div class="diagnostic-grid"><div><small>측정 범위</small><b>{'빠른 측정 · 1위치' if int(result.get('measurement_coverage', {}).get('positions', total)) == 1 else '표준 측정 · 3위치'}</b></div><div><small>공간 평균</small><b>{html.escape(str(result.get('spatial_mode', 'equal')))}</b></div><div><small>룸보정 범위</small><b>{limits.get('low_hz', '?')}–{limits.get('high_hz', '?')} Hz</b></div><div><small>최대 상대 보상</small><b>{limits.get('max_relative_compensation_db', limits.get('max_room_boost_db', '?'))} dB</b><small>신뢰 가능한 넓은 roll-off의 상한 · 좁은 딥은 최대 3 dB</small></div><div><small>상대 보상의 음량 비용</small><b>전체 {common_attenuation_label}</b><small>가장 큰 FIR 보정점을 0 dB로 유지하기 위해 L/R/우퍼를 함께 내린 값</small></div><div class="{'diagnostic-warning' if high_frequency_ceiling_reached and isinstance(high_frequency_residual_db, (int, float)) and high_frequency_residual_db > 3 else ''}"><small>15–20 kHz 잔여 오차</small><b>{high_frequency_residual_label}</b><small>{'상대 보상 상한을 모두 사용함' if high_frequency_ceiling_reached else '선택한 보상 한도 안에서 계산됨'}</small></div><div><small>공통 0 dB 기준</small><b>{common_scope_label} · 공통 gain {common_gain_label}</b><small>채널별 정규화 없음 · 상대레벨 보존</small></div><div class="{'validation-fail' if crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if crossover_failed else '실측 대기 · ' if crossover_pending else ''}{html.escape(crossover_label)}</b></div>{phase_alignment_card}<div><small>추가 취향</small><b>저음 {preference.get('bass_db_at_20_hz', 0):+} / 고음 {preference.get('treble_db_at_20_khz', 0):+} dB</b></div><div><small>L/R 중앙값 차이</small><b>{diagnostics.get('lr_median_difference_db', '?')} dB</b></div><div><small>공간 편차 중앙값</small><b>{diagnostics.get('spatial_std_median_db', '?')} dB</b></div><div><small>측정 SNR 최소/중앙</small><b>{diagnostics.get('measurement_snr_min_db', '?')} / {diagnostics.get('measurement_snr_median_db', '?')} dB</b></div><div class="{'validation-fail' if validation_failed else ''}"><small>FIR 셀프검증</small><b>{validation_label}</b></div><div><small>우퍼 최종 트림</small><b>{result.get('woofer_trim_db', 0):+} dB</b></div><div><small>측정 시 우퍼 감쇄</small><b>{job.get('woofer_measurement_attenuation_db', -9):+} dB · 응답에서 복원됨</b></div></div>
+          <div class="diagnostic-grid"><div><small>측정 범위</small><b>{'빠른 측정 · 1위치' if int(result.get('measurement_coverage', {}).get('positions', total)) == 1 else '표준 측정 · 3위치'}</b></div><div><small>공간 평균</small><b>{html.escape(str(result.get('spatial_mode', 'equal')))}</b></div>{spatial_aggregation_card}<div><small>룸보정 범위</small><b>{limits.get('low_hz', '?')}–{limits.get('high_hz', '?')} Hz</b></div><div><small>최대 상대 보상</small><b>{limits.get('max_relative_compensation_db', limits.get('max_room_boost_db', '?'))} dB</b><small>신뢰 가능한 넓은 roll-off의 상한 · 좁은 딥은 최대 3 dB</small></div><div><small>상대 보상의 음량 비용</small><b>전체 {common_attenuation_label}</b><small>가장 큰 FIR 보정점을 0 dB로 유지하기 위해 L/R/우퍼를 함께 내린 값</small></div><div class="{'diagnostic-warning' if high_frequency_ceiling_reached and isinstance(high_frequency_residual_db, (int, float)) and high_frequency_residual_db > 3 else ''}"><small>15–20 kHz 잔여 오차</small><b>{high_frequency_residual_label}</b><small>{'상대 보상 상한을 모두 사용함' if high_frequency_ceiling_reached else '선택한 보상 한도 안에서 계산됨'}</small></div><div><small>공통 0 dB 기준</small><b>{common_scope_label} · 공통 gain {common_gain_label}</b><small>채널별 정규화 없음 · 상대레벨 보존</small></div><div class="{'validation-fail' if crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if crossover_failed else '실측 대기 · ' if crossover_pending else ''}{html.escape(crossover_label)}</b></div>{phase_alignment_card}<div><small>추가 취향</small><b>저음 {preference.get('bass_db_at_20_hz', 0):+} / 고음 {preference.get('treble_db_at_20_khz', 0):+} dB</b></div><div><small>L/R 중앙값 차이</small><b>{diagnostics.get('lr_median_difference_db', '?')} dB</b></div><div><small>공간 편차 중앙값</small><b>{diagnostics.get('spatial_std_median_db', '?')} dB</b></div><div><small>측정 SNR 최소/중앙</small><b>{diagnostics.get('measurement_snr_min_db', '?')} / {diagnostics.get('measurement_snr_median_db', '?')} dB</b></div><div class="{'validation-fail' if validation_failed else ''}"><small>FIR 셀프검증</small><b>{validation_label}</b></div><div><small>우퍼 최종 트림</small><b>{result.get('woofer_trim_db', 0):+} dB</b></div><div><small>측정 시 우퍼 감쇄</small><b>{job.get('woofer_measurement_attenuation_db', -9):+} dB · 응답에서 복원됨</b></div></div>
           <p class="diagnostic-note"><b>설정 상한과 예상 음압은 다릅니다.</b> ‘최대 상대 보상’과 ‘최대 룸 감쇄’는 FIR이 사용할 수 있는 범위의 제한값입니다. 아래 예상 곡선은 측정 응답, 좁은 딥 보호, 크로스오버 합산과 전체 공통 gain을 모두 적용한 계산 결과이며, 사후 실측과의 일치도는 ‘예상↔실측’ MAE/P90으로 판단합니다.</p>
             <div class="graph-toolbar"><div><b>응답 비교</b><small>전체 대역이 기본이며 저역 확대에서 크로스오버 딥을 확인합니다.</small></div><div role="group" aria-label="그래프 주파수 범위"><button type="button" class="secondary selected" data-result-range="full" aria-pressed="true">전체</button><button type="button" class="secondary" data-result-range="bass" aria-pressed="false">저역</button></div></div>
           <svg id="measurement-result-graph" data-result-target="{html.escape(str(result.get('target', 'harman')))}" viewBox="0 0 760 250" role="img" aria-label="보정 전후 및 합산 주파수 응답"></svg>
@@ -2431,7 +2530,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
             recovery_buttons.append(
                 '<form method="post" action="/measurement/reprocess-level"><button>빠른 검사 원본 재계산</button></form>'
             )
-        if bool(capture_inventory.get("can_reprocess_all")) and response_count < expected_capture_count and not busy:
+        if bool(capture_inventory.get("can_reprocess_all")) and (response_count < expected_capture_count or needs_algorithm_reprocess) and not busy:
             recovery_buttons.append(
                 '<form method="post" action="/measurement/reprocess-saved"><button>위치 측정 원본 재계산</button></form>'
             )
@@ -3499,6 +3598,10 @@ class Handler(BaseHTTPRequestHandler):
                 fields = self.read_urlencoded()
                 measurement("start-post-validation", fields["level_dbfs"])
                 self.redirect("현재 미리듣기 FIR을 통과하는 L+우퍼/R+우퍼 사후 합산 측정을 시작했습니다. 원측정과 FIR은 유지됩니다.", "/measure")
+                return
+            if parsed.path == "/measurement/reprocess-post-validation":
+                measurement("reprocess-post-validation")
+                self.redirect("저장된 사후 합산 응답을 소리 없이 다시 판정했습니다.", "/measure")
                 return
             if parsed.path == "/measurement/reset-post-validation":
                 measurement("reset-post-validation")

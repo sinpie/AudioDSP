@@ -71,10 +71,16 @@ MINIMUM_USABLE_SNR_DB = 6.0
 RECOMMENDED_SNR_DB = 15.0
 PREFLIGHT_TARGET_SNR_DB = MINIMUM_USABLE_SNR_DB
 POST_VALIDATION_SWEEP_SECONDS = 28
+POST_VALIDATION_SILENT_LEAD_SECONDS = 2.0
 FIR_IMPLEMENTATION_MAE_LIMIT_DB = 0.25
 FIR_IMPLEMENTATION_P95_LIMIT_DB = 0.80
-RESULT_ALGORITHM_REVISION = "2026-08-21-broad-rolloff-diagnostics-v21"
-PHASE_CLOCK_SHARED = environment("AUDIODSP_PHASE_CLOCK_SHARED", "0") == "1"
+RESULT_ALGORITHM_REVISION = "2026-08-21-post-validation-settle-v23"
+RESPONSE_ALGORITHM_REVISION = "2026-08-21-power-domain-smoothing-v1"
+SMOOTHING_NAME = "power-domain variable 1/12 octave <200 Hz; 1/6 octave 200-2000 Hz; 1/3 octave >2 kHz"
+LEGACY_SMOOTHING_NAMES = frozenset((
+    "variable 1/12 octave <200 Hz; 1/6 octave 200-2000 Hz; 1/3 octave >2 kHz",
+))
+PHASE_CLOCK_SHARED = environment("PHASE_CLOCK_SHARED", "0") == "1"
 WOOFER_MEASUREMENT_ATTENUATION_DB = float(environment(
     "WOOFER_MEASUREMENT_ATTENUATION_DB",
     str(DEFAULT_WOOFER_MEASUREMENT_ATTENUATION_DB),
@@ -462,6 +468,14 @@ def load_current() -> dict[str, Any]:
             for position, source in expected
             if (session_directory / f"p{position}_{source}_response.json").is_file()
         ]
+        response_revisions = []
+        for item in responses:
+            try:
+                payload = json.loads((session_directory / item["file"]).read_text(encoding="utf-8"))
+                response_revisions.append(str(payload.get("response_algorithm_revision") or "legacy-db-domain-smoothing"))
+            except (OSError, ValueError, TypeError):
+                response_revisions.append("unreadable-response")
+        current_response_count = sum(revision == RESPONSE_ALGORITHM_REVISION for revision in response_revisions)
         value["capture_inventory"] = {
             "expected": len(expected),
             "raw_count": len(raw),
@@ -469,6 +483,10 @@ def load_current() -> dict[str, Any]:
             "raw": raw,
             "responses": responses,
             "can_reprocess_all": bool(expected) and len(raw) == len(expected),
+            "expected_response_revision": RESPONSE_ALGORITHM_REVISION,
+            "current_response_count": current_response_count,
+            "legacy_response_count": len(responses) - current_response_count,
+            "needs_algorithm_reprocess": bool(responses) and current_response_count < len(responses),
         }
         phase_expected = (
             list(range(1, session_position_count(value) + 1))
@@ -1400,9 +1418,12 @@ def generate_sweep_mono(
     level_check: bool = False,
     low_hz: float | None = None,
     high_hz: float | None = None,
+    lead_seconds: float = 0.35,
 ) -> tuple[list[float], int]:
     """Generate deterministic mono logarithmic sine sweep samples."""
-    lead_seconds = 0.35
+    lead_seconds = float(lead_seconds)
+    if not 0.0 <= lead_seconds <= 5.0:
+        raise MeasurementError("Sweep 무음 준비 시간은 0~5초여야 합니다.")
     tail_seconds = 1.0 if level_check else 2.0
     sweep_seconds = float(seconds)
     frames = round((lead_seconds + sweep_seconds + tail_seconds) * RATE)
@@ -1435,10 +1456,17 @@ def reference_sweep_for_source(
     seconds: int,
     *,
     woofer_attenuation_db: float | None = None,
+    level_check: bool = False,
 ) -> list[float]:
     """Build the deconvolution reference without touching a saved WAV."""
     low_hz, high_hz = sweep_band_for_source(source)
-    mono, _ = generate_sweep_mono(level_dbfs, seconds, low_hz=low_hz, high_hz=high_hz)
+    mono, _ = generate_sweep_mono(
+        level_dbfs,
+        seconds,
+        level_check=level_check,
+        low_hz=low_hz,
+        high_hz=high_hz,
+    )
     if source not in SUBWOOFER_ONLY_SOURCES:
         return mono
     woofer_db = WOOFER_MEASUREMENT_ATTENUATION_DB if woofer_attenuation_db is None else float(woofer_attenuation_db)
@@ -2182,7 +2210,14 @@ def write_filtered_stereo_sweep(path: Path, side: str, level_dbfs: int, seconds:
     """Write a stereo input sweep that must travel through the active FIR graph directly in 2ch."""
     if side not in ("left", "right"):
         raise MeasurementError("사후 합산 검증 채널이 잘못되었습니다.")
-    mono, _ = generate_sweep_mono(level_dbfs, seconds)
+    # A standalone CamillaDSP file graph can switch the U7 stream on startup.
+    # Keep that transition inside silence so it cannot overlap low-frequency
+    # ESS content; this does not add another audible sweep.
+    mono, _ = generate_sweep_mono(
+        level_dbfs,
+        seconds,
+        lead_seconds=POST_VALIDATION_SILENT_LEAD_SECONDS,
+    )
     data_bytes = len(mono) * 2 * 3
     zero = b"\x00\x00\x00"
     with path.open("wb") as handle:
@@ -3246,6 +3281,8 @@ def response_from_recording(
     reference: list[float],
     cal: dict[str, Any],
     source: str | None = None,
+    *,
+    configured_level_dbfs: int | None = None,
 ) -> dict[str, Any]:
     _, bits, samples = read_pcm_wav(recorded)
     if len(samples) < RATE:
@@ -3255,10 +3292,13 @@ def response_from_recording(
     if peak >= 0.988:
         raise MeasurementError("UMIK 입력이 클리핑되었습니다. 볼륨을 낮추세요.")
     quality = sweep_capture_quality(samples, reference, source)
-    try:
-        configured_level_dbfs = int(load_current().get("level_dbfs", DEFAULT_SWEEP_LEVEL_DBFS))
-    except Exception:
-        configured_level_dbfs = DEFAULT_SWEEP_LEVEL_DBFS
+    if configured_level_dbfs is None:
+        try:
+            configured_level_dbfs = int(load_current().get("level_dbfs", DEFAULT_SWEEP_LEVEL_DBFS))
+        except Exception:
+            configured_level_dbfs = DEFAULT_SWEEP_LEVEL_DBFS
+    else:
+        configured_level_dbfs = int(configured_level_dbfs)
     quality_message, level_guidance = measurement_quality_message(
         quality,
         source,
@@ -3347,7 +3387,7 @@ def response_from_recording(
             phases[index] -= 2.0 * math.pi
         while phases[index] - phases[index - 1] < -math.pi:
             phases[index] += 2.0 * math.pi
-    smoothed = variable_smooth(frequencies, levels)
+    smoothed = variable_power_smooth(frequencies, levels)
     group_delay = group_delay_metrics(frequencies, phases) if bulk_delay_reliable else {
         "reliable": False,
         "classification": "insufficient_data",
@@ -3368,7 +3408,8 @@ def response_from_recording(
         "capture_bits": bits,
         "fft_backend": fft.kind,
         "fft_size": length,
-        "smoothing": "variable 1/12 octave <200 Hz; 1/6 octave 200-2000 Hz; 1/3 octave >2 kHz",
+        "response_algorithm_revision": RESPONSE_ALGORITHM_REVISION,
+        "smoothing": SMOOTHING_NAME,
         "measurement_quality": quality,
         "room_decay": decay,
         "temporal": temporal,
@@ -3873,6 +3914,40 @@ def prepare_build() -> dict[str, Any]:
     return state
 
 
+def prepare_saved_reprocess() -> dict[str, Any]:
+    """Invalidate every response-dependent artifact when raw reprocessing starts."""
+    state = load_current()
+    if state.get("state") in ("running", "processing", "cancelling"):
+        raise MeasurementError("다른 측정 작업이 진행 중입니다.")
+    capture_inventory = state.get("capture_inventory") or {}
+    phase_inventory = state.get("phase_capture_inventory") or {}
+    if not bool(capture_inventory.get("can_reprocess_all")):
+        raise MeasurementError("모든 위치의 저장 ESS 원본이 있어야 원본 재계산을 시작할 수 있습니다.")
+    if int(phase_inventory.get("expected", 0)) and not bool(phase_inventory.get("can_reprocess_all")):
+        raise MeasurementError("모든 위치의 L/R/우퍼 동시 위상 원본이 있어야 원본 재계산을 시작할 수 있습니다.")
+    state = restore_preview_if_needed(state)
+    state.update({
+        "state": "ready",
+        "stage": "3 · 위치 측정 · 저장 원본 재계산 준비 · 이전 FIR 결과 폐기",
+        "progress": 0.0,
+        "eta_seconds": None,
+        "measurements": [],
+        "phase_references": [],
+        "positions_completed": 0,
+        "validation": None,
+        "premeasured_sum_validation": None,
+        "last_measurement_quality": None,
+        "result": None,
+        "post_filter_validation": None,
+        "applied_profile": None,
+        "preview_active": False,
+        "preview_profile": None,
+        "error": None,
+    })
+    save_current(state)
+    return state
+
+
 def spawn_worker(action: str, *arguments: str) -> dict[str, Any]:
     with LOCK.open("w") as lock_handle:
         fcntl.flock(lock_handle, fcntl.LOCK_EX)
@@ -4330,9 +4405,15 @@ def analyze_level_check_recordings(state: dict[str, Any], sources: list[str]) ->
     directory = Path(state["session_dir"])
     level = int(state["level_dbfs"])
     woofer_attenuation = float(state.get("woofer_measurement_attenuation_db", WOOFER_MEASUREMENT_ATTENUATION_DB))
-    reference, _ = generate_sweep_mono(level, 2)
     channel_results: list[dict[str, Any]] = []
     for index, source in enumerate(sources):
+        reference = reference_sweep_for_source(
+            source,
+            level,
+            2,
+            woofer_attenuation_db=woofer_attenuation,
+            level_check=True,
+        )
         record_path = directory / f"level_check_{source}_recorded.wav"
         sweep_path = directory / f"level_check_{source}_sweep.wav"
         if not record_path.is_file() or not sweep_path.is_file():
@@ -4837,6 +4918,8 @@ def evaluate_post_filter_sum(directory: Path, state: dict[str, Any], post: dict[
     prediction_basis_by_side: dict[str, str] = {}
     prediction_reliable_by_side: dict[str, bool] = {}
     all_snrs: list[float] = []
+    switching_transient_captures: list[dict[str, Any]] = []
+    active_transient_captures: list[dict[str, Any]] = []
     correction_limits = result.get("correction_limits", {})
     correction_low = float(correction_limits.get("low_hz", 20.0))
     correction_high = float(correction_limits.get("high_hz", 20_000.0))
@@ -4850,20 +4933,44 @@ def evaluate_post_filter_sum(directory: Path, state: dict[str, Any], post: dict[
                 raise MeasurementError(f"사후 합산 응답이 없습니다: {path.name}")
             response = json.loads(path.read_text(encoding="utf-8"))
             responses.append(response)
-            snr = response.get("measurement_quality", {}).get("snr_db")
+            quality = response.get("measurement_quality", {})
+            snr = quality.get("snr_db")
             if isinstance(snr, (int, float)):
                 all_snrs.append(float(snr))
+            if quality.get("switching_transient_suspected"):
+                switching_transient_captures.append({
+                    "position": position,
+                    "side": side,
+                    "noise_side_spread_db": quality.get("noise_side_spread_db"),
+                })
+            if (quality.get("frequency_noise") or {}).get("transient_contamination_detected"):
+                active_transient_captures.append({"position": position, "side": side})
         if frequencies is None:
             frequencies = [float(value) for value in responses[0]["frequencies"]]
         smoothed = [
             [float(value) for value in response["db"]]
-            if response.get("smoothing") == "variable 1/12 octave <200 Hz; 1/6 octave 200-2000 Hz; 1/3 octave >2 kHz"
-            else variable_smooth(frequencies, [float(value) for value in response["db"]])
+            if response.get("smoothing") == SMOOTHING_NAME or response.get("smoothing") in LEGACY_SMOOTHING_NAMES
+            else variable_power_smooth(frequencies, [float(value) for value in response["db"]])
             for response in responses
         ]
-        averaged = [statistics.mean(values) for values in zip(*smoothed)]
+        averaged = []
+        spatial_std = []
+        spatial_mode = str(result.get("spatial_mode", state.get("spatial_mode", "equal")))
+        for index, frequency in enumerate(frequencies):
+            base_weights = spatial_position_weights(frequency, positions_total, spatial_mode)
+            confidence = []
+            for response in responses:
+                values = response.get("frequency_quality", {}).get("confidence")
+                confidence.append(float(values[index]) if isinstance(values, list) and index < len(values) else 1.0)
+            effective_weights = [
+                weight * max(0.05, min(1.0, value))
+                for weight, value in zip(base_weights, confidence)
+            ]
+            position_levels = [float(values[index]) for values in smoothed]
+            averaged.append(weighted_power_mean_db(position_levels, effective_weights))
+            spatial_std.append(weighted_std_db(position_levels, effective_weights))
         raw_averaged_by_side[side] = averaged
-        spatial_std_by_side[side] = [statistics.pstdev(values) for values in zip(*smoothed)]
+        spatial_std_by_side[side] = spatial_std
     assert frequencies is not None
     target_values = effective_combined_target(result, frequencies)
     measured_reference_values = [
@@ -4980,7 +5087,16 @@ def evaluate_post_filter_sum(directory: Path, state: dict[str, Any], post: dict[
         for item in channels.values()
     )
     lr_pass = lr_median <= 3.0 and reference_difference <= 3.0
-    strict_pass = target_pass and crossover_pass and lr_pass and snr_usable and (prediction_pass if prediction_gate_required else True)
+    switching_transient_suspected = bool(switching_transient_captures)
+    active_transient_suspected = bool(active_transient_captures)
+    metric_pass = (
+        target_pass
+        and crossover_pass
+        and lr_pass
+        and snr_usable
+        and (prediction_pass if prediction_gate_required else True)
+    )
+    strict_pass = metric_pass and not active_transient_suspected
     # A barely usable recording must not be mislabeled as a conclusive DSP
     # failure when its miss is close to the strict limit.  It remains a retry
     # warning and cannot become PASS.  Gross errors still block immediately.
@@ -4998,13 +5114,33 @@ def evaluate_post_filter_sum(directory: Path, state: dict[str, Any], post: dict[
         for item in channels.values()
     ) or not lr_pass
     snr_recommended = snr_minimum is not None and snr_minimum >= RECOMMENDED_SNR_DB
-    inconclusive_low_snr = bool(snr_usable and not snr_recommended and not strict_pass and not hard_failure)
+    # A different pre/post stationary floor is evidence of a possible stream
+    # transition, but it does not invalidate a fully passing acoustic transfer.
+    # It becomes verdict-affecting only when the response also misses a metric,
+    # or when the active sweep itself contains a detected transient.
+    inconclusive_switching_transient = bool(
+        not strict_pass
+        and (
+            active_transient_suspected
+            or (switching_transient_suspected and not metric_pass)
+        )
+    )
+    inconclusive_low_snr = bool(
+        not inconclusive_switching_transient
+        and snr_usable
+        and not snr_recommended
+        and not strict_pass
+        and not hard_failure
+    )
+    inconclusive = inconclusive_switching_transient or inconclusive_low_snr
     verification_status = (
         "pass" if strict_pass else
+        "inconclusive_switching_transient" if inconclusive_switching_transient else
         "inconclusive_low_snr" if inconclusive_low_snr else
         "fail"
     )
     prediction_status = (
+        "inconclusive_switching_transient" if inconclusive_switching_transient else
         "pass" if prediction_pass else
         "inconclusive_low_snr" if inconclusive_low_snr else
         "fail" if prediction_gate_required else
@@ -5018,6 +5154,11 @@ def evaluate_post_filter_sum(directory: Path, state: dict[str, Any], post: dict[
         "sweep_seconds": int(post.get("sweep_seconds", state.get("sweep_seconds", POST_VALIDATION_SWEEP_SECONDS))),
         "gain_recovery": "input sweep amplitude is included in the deconvolution reference; test dBFS affects SNR/headroom only",
         "output_reference": "U7 PCM hardware unity (0 dB); saved listening volume is restored before normal input reconnects",
+        "spatial_aggregation": {
+            "method": "noise-confidence weighted acoustic transfer power mean",
+            "formula": "10*log10(sum(w_p*10^(L_p/10))/sum(w_p))",
+            "spatial_mode": str(result.get("spatial_mode", state.get("spatial_mode", "equal"))),
+        },
         "channels": channels,
         "common_level_reference": {
             "scope": "post-filter measured L/R sums and predicted L/R sums",
@@ -5030,7 +5171,7 @@ def evaluate_post_filter_sum(directory: Path, state: dict[str, Any], post: dict[
         "crossover_pass": crossover_pass,
         "prediction_consistency": {
             "gate_required": prediction_gate_required,
-            "pass": prediction_pass,
+            "pass": prediction_pass and not inconclusive_switching_transient,
             "status": prediction_status,
             "thresholds_db": {"mae": 3.5, "p90": 7.0, "crossover_mae": 2.5, "crossover_p90": 5.0},
             "note": "신뢰 가능한 복소 합산 예측은 정식 PASS에 포함합니다. 위상 제한 모델은 차이를 표시하되 실제 타깃 실측을 우선합니다.",
@@ -5049,15 +5190,127 @@ def evaluate_post_filter_sum(directory: Path, state: dict[str, Any], post: dict[
         },
         "verification_status": verification_status,
         "inconclusive_low_snr": inconclusive_low_snr,
-        "application_blocking": not strict_pass and not inconclusive_low_snr,
-        "recommended_retry": {
-            "level_dbfs": -25,
-            "sweep_seconds": POST_VALIDATION_SWEEP_SECONDS,
-            "action": "5 · 적용 전 검토에서 ‘검증 초기화’ 후 ‘검증 sweep 입력 -25 dBFS’로 다시 측정하세요. 사후 검증은 자동으로 28초 ESS를 사용합니다.",
-        } if inconclusive_low_snr else None,
+        "inconclusive_switching_transient": inconclusive_switching_transient,
+        "switching_transient": {
+            "suspected": switching_transient_suspected,
+            "captures": switching_transient_captures,
+            "active_sweep_transient_suspected": active_transient_suspected,
+            "active_sweep_captures": active_transient_captures,
+            "affected_verdict": inconclusive_switching_transient,
+            "silent_lead_seconds": POST_VALIDATION_SILENT_LEAD_SECONDS,
+            "meaning": "U7/CamillaDSP stream startup changed the pre/post noise floor and may have overlapped the low-frequency sweep start.",
+        },
+        "application_blocking": not strict_pass and not inconclusive,
+        "recommended_retry": (
+            {
+                "level_dbfs": int(post["level_dbfs"]),
+                "sweep_seconds": POST_VALIDATION_SWEEP_SECONDS,
+                "action": "5 · 적용 전 검토에서 ‘검증 초기화’를 누른 뒤 같은 검증 sweep 입력으로 다시 측정하세요. 재측정은 시작 전 2초 무음으로 U7/CamillaDSP 출력을 안정화합니다.",
+            }
+            if inconclusive_switching_transient else
+            {
+                "level_dbfs": -25,
+                "sweep_seconds": POST_VALIDATION_SWEEP_SECONDS,
+                "action": "5 · 적용 전 검토에서 ‘검증 초기화’ 후 ‘검증 sweep 입력 -25 dBFS’로 다시 측정하세요. 사후 검증은 자동으로 28초 ESS를 사용합니다.",
+            }
+            if inconclusive_low_snr else None
+        ),
         "overall_pass": strict_pass,
         "completed_unix": time.time(),
     }
+
+
+def finalize_post_filter_evaluation(
+    directory: Path,
+    state: dict[str, Any],
+    post: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-grade saved post-FIR responses and persist one authoritative verdict."""
+    positions_total = session_position_count(state)
+    evaluation = evaluate_post_filter_sum(directory, state, post)
+    post["evaluation"] = evaluation
+    result = state["result"]
+    self_validation = result.setdefault("self_validation", {})
+    self_validation["post_filter_sum"] = evaluation
+    previous_crossover_sum = self_validation.get("crossover_sum") or {}
+    advisory = bool(
+        evaluation.get("inconclusive_low_snr")
+        or evaluation.get("inconclusive_switching_transient")
+    )
+    transient_advisory = bool(evaluation.get("inconclusive_switching_transient"))
+    measured_gate_pass = bool(evaluation["overall_pass"])
+    self_validation["crossover_sum"] = {
+        "required": True,
+        "pass": bool(previous_crossover_sum.get("pass")) if advisory else measured_gate_pass,
+        "status": (
+            "pass_measured" if measured_gate_pass else
+            "warning_post_measurement_switching_transient" if transient_advisory else
+            "warning_post_measurement_low_snr" if advisory else
+            "fail_measured"
+        ),
+        "method": evaluation["method"],
+        "positions": positions_total,
+        "post_measurement_strict_pass": measured_gate_pass,
+        "post_measurement_application_blocking": bool(evaluation.get("application_blocking")),
+        "premeasurement_status": previous_crossover_sum.get("premeasurement_status") or previous_crossover_sum.get("status"),
+    }
+    core_pass = all(bool(value) for value in (self_validation.get("core_checks") or {}).values())
+    independent_pass = bool((self_validation.get("independent_positions") or {}).get("pass"))
+    required_target_pass = all(
+        item is None or item.get("applicable") is False or item.get("pass")
+        for item in (self_validation.get("target_fit") or {}).values()
+    )
+    self_validation["overall_pass"] = core_pass and independent_pass and required_target_pass and bool(self_validation["crossover_sum"]["pass"])
+    result["crossover"]["post_filter_measurement"] = evaluation
+    result["crossover"]["status"] = (
+        "pass_measured" if measured_gate_pass else
+        "warning_post_measurement_switching_transient" if transient_advisory else
+        "warning_post_measurement_low_snr" if advisory else
+        "fail_measured"
+    )
+    result["crossover"]["overall_acoustic_prediction_pass"] = measured_gate_pass
+    sync_mimo_manifest_validation(directory, result)
+    atomic_json(directory / result["report_json"], result)
+    write_room_tuning_report(directory / result["report_md"], state, result)
+    state["stage"] = (
+        f"Preview FIR {positions_total}위치 합산 실측 PASS" if measured_gate_pass else
+        f"Preview FIR {positions_total}위치 합산 실측 재검증 권장 · 출력 전환 감지" if transient_advisory else
+        f"Preview FIR {positions_total}위치 합산 실측 재검증 권장 · SNR 부족" if advisory else
+        f"Preview FIR {positions_total}위치 합산 실측 FAIL"
+    )
+    state["result"] = result
+    state["post_filter_validation"] = post
+    state["state"] = "built"
+    state["worker_pid"] = None
+    state["progress"] = 100.0
+    save_current(state)
+    atomic_json(directory / "session.json", state)
+    return state
+
+
+def reprocess_post_filter_validation() -> dict[str, Any]:
+    """Re-grade completed saved post-FIR responses without replaying sound."""
+    with LOCK.open("w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        state = load_current()
+        if state.get("state") in ("running", "processing", "cancelling"):
+            raise MeasurementError("작업 중에는 저장 사후 검증을 다시 판정할 수 없습니다.")
+        result = state.get("result")
+        if not isinstance(result, dict):
+            raise MeasurementError("유지할 FIR 결과가 없습니다.")
+        validate_result_revision(result)
+        post = state.get("post_filter_validation")
+        if not isinstance(post, dict):
+            raise MeasurementError("다시 판정할 사후 합산 검증이 없습니다.")
+        positions_total = session_position_count(state)
+        if int(post.get("positions_completed", 0)) != positions_total:
+            raise MeasurementError("사후 합산 검증이 모든 위치에서 완료되지 않았습니다.")
+        if post.get("result_fingerprint") != result_fingerprint(result):
+            raise MeasurementError("저장 사후 검증이 현재 FIR 결과와 다릅니다. 이번 튜닝 Preview로 다시 측정하세요.")
+        state["stage"] = "저장 사후 합산 응답 다시 판정 중"
+        state["progress"] = 95.0
+        save_current(state)
+        return finalize_post_filter_evaluation(Path(state["session_dir"]), state, post)
 
 
 def post_filter_validation_worker(level_dbfs: int) -> None:
@@ -5113,7 +5366,13 @@ def post_filter_validation_worker(level_dbfs: int) -> None:
     for index, side in enumerate(("left", "right")):
         update_current(state="processing", stage=f"사후 합산 검증 · 위치 {position}/{positions_total} · {side.title()} 응답 계산", progress=75.0 + index * 10.0)
         recorded = directory / f"post_p{position}_{side}_sum_recorded.wav"
-        response = response_from_recording(recorded, references[side], cal, f"{side}_woofer")
+        response = response_from_recording(
+            recorded,
+            references[side],
+            cal,
+            f"{side}_woofer",
+            configured_level_dbfs=level_dbfs,
+        )
         response["measurement"] = {
             "kind": "post_filter_acoustic_sum",
             "position": position,
@@ -5148,44 +5407,9 @@ def post_filter_validation_worker(level_dbfs: int) -> None:
     state["worker_pid"] = None
     state["progress"] = 100.0 * position / positions_total
     if position == positions_total:
-        evaluation = evaluate_post_filter_sum(directory, state, post)
-        post["evaluation"] = evaluation
-        result = state["result"]
-        self_validation = result.setdefault("self_validation", {})
-        self_validation["post_filter_sum"] = evaluation
-        previous_crossover_sum = self_validation.get("crossover_sum") or {}
-        advisory = bool(evaluation.get("inconclusive_low_snr"))
-        measured_gate_pass = bool(evaluation["overall_pass"])
-        self_validation["crossover_sum"] = {
-            "required": True,
-            "pass": bool(previous_crossover_sum.get("pass")) if advisory else measured_gate_pass,
-            "status": "pass_measured" if measured_gate_pass else "warning_post_measurement_low_snr" if advisory else "fail_measured",
-            "method": evaluation["method"],
-            "positions": positions_total,
-            "post_measurement_strict_pass": measured_gate_pass,
-            "post_measurement_application_blocking": bool(evaluation.get("application_blocking")),
-            "premeasurement_status": previous_crossover_sum.get("status"),
-        }
-        core_pass = all(bool(value) for value in (self_validation.get("core_checks") or {}).values())
-        independent_pass = bool((self_validation.get("independent_positions") or {}).get("pass"))
-        required_target_pass = all(
-            item is None or item.get("applicable") is False or item.get("pass")
-            for item in (self_validation.get("target_fit") or {}).values()
-        )
-        self_validation["overall_pass"] = core_pass and independent_pass and required_target_pass and bool(self_validation["crossover_sum"]["pass"])
-        result["crossover"]["post_filter_measurement"] = evaluation
-        result["crossover"]["status"] = "pass_measured" if measured_gate_pass else "warning_post_measurement_low_snr" if advisory else "fail_measured"
-        result["crossover"]["overall_acoustic_prediction_pass"] = measured_gate_pass
-        sync_mimo_manifest_validation(directory, result)
-        atomic_json(directory / result["report_json"], result)
-        write_room_tuning_report(directory / result["report_md"], state, result)
-        state["stage"] = (
-            f"Preview FIR {positions_total}위치 합산 실측 PASS" if measured_gate_pass else
-            f"Preview FIR {positions_total}위치 합산 실측 재검증 권장 · SNR 부족" if advisory else
-            f"Preview FIR {positions_total}위치 합산 실측 FAIL"
-        )
-    else:
-        state["stage"] = f"사후 합산 검증 위치 {position}/{positions_total} 완료 · 마이크를 다음 위치로 옮기세요. FIR 결과는 유지됩니다."
+        finalize_post_filter_evaluation(directory, state, post)
+        return
+    state["stage"] = f"사후 합산 검증 위치 {position}/{positions_total} 완료 · 마이크를 다음 위치로 옮기세요. FIR 결과는 유지됩니다."
     state["result"] = result
     state["post_filter_validation"] = post
     save_current(state)
@@ -5425,8 +5649,77 @@ def target_catalog() -> dict[str, Any]:
     return {"targets": result, "reference_hz": 1000, "default": "harman"}
 
 
+def weighted_power_mean_db(values: list[float], weights: list[float]) -> float:
+    """Return 10log10 of a weighted mean-square response without overflow.
+
+    The stored response is a magnitude level ``20log10|H|``.  Converting with
+    ``10**(L/10)`` therefore averages ``|H|**2`` (acoustic transfer power), not
+    amplitudes or logarithms.  A max-level offset implements a log-sum-exp
+    evaluation and keeps very quiet bins numerically stable.
+    """
+    if not values or len(values) != len(weights):
+        raise MeasurementError("파워 평균 입력 길이가 일치하지 않습니다.")
+    pairs = [(float(value), float(weight)) for value, weight in zip(values, weights)]
+    if any(not math.isfinite(value) or not math.isfinite(weight) for value, weight in pairs):
+        raise MeasurementError("파워 평균에 NaN/Inf가 포함되어 있습니다.")
+    positive = [(value, max(0.0, weight)) for value, weight in pairs if weight > 0.0]
+    if not positive:
+        raise MeasurementError("파워 평균의 유효 가중치가 없습니다.")
+    maximum = max(value for value, _weight in positive)
+    weight_sum = sum(weight for _value, weight in positive)
+    relative_power = sum(weight * 10.0 ** ((value - maximum) / 10.0) for value, weight in positive)
+    return maximum + 10.0 * math.log10(max(relative_power / weight_sum, 1.0e-30))
+
+
+def weighted_std_db(values: list[float], weights: list[float]) -> float:
+    """Noise-aware population spread in dB for spatial regularization."""
+    if not values or len(values) != len(weights):
+        raise MeasurementError("공간 분산 입력 길이가 일치하지 않습니다.")
+    pairs = [(float(value), float(weight)) for value, weight in zip(values, weights)]
+    if any(not math.isfinite(value) or not math.isfinite(weight) for value, weight in pairs):
+        raise MeasurementError("공간 분산에 NaN/Inf가 포함되어 있습니다.")
+    weight_sum = sum(max(0.0, weight) for _value, weight in pairs)
+    if weight_sum <= 0.0:
+        return 0.0
+    mean = sum(max(0.0, weight) * value for value, weight in pairs) / weight_sum
+    variance = sum(
+        max(0.0, weight) * (value - mean) ** 2
+        for value, weight in pairs
+    ) / weight_sum
+    return math.sqrt(max(0.0, variance))
+
+
+def spatial_position_weights(frequency: float, positions_total: int, spatial_mode: str) -> list[float]:
+    """Return normalized geometric position weights before SNR confidence.
+
+    Standard/equal treats the three nearby microphone positions equally.
+    Center-priority only increases the reference-position weight above 200 Hz;
+    bass remains a true seat-area average because its modal field is spatial.
+    """
+    if positions_total not in ALLOWED_POSITION_COUNTS:
+        raise MeasurementError("공간 평균의 위치 수가 잘못되었습니다.")
+    if spatial_mode not in ("equal", "center"):
+        raise MeasurementError("공간 평균 방식이 잘못되었습니다.")
+    if positions_total == 1 or spatial_mode == "equal":
+        return [1.0 / positions_total] * positions_total
+    if frequency <= 200.0:
+        center_weight = 1.0 / 3.0
+    elif frequency >= 2000.0:
+        center_weight = 0.60
+    else:
+        blend = math.log(frequency / 200.0) / math.log(10.0)
+        center_weight = 1.0 / 3.0 + blend * (0.60 - 1.0 / 3.0)
+    return [center_weight, (1.0 - center_weight) / 2.0, (1.0 - center_weight) / 2.0]
+
+
 def variable_smooth(frequencies: list[float], values: list[float]) -> list[float]:
-    """Perceptual log-frequency smoothing: 1/12 octave bass, 1/6 mid, 1/3 treble."""
+    """Triangular fractional-octave arithmetic smoothing in dB.
+
+    Keep this operation for *filter gain* curves such as the cut-only crossover
+    guard.  Power averaging a negative gain curve biases it toward 0 dB and can
+    silently weaken a safety cut.  Measured acoustic responses use the distinct
+    :func:`variable_power_smooth` operation below.
+    """
     if len(frequencies) != len(values) or not values:
         raise MeasurementError("Smoothing input length mismatch.")
     result: list[float] = []
@@ -5439,9 +5732,29 @@ def variable_smooth(frequencies: list[float], values: list[float]) -> list[float
             distance = abs(math.log2(max(candidate, 1.0e-9) / max(frequency, 1.0e-9)))
             if distance <= half:
                 weight = 1.0 - distance / max(half, 1.0e-9)
-                weighted += value * weight
+                weighted += float(value) * weight
                 weight_sum += weight
-        result.append(weighted / weight_sum if weight_sum else values[center])
+        result.append(weighted / weight_sum if weight_sum else float(values[center]))
+    return result
+
+
+def variable_power_smooth(frequencies: list[float], values: list[float]) -> list[float]:
+    """Triangular fractional-octave smoothing of acoustic transfer power."""
+    if len(frequencies) != len(values) or not values:
+        raise MeasurementError("Smoothing input length mismatch.")
+    result: list[float] = []
+    for center, frequency in enumerate(frequencies):
+        width_octaves = 1.0 / 12.0 if frequency < 200.0 else (1.0 / 6.0 if frequency < 2000.0 else 1.0 / 3.0)
+        half = width_octaves / 2.0
+        local_values: list[float] = []
+        local_weights: list[float] = []
+        for candidate, value in zip(frequencies, values):
+            distance = abs(math.log2(max(candidate, 1.0e-9) / max(frequency, 1.0e-9)))
+            if distance <= half:
+                weight = 1.0 - distance / max(half, 1.0e-9)
+                local_values.append(float(value))
+                local_weights.append(weight)
+        result.append(weighted_power_mean_db(local_values, local_weights) if local_weights else float(values[center]))
     return result
 
 
@@ -5463,24 +5776,31 @@ def preference_modifier_db(frequency: float, bass_db: int, treble_db: int) -> fl
 
 
 def natural_usable_band(frequencies: list[float], levels_db: list[float], reference_db: float) -> tuple[float, float]:
-    """Estimate the -10 dB usable band using half-octave local medians, not single peaks."""
+    """Estimate a branch-local -10 dB band using broad local medians.
+
+    This is a physical boost guard, not a channel normalization.  It must work
+    for a Woofer whose upper edge is far below 1 kHz as well as a full-range
+    front speaker.
+    """
+    if len(frequencies) != len(levels_db) or not frequencies:
+        raise MeasurementError("자연 재생대역 응답 길이가 일치하지 않습니다.")
     normalized = [value - reference_db for value in levels_db]
-    low, high = 20.0, 20_000.0
+    half_width = 2.0 ** 0.25
+    supported = []
     for frequency in frequencies:
-        if not 20.0 <= frequency <= 1000.0:
+        if not 20.0 <= frequency <= 20_000.0:
             continue
-        window = [value for f, value in zip(frequencies, normalized) if frequency <= f <= frequency * math.sqrt(2.0)]
+        window = [
+            value for candidate, value in zip(frequencies, normalized)
+            if frequency / half_width <= candidate <= frequency * half_width
+        ]
         if window and statistics.median(window) >= -10.0:
-            low = frequency
-            break
-    for frequency in reversed(frequencies):
-        if not 1000.0 <= frequency <= 20_000.0:
-            continue
-        window = [value for f, value in zip(frequencies, normalized) if frequency / math.sqrt(2.0) <= f <= frequency]
-        if window and statistics.median(window) >= -10.0:
-            high = frequency
-            break
-    return max(20.0, low), min(20_000.0, high)
+            supported.append(float(frequency))
+    if not supported:
+        # No boost may be inferred when even a broad local window never reaches
+        # the branch-local -10 dB threshold.
+        return 20_000.0, 20.0
+    return max(20.0, supported[0]), min(20_000.0, supported[-1])
 
 
 def correction_window(frequency: float, low_hz: int, high_hz: int) -> float:
@@ -5938,40 +6258,65 @@ def load_average_response(directory: Path, source: str, spatial_mode: str = "equ
         if not path.is_file():
             raise MeasurementError(f"측정 응답이 없습니다: {path.name}")
         responses.append(json.loads(path.read_text(encoding="utf-8")))
-    frequencies = responses[0]["frequencies"]
-    smoothing_name = "variable 1/12 octave <200 Hz; 1/6 octave 200-2000 Hz; 1/3 octave >2 kHz"
-    smoothed_positions = [
-        response["db"] if response.get("smoothing") == smoothing_name else variable_smooth(frequencies, response["db"])
-        for response in responses
-    ]
+    raw_frequencies = responses[0].get("frequencies")
+    if not isinstance(raw_frequencies, list) or len(raw_frequencies) < 2:
+        raise MeasurementError(f"{source} 응답의 주파수 grid가 없습니다.")
+    frequencies = [float(value) for value in raw_frequencies]
+    if any(not math.isfinite(value) or value <= 0.0 for value in frequencies) or any(
+        right <= left for left, right in zip(frequencies, frequencies[1:])
+    ):
+        raise MeasurementError(f"{source} 응답의 주파수 grid가 유효하지 않습니다.")
+    for position, response in enumerate(responses, start=1):
+        candidate_frequencies = response.get("frequencies")
+        candidate_db = response.get("db")
+        if not isinstance(candidate_frequencies, list) or not isinstance(candidate_db, list):
+            raise MeasurementError(f"p{position}_{source} 응답 배열이 없습니다.")
+        if len(candidate_frequencies) != len(frequencies) or len(candidate_db) != len(frequencies):
+            raise MeasurementError(f"p{position}_{source} 응답 grid 길이가 다른 위치와 일치하지 않습니다.")
+        if any(
+            abs(float(candidate) - reference) > max(1.0e-6, abs(reference) * 1.0e-7)
+            for candidate, reference in zip(candidate_frequencies, frequencies)
+        ):
+            raise MeasurementError(f"p{position}_{source} 응답 주파수 grid가 다른 위치와 일치하지 않습니다.")
+        if any(not math.isfinite(float(value)) for value in candidate_db):
+            raise MeasurementError(f"p{position}_{source} 응답에 NaN/Inf가 포함되어 있습니다.")
+    # Never smooth an already smoothed legacy response a second time.  New raw
+    # WAV reprocessing writes RESPONSE_ALGORITHM_REVISION and uses power-domain
+    # smoothing; old response JSON stays usable but is identified in the result
+    # so the UI can recommend a silent raw-WAV recalculation.
+    smoothed_positions = []
+    response_revisions = []
+    for response in responses:
+        revision = str(response.get("response_algorithm_revision") or "legacy-db-domain-smoothing")
+        response_revisions.append(revision)
+        # A *_response.json file is a derived response artifact and therefore
+        # already smoothed, including the oldest files that predate explicit
+        # revision/smoothing metadata.  Never infer that missing metadata means
+        # raw data.  Only the explicit raw-WAV reprocess worker may replace it
+        # with the current power-domain calculation.
+        smoothed_positions.append([float(value) for value in response["db"]])
     averaged = []
+    geometric_averaged = []
+    spatial_std_db = []
+    power_lift_db = []
     aggregate_confidence = []
     for index, frequency in enumerate(frequencies):
-        if positions_total == 1 or spatial_mode == "equal":
-            weights = [1.0 / len(responses)] * len(responses)
-        else:
-            # Frequency-dependent proxy for distance/directivity weighting: bass is
-            # spatially robust, while the on-axis center position matters more in treble.
-            if frequency <= 200.0:
-                center_weight = 1.0 / 3.0
-            elif frequency >= 2000.0:
-                center_weight = 0.60
-            else:
-                blend = math.log(frequency / 200.0) / math.log(10.0)
-                center_weight = 1.0 / 3.0 + blend * (0.60 - 1.0 / 3.0)
-            weights = [center_weight, (1.0 - center_weight) / 2.0, (1.0 - center_weight) / 2.0]
+        weights = spatial_position_weights(float(frequency), positions_total, spatial_mode)
         noise_confidence = []
         for response in responses:
             values = response.get("frequency_quality", {}).get("confidence")
-            noise_confidence.append(float(values[index]) if isinstance(values, list) and index < len(values) else 1.0)
+            confidence = float(values[index]) if isinstance(values, list) and index < len(values) else 1.0
+            noise_confidence.append(max(0.0, min(1.0, confidence)) if math.isfinite(confidence) else 0.0)
         aggregate_confidence.append(sum(weight * confidence for weight, confidence in zip(weights, noise_confidence)))
         effective_weights = [weight * max(0.05, confidence) for weight, confidence in zip(weights, noise_confidence)]
         weight_sum = sum(effective_weights)
-        averaged.append(sum(weight * values[index] for weight, values in zip(effective_weights, smoothed_positions)) / max(weight_sum, 1.0e-12))
-    spatial_std_db = [
-        statistics.pstdev(values[index] for values in smoothed_positions)
-        for index in range(len(frequencies))
-    ]
+        position_levels = [float(values[index]) for values in smoothed_positions]
+        geometric = sum(weight * level for weight, level in zip(effective_weights, position_levels)) / max(weight_sum, 1.0e-12)
+        power = weighted_power_mean_db(position_levels, effective_weights)
+        averaged.append(power)
+        geometric_averaged.append(geometric)
+        spatial_std_db.append(weighted_std_db(position_levels, effective_weights))
+        power_lift_db.append(max(0.0, power - geometric))
     decay_centers = []
     decay_rt60 = []
     for center in (63, 125, 250, 500, 1000, 2000, 4000):
@@ -6000,8 +6345,21 @@ def load_average_response(directory: Path, source: str, spatial_mode: str = "equ
             "single reference position" if positions_total == 1
             else "equal 1/3 each" if spatial_mode == "equal"
             else "frequency-dependent: center 1/3 below 200 Hz to 0.60 above 2 kHz"
-        ) + "; multiplied by per-position noise confidence",
-        "smoothing": smoothing_name,
+        ) + "; multiplied by per-position noise confidence; normalized weighted mean-square response",
+        "smoothing": SMOOTHING_NAME if all(revision == RESPONSE_ALGORITHM_REVISION for revision in response_revisions) else "stored response smoothing preserved; spatial integration uses weighted power",
+        "spatial_aggregation": {
+            "method": "noise-confidence weighted acoustic transfer power mean",
+            "formula": "10*log10(sum(w_p*10^(L_p/10))/sum(w_p))",
+            "dispersion": "sqrt(sum(w_p*(L_p-mu_db)^2)/sum(w_p))",
+            "positions": positions_total,
+            "geometric_average_db": geometric_averaged,
+            "power_mean_lift_db": power_lift_db,
+            "median_power_mean_lift_db": round(statistics.median(power_lift_db), 4),
+            "p90_power_mean_lift_db": round(percentile(power_lift_db, 0.90), 4),
+            "response_revisions": sorted(set(response_revisions)),
+            "legacy_response_count": sum(revision != RESPONSE_ALGORITHM_REVISION for revision in response_revisions),
+            "raw_reprocess_recommended": any(revision != RESPONSE_ALGORITHM_REVISION for revision in response_revisions),
+        },
         "decay_frequency_hz": decay_centers,
         "decay_t20_rt60_s": decay_rt60,
     }
@@ -6365,7 +6723,9 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         if target_reference_band[0] <= frequency <= target_reference_band[1]
     )
     reference_target_without_preference = reference_target - reference_preference
-    natural_low, natural_high = natural_usable_band(measure_f, measure_db, reference_measure)
+    # Natural driver bandwidth is relative to this branch's own broad level.
+    # The target/error still uses the one shared L/R/W system reference below.
+    natural_low, natural_high = natural_usable_band(measure_f, measure_db, local_reference_measure)
     fft_length = TAPS * 2
     gains: list[float] = []
     graph_frequency: list[float] = []
@@ -6524,7 +6884,7 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         "decay_t20_rt60_s": graph_decay,
         "decay_control_db": graph_decay_cut,
         "phase": phase_details,
-        "regularization": "1/3-position weighted dB prototype; pre/post noise confidence; variable perceptual smoothing; spatial variance plus narrow-notch soft boost guard; L/R-corroborated broad roll-off confidence; explicit broad tone preference independent of the automatic room-EQ band",
+        "regularization": "noise-confidence weighted mean-square spatial prototype; power-domain variable perceptual smoothing; weighted spatial variance plus narrow-notch soft boost guard; L/R-corroborated broad roll-off confidence; explicit broad tone preference independent of the automatic room-EQ band",
         "reference_band_hz": list(reference_band),
         "level_reference": "shared Front L/R 500-2000 Hz" if shared_reference_measure_db is not None else f"local {reference_band[0]}-{reference_band[1]} Hz",
         "reference_measure_db": round(reference_measure, 3),
@@ -6868,6 +7228,7 @@ def apply_joint_crossover_guard(
     time_alignment_reliable: bool,
     optimize_relative_phase: bool,
     positions_total: int,
+    spatial_mode: str,
     fft: FFTBackend,
 ) -> tuple[list[float], list[float], list[list[float]], dict[str, Any]]:
     """Cut-only common branch EQ so separately designed branches cannot over-sum.
@@ -6886,6 +7247,35 @@ def apply_joint_crossover_guard(
             if path.is_file():
                 row[source] = json.loads(path.read_text(encoding="utf-8"))
         positions.append(row)
+
+    def response_confidence_at(response: dict[str, Any], frequency: float) -> float:
+        quality = response.get("frequency_quality", {})
+        frequencies = quality.get("frequencies")
+        confidence = quality.get("confidence")
+        if not isinstance(frequencies, list) or not isinstance(confidence, list) or len(frequencies) != len(confidence) or not frequencies:
+            return 1.0
+        return max(0.0, min(1.0, interpolate_log(
+            [float(value) for value in frequencies],
+            [float(value) for value in confidence],
+            frequency,
+        )))
+
+    def combined_position_weights(side: str, frequency: float) -> list[float]:
+        geometric = spatial_position_weights(frequency, positions_total, spatial_mode)
+        weighted = []
+        for index, position in enumerate(positions):
+            confidences = [
+                response_confidence_at(position[side], frequency),
+                response_confidence_at(position["woofer"], frequency),
+            ]
+            combined = position.get(f"{side}_woofer")
+            if combined is not None:
+                confidences.append(response_confidence_at(combined, frequency))
+            weighted.append(geometric[index] * min(confidences))
+        total = sum(weighted)
+        if total <= 1.0e-9:
+            return geometric
+        return [value / total for value in weighted]
     phase_references = load_phase_reference_results(directory, positions_total)
     simultaneous_phase_coverage = phase_reference_coverage(
         phase_references, ("left", "right", "woofer")
@@ -6971,8 +7361,9 @@ def apply_joint_crossover_guard(
             ):
                 phase_frequencies.append(frequency)
 
-        def alignment_score(relative_delay_samples: int, polarity: int) -> tuple[float, float, float]:
+        def alignment_score(relative_delay_samples: int, polarity: int) -> tuple[float, float, float, float, float]:
             errors: list[float] = []
+            cancellation_deficits: list[float] = []
             for channel, source in enumerate(("left", "right")):
                 for frequency in phase_frequencies:
                     target_absolute = (
@@ -6993,6 +7384,7 @@ def apply_joint_crossover_guard(
                         math.sin(-2.0 * math.pi * frequency * rear_delay / RATE),
                     )
                     position_errors = []
+                    position_cancellation = []
                     for position_index, position in enumerate(positions):
                         front_acoustic, woofer_acoustic = acoustic_pair(position_index, source, frequency)
                         main = (
@@ -7006,14 +7398,28 @@ def apply_joint_crossover_guard(
                             * rear_rotation
                         )
                         level = 20.0 * math.log10(max(abs(main + woofer), 1.0e-15))
+                        energy_level = 10.0 * math.log10(max(abs(main) ** 2 + abs(woofer) ** 2, 1.0e-30))
                         position_errors.append(abs(level - target_absolute))
-                    errors.append(statistics.median(position_errors))
+                        position_cancellation.append(max(0.0, energy_level - level))
+                    weights = combined_position_weights(source, frequency)
+                    errors.append(sum(weight * error for weight, error in zip(weights, position_errors)))
+                    cancellation_deficits.append(sum(
+                        weight * deficit for weight, deficit in zip(weights, position_cancellation)
+                    ))
             mae = sum(errors) / len(errors) if errors else float("inf")
             p90 = percentile(errors, 0.90) if errors else float("inf")
-            # The P90 term prevents a narrow cancellation from winning merely
-            # because the mean is marginally lower. Prefer smaller delay on ties.
-            score = mae + 0.45 * p90 + abs(relative_delay_samples) * 1.0e-6
-            return score, mae, p90
+            cancellation_mae = (
+                sum(cancellation_deficits) / len(cancellation_deficits)
+                if cancellation_deficits else float("inf")
+            )
+            cancellation_p90 = percentile(cancellation_deficits, 0.90) if cancellation_deficits else float("inf")
+            if not errors:
+                return 0.0, 0.0, 0.0, 0.0, 0.0
+            # Explicitly penalize a complex sum below the phase-agnostic energy
+            # sum. Otherwise an anti-phase notch can look like successful EQ
+            # when an over-loud Woofer happens to cancel toward the target.
+            score = mae + 0.45 * p90 + 0.75 * cancellation_p90 + abs(relative_delay_samples) * 1.0e-6
+            return score, mae, p90, cancellation_mae, cancellation_p90
 
         if len(phase_frequencies) < 3:
             time_alignment_reliable = False
@@ -7039,35 +7445,48 @@ def apply_joint_crossover_guard(
                 search_center = max(-search_limit, min(search_limit, round(-total_woofer_minus_front)))
                 search_radius = min(search_limit, 240)
         coarse_step = 4
-        candidates: list[tuple[float, int, int, float, float, int]] = []
+        candidates: list[tuple[float, int, int, float, float, float, float, int]] = []
         for polarity in (1, -1):
             for relative_delay in range(
                 max(-search_limit, search_center - search_radius),
                 min(search_limit, search_center + search_radius) + 1,
                 coarse_step,
             ):
-                score, mae, p90 = alignment_score(relative_delay, polarity)
-                candidates.append((score, abs(relative_delay), relative_delay, mae, p90, polarity))
+                score, mae, p90, cancellation_mae, cancellation_p90 = alignment_score(relative_delay, polarity)
+                candidates.append((score, abs(relative_delay), relative_delay, mae, p90, cancellation_mae, cancellation_p90, polarity))
         coarse_best = min(candidates)
         best_relative = coarse_best[2]
-        best_polarity = coarse_best[5]
+        best_polarity = coarse_best[7]
         fine_candidates = []
         for relative_delay in range(
             max(-search_limit, best_relative - coarse_step),
             min(search_limit, best_relative + coarse_step) + 1,
         ):
-            score, mae, p90 = alignment_score(relative_delay, best_polarity)
-            fine_candidates.append((score, abs(relative_delay), relative_delay, mae, p90, best_polarity))
+            score, mae, p90, cancellation_mae, cancellation_p90 = alignment_score(relative_delay, best_polarity)
+            fine_candidates.append((score, abs(relative_delay), relative_delay, mae, p90, cancellation_mae, cancellation_p90, best_polarity))
         best = min(fine_candidates)
-        best_relative, best_mae, best_p90, best_polarity = best[2], best[3], best[4], best[5]
-        baseline_score, baseline_mae, baseline_p90 = alignment_score(0, 1)
+        (
+            best_relative, best_mae, best_p90, best_cancellation_mae,
+            best_cancellation_p90, best_polarity,
+        ) = best[2], best[3], best[4], best[5], best[6], best[7]
+        (
+            baseline_score, baseline_mae, baseline_p90,
+            baseline_cancellation_mae, baseline_cancellation_p90,
+        ) = alignment_score(0, 1)
         improvement = baseline_score - best[0]
+        candidate_relative = best_relative
+        candidate_polarity = best_polarity
+        candidate_mae = best_mae
+        candidate_p90 = best_p90
+        candidate_cancellation_mae = best_cancellation_mae
+        candidate_cancellation_p90 = best_cancellation_p90
         apply_alignment = (
             len(phase_frequencies) >= 3
             and math.isfinite(best[0])
             and (best_relative != 0 or best_polarity != 1)
             and improvement >= 0.25
             and best_p90 <= baseline_p90 + 0.25
+            and best_cancellation_p90 <= baseline_cancellation_p90 + 0.25
         )
         if apply_alignment:
             if best_relative < 0:
@@ -7080,12 +7499,14 @@ def apply_joint_crossover_guard(
         else:
             best_relative, best_polarity = 0, 1
             best_mae, best_p90 = baseline_mae, baseline_p90
+            best_cancellation_mae = baseline_cancellation_mae
+            best_cancellation_p90 = baseline_cancellation_p90
         phase_optimization = {
             "requested": True,
             "evaluated": len(phase_frequencies) >= 3,
             "reliable": len(phase_frequencies) >= 3,
             "enabled": apply_alignment,
-            "method": "same-recording relative-phase constrained robust search across L/R and all positions" if simultaneous_phase_reliable else "measured complex-sum robust search across both L/R and all positions",
+            "method": "same-recording relative-phase constrained robust search across L/R and all positions with destructive-cancellation penalty" if simultaneous_phase_reliable else "measured complex-sum robust search across both L/R and all positions with destructive-cancellation penalty",
             "evaluation_band_hz": [round(phase_low, 1), round(phase_high, 1)],
             "relative_delay_samples": best_relative,
             "relative_delay_ms": round(best_relative * 1000.0 / RATE, 4),
@@ -7095,9 +7516,26 @@ def apply_joint_crossover_guard(
             "predicted_p90_db_before_guard": round(best_p90, 3),
             "baseline_mae_db": round(baseline_mae, 3),
             "baseline_p90_db": round(baseline_p90, 3),
+            "cancellation_deficit_mae_db": round(best_cancellation_mae, 3),
+            "cancellation_deficit_p90_db": round(best_cancellation_p90, 3),
+            "baseline_cancellation_deficit_mae_db": round(baseline_cancellation_mae, 3),
+            "baseline_cancellation_deficit_p90_db": round(baseline_cancellation_p90, 3),
+            "cancellation_non_regression_limit_db": 0.25,
+            "candidate_relative_delay_samples": candidate_relative,
+            "candidate_polarity": candidate_polarity,
+            "candidate_target_mae_db": round(candidate_mae, 3),
+            "candidate_target_p90_db": round(candidate_p90, 3),
+            "candidate_cancellation_deficit_mae_db": round(candidate_cancellation_mae, 3),
+            "candidate_cancellation_deficit_p90_db": round(candidate_cancellation_p90, 3),
             "score_improvement": round(max(0.0, improvement), 4),
             "reason": (
                 None if apply_alignment else
+                (
+                    f"새 지연의 위상 상쇄 P90 {best_cancellation_p90:.2f} dB가 현재 "
+                    f"{baseline_cancellation_p90:.2f} dB보다 0.25 dB 넘게 나빠 적용하지 않았습니다. "
+                    "4 · FIR 계산에서 크로스오버 주파수를 한 단계 바꿔 비교하세요."
+                )
+                if len(phase_frequencies) >= 3 and best_cancellation_p90 > baseline_cancellation_p90 + 0.25 else
                 "0.25 dB 이상의 안정적인 합산 개선이 없어 현재 지연·극성을 유지했습니다. 측정 실패가 아니라 변경 불필요 판정입니다."
                 if len(phase_frequencies) >= 3 else
                 "동시 위상 기준의 crossover 공통 tone이 3개 미만이라 상대 지연을 평가하지 못했습니다."
@@ -7210,8 +7648,9 @@ def apply_joint_crossover_guard(
                 complex_levels.append(20.0 * math.log10(max(abs(main + woofer), 1.0e-15)))
                 energy_levels.append(10.0 * math.log10(max(abs(main) ** 2 + abs(woofer) ** 2, 1.0e-30)))
                 upper_levels.append(20.0 * math.log10(max(abs(main) + abs(woofer), 1.0e-15)))
-            predicted = statistics.median(complex_levels)
-            energy_sum = statistics.median(energy_levels)
+            position_weights = combined_position_weights(source, frequency)
+            predicted = weighted_power_mean_db(complex_levels, position_weights)
+            energy_sum = weighted_power_mean_db(energy_levels, position_weights)
             upper = max(upper_levels)
             reliable_here = phase_available(frequency)
             guarded_upper = max(complex_levels) if reliable_here else upper
@@ -7265,6 +7704,11 @@ def apply_joint_crossover_guard(
             "complex_prediction_reliable": phase_reliable,
             "graph_range_hz": [20.0, 20_000.0],
             "metric_range_hz": [20.0, round(guard_high, 2)],
+            "spatial_aggregation": {
+                "method": "frequency-dependent spatial/SNR-weighted mean-square transfer power",
+                "mode": spatial_mode,
+                "safety_upper_envelope": "maximum across measured positions; never spatially averaged",
+            },
             "deepest_crossover_dip_hz": round(deepest_dip_frequency, 1) if deepest_dip_frequency is not None else None,
             "deepest_crossover_dip_db": round(deepest_dip_db, 2),
             "deep_notch_detected": deepest_dip_db <= -6.0,
@@ -7664,6 +8108,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             ),
             optimize_relative_phase=phase_mode == "bass",
             positions_total=positions_total,
+            spatial_mode=spatial_mode,
             fft=fft,
         )
         phase_optimization = crossover_summary.get("relative_phase_optimization", {})
@@ -7918,6 +8363,19 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         state.get("mode") not in PREMEASURED_SUM_MODES
         or bool(premeasured_sum_model and premeasured_sum_model.get("pass"))
     )
+    spatial_aggregation = {
+        "method": "noise-confidence weighted acoustic transfer power mean",
+        "left": left_response.get("spatial_aggregation"),
+        "right": right_response.get("spatial_aggregation"),
+        "woofer": woofer_response.get("spatial_aggregation") if state["mode"] in SEPARATE_WOOFER_MODES else None,
+    }
+    legacy_response_count = sum(
+        int((item or {}).get("legacy_response_count", 0))
+        for item in (spatial_aggregation["left"], spatial_aggregation["right"], spatial_aggregation["woofer"])
+        if isinstance(item, dict)
+    )
+    spatial_aggregation["legacy_response_count"] = legacy_response_count
+    spatial_aggregation["raw_reprocess_recommended"] = legacy_response_count > 0
     diagnostics = {
         "lr_median_difference_db": round(statistics.median(lr_differences), 2) if lr_differences else None,
         "spatial_std_median_db": round(statistics.median(all_variation), 2) if all_variation else None,
@@ -7933,6 +8391,11 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         diagnostics["warnings"].append("위치별 편차가 큰 대역이 많아 boost를 강하게 제한했습니다.")
     if diagnostics["measurement_snr_min_db"] is not None and diagnostics["measurement_snr_min_db"] < 15.0:
         diagnostics["warnings"].append("일부 sweep SNR이 권장 15 dB보다 낮습니다. 실제 측정에서는 레벨 또는 sweep 시간을 올리세요.")
+    if legacy_response_count:
+        diagnostics["warnings"].append(
+            f"응답 {legacy_response_count}개가 이전 dB-domain smoothing 결과입니다. 원본 WAV는 유지되므로 "
+            "3 · 위치 측정의 ‘원본 재계산’을 실행하면 새 power-domain smoothing을 소리 없이 적용할 수 있습니다."
+        )
     if (
         high_frequency_compensation["ceiling_reached"]
         and high_frequency_compensation["worst_abs_residual_db_15_20khz"] > 3.0
@@ -8009,6 +8472,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         },
         "position_weights": left_response["position_weights"],
         "smoothing": left_response["smoothing"],
+        "spatial_aggregation": spatial_aggregation,
         "preference": {"bass_db_at_20_hz": bass_tilt_db, "treble_db_at_20_khz": treble_tilt_db},
         "correction_limits": {
             "low_hz": correction_low_hz,
@@ -8095,8 +8559,8 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             "strong": "Primus360 + 140 Hz low shelf -9 dB + 63 Hz -5 dB",
         },
         "algorithm": {
-            "prototype": "multi-position weighted power-response prototype",
-            "regularization": "frequency-dependent spatial variance, narrow-null reliability, stereo broad-rolloff corroboration and bounded relative compensation",
+            "prototype": "noise-confidence weighted mean-square acoustic transfer response; exact power-domain spatial and fractional-octave aggregation",
+            "regularization": "frequency-dependent weighted spatial variance, narrow-null reliability, stereo broad-rolloff corroboration and bounded relative compensation",
             "rolloff_guard": "half-octave median -10 dB natural usable-band estimator; only L/R-corroborated broad roll-off may extend through the edge",
             "phase": "minimum phase; optional low-frequency excess phase with acausality limit",
             "target": "named target plus optional bass/treble house-curve preference",
@@ -8729,6 +9193,7 @@ def main() -> int:
     sub.add_parser("start-validation")
     post_validation = sub.add_parser("start-post-validation")
     post_validation.add_argument("level_dbfs", type=int, choices=range(-54, -11))
+    sub.add_parser("reprocess-post-validation")
     sub.add_parser("reset-post-validation")
     inspect_recording = sub.add_parser("inspect-recording")
     inspect_recording.add_argument("position", type=int, choices=range(1, POSITIONS + 1))
@@ -8859,6 +9324,8 @@ def main() -> int:
             result = spawn_worker("_worker-validation")
         elif args.command == "start-post-validation":
             result = spawn_worker("_worker-post-validation", str(args.level_dbfs))
+        elif args.command == "reprocess-post-validation":
+            result = reprocess_post_filter_validation()
         elif args.command == "reset-post-validation":
             result = reset_post_filter_validation()
         elif args.command == "inspect-recording":
@@ -8866,6 +9333,7 @@ def main() -> int:
         elif args.command == "reprocess-recording":
             result = inspect_saved_recording(args.position, args.source, reprocess=True)
         elif args.command == "start-reprocess-saved":
+            prepare_saved_reprocess()
             result = spawn_worker("_worker-reprocess-saved")
         elif args.command == "start-build":
             prepare_build()

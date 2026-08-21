@@ -183,6 +183,33 @@ def response_confidence(response: dict[str, Any], frequency: float) -> float:
     return max(0.0, min(1.0, interpolate_log(frequencies, confidence, frequency)))
 
 
+def spatial_confidence_weights(
+    engine,
+    positions: list[dict[str, dict[str, Any]]],
+    sources: list[str],
+    frequency: float,
+    spatial_mode: str,
+) -> list[float]:
+    """Use the same frequency-dependent seat policy as the SISO designer.
+
+    The geometric weights describe which microphone positions matter.  The
+    weakest measured actuator confidence at each position then limits how much
+    that row may steer the complex inverse.  Normalizing once here keeps the
+    solver, prediction graph and validation metric on one mathematical basis.
+    """
+    geometric = engine.spatial_position_weights(frequency, len(positions), spatial_mode)
+    weighted = [
+        geometric[index]
+        * min(response_confidence(position[source], frequency) for source in sources)
+        for index, position in enumerate(positions)
+    ]
+    total = sum(weighted)
+    if total <= 1.0e-9:
+        total = sum(geometric)
+        return [value / total for value in geometric]
+    return [value / total for value in weighted]
+
+
 def raised_cosine(frequency: float, low: float, high: float, rising: bool) -> float:
     if high <= low:
         return 1.0 if (frequency >= high if rising else frequency <= low) else 0.0
@@ -235,6 +262,18 @@ def percentile(values: list[float], fraction: float) -> float:
     upper = min(len(ordered) - 1, lower + 1)
     blend = position - lower
     return ordered[lower] * (1.0 - blend) + ordered[upper] * blend
+
+
+def weighted_aligned_mae(samples: list[dict[str, Any]], level_key: str, alignment_db: float) -> float:
+    numerator = 0.0
+    denominator = 0.0
+    for sample in samples:
+        levels = sample[level_key]
+        weights = sample["position_weights"]
+        for level, weight in zip(levels, weights):
+            numerator += float(weight) * abs(float(level) + alignment_db - float(sample["target_db"]))
+            denominator += float(weight)
+    return numerator / max(denominator, 1.0e-12)
 
 
 def sha256(path: Path) -> str:
@@ -464,7 +503,8 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     target_name = str(options.get("target", "harman"))
     preset = str(options.get("preset", "strong"))
     spatial_mode = str(options.get("spatial_mode", "equal"))
-    position_weights = [1.0 / 3.0] * 3 if spatial_mode == "equal" else [0.60, 0.20, 0.20]
+    if spatial_mode not in ("equal", "center"):
+        raise MimoError("공간 평균 방식은 equal/center 중 하나여야 합니다.")
     bass_tilt = int(options.get("bass_tilt_db", 0))
     treble_tilt = int(options.get("treble_tilt_db", 0))
     woofer_trim = int(options.get("woofer_trim_db", -9))
@@ -701,11 +741,14 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         for channel in range(2):
             gram = [[0j for _ in range(actuator_count)] for _ in range(actuator_count)]
             rhs = [0j] * actuator_count
+            confidence_weights = spatial_confidence_weights(
+                engine, positions, sources, max(20.0, frequency), spatial_mode,
+            )
             # Keep the weighted SISO arrival phase instead of asking the inverse
             # for a non-causal zero-phase room response. MIMO changes level and
             # seat variance while the common causal delay remains short.
             baseline_pressure = sum(
-                position_weights[index] * row[channel] * base_spectra[channel][bin_index]
+                confidence_weights[index] * row[channel] * base_spectra[channel][bin_index]
                 for index, row in enumerate(h)
             )
             desired_phase = cmath.phase(baseline_pressure) if abs(baseline_pressure) > 1.0e-12 else 0.0
@@ -713,15 +756,6 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                 engine, target_name, preset, max(20.0, frequency), bass_tilt, treble_tilt,
             ) + target_offsets_db[channel]) / 20.0)
             desired = normalized_target_amp * cmath.exp(1j * desired_phase)
-            confidence_weights = [
-                position_weights[position_index] * min(response_confidence(positions[position_index][source], max(20.0, frequency)) for source in sources)
-                for position_index in range(len(positions))
-            ]
-            confidence_total = sum(confidence_weights)
-            if confidence_total <= 1.0e-9:
-                confidence_weights = list(position_weights)
-                confidence_total = sum(confidence_weights)
-            confidence_weights = [value / confidence_total for value in confidence_weights]
             for position_index, row in enumerate(h):
                 weight = confidence_weights[position_index]
                 for a in range(actuator_count):
@@ -846,17 +880,19 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                 after_values.append(after)
             before_levels = [db(abs(value)) for value in before_values]
             after_levels = [db(abs(value)) for value in after_values]
-            before_curve_raw.append(statistics.median(before_levels))
-            after_curve_raw.append(statistics.median(after_levels))
+            position_weights = spatial_confidence_weights(engine, positions, sources, frequency, spatial_mode)
+            before_curve_raw.append(engine.weighted_power_mean_db(before_levels, position_weights))
+            after_curve_raw.append(engine.weighted_power_mean_db(after_levels, position_weights))
             response_samples.append({
                 "frequency": frequency,
                 "target_db": target_db_value,
                 "before_levels": before_levels,
                 "after_levels": after_levels,
+                "position_weights": position_weights,
             })
             if 20.0 <= frequency <= high_hz:
-                before_std.append(statistics.pstdev(before_levels))
-                after_std.append(statistics.pstdev(after_levels))
+                before_std.append(engine.weighted_std_db(before_levels, position_weights))
+                after_std.append(engine.weighted_std_db(after_levels, position_weights))
         # A worst-case correlated-input bound may attenuate the whole matrix.
         # That is a volume/headroom change, not a target-shape error.  Compare
         # both the existing SISO path and the candidate MIMO path after one
@@ -885,17 +921,9 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             sample["target_db"] - level
             for sample in alignment_samples for level in sample["after_levels"]
         ])
-        before_errors, after_errors = [], []
-        for sample in response_samples:
-            if 20.0 <= sample["frequency"] <= high_hz:
-                before_errors.extend(
-                    abs(level + before_level_alignment_db - sample["target_db"])
-                    for level in sample["before_levels"]
-                )
-                after_errors.extend(
-                    abs(level + after_level_alignment_db - sample["target_db"])
-                    for level in sample["after_levels"]
-                )
+        scored_samples = [sample for sample in response_samples if 20.0 <= sample["frequency"] <= high_hz]
+        before_mae = weighted_aligned_mae(scored_samples, "before_levels", before_level_alignment_db)
+        after_mae = weighted_aligned_mae(scored_samples, "after_levels", after_level_alignment_db)
         before_curve = [value + before_level_alignment_db for value in before_curve_raw]
         after_curve = [value + after_level_alignment_db for value in after_curve_raw]
         for bin_index in range(1, min(FFT_LENGTH // 2, round((high_hz + 30) * FFT_LENGTH / RATE)) + 1):
@@ -918,8 +946,8 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         tail_before_values[channel_name] = [modal_tail_ratio(fft, spectrum) for spectrum in before_tail_spectra]
         tail_after_values[channel_name] = [modal_tail_ratio(fft, spectrum) for spectrum in after_tail_spectra]
         prediction[channel_name] = {
-            "before_target_mae_db": round(statistics.mean(before_errors), 3),
-            "after_target_mae_db": round(statistics.mean(after_errors), 3),
+            "before_target_mae_db": round(before_mae, 3),
+            "after_target_mae_db": round(after_mae, 3),
             "before_spatial_std_db": round(statistics.mean(before_std), 3),
             "after_spatial_std_db": round(statistics.mean(after_std), 3),
             "before_modal_tail_db": round(statistics.mean(tail_before_values[channel_name]), 3),
@@ -976,19 +1004,12 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     ])
     for channel_name in ("left", "right"):
         samples = channel_response_samples[channel_name]
-        before_errors = [
-            abs(level + common_before_level_alignment_db - sample["target_db"])
-            for sample in samples if 20.0 <= sample["frequency"] <= high_hz
-            for level in sample["before_levels"]
-        ]
-        after_errors = [
-            abs(level + common_after_level_alignment_db - sample["target_db"])
-            for sample in samples if 20.0 <= sample["frequency"] <= high_hz
-            for level in sample["after_levels"]
-        ]
+        scored_samples = [sample for sample in samples if 20.0 <= sample["frequency"] <= high_hz]
+        before_mae = weighted_aligned_mae(scored_samples, "before_levels", common_before_level_alignment_db)
+        after_mae = weighted_aligned_mae(scored_samples, "after_levels", common_after_level_alignment_db)
         prediction[channel_name].update({
-            "before_target_mae_db": round(statistics.mean(before_errors), 3),
-            "after_target_mae_db": round(statistics.mean(after_errors), 3),
+            "before_target_mae_db": round(before_mae, 3),
+            "after_target_mae_db": round(after_mae, 3),
             "shape_reference_band_hz": [round(common_alignment_low_hz, 1), round(common_alignment_high_hz, 1)],
             "before_level_alignment_db": round(common_before_level_alignment_db, 3),
             "after_level_alignment_db": round(common_after_level_alignment_db, 3),
@@ -1112,6 +1133,16 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "usable_low_hz": {key: round(value, 2) for key, value in usable_lows.items()},
             "condition_surrogate": {"median": round(statistics.median(condition_values), 3), "p95": round(percentile(condition_values, 0.95), 3), "maximum": round(max(condition_values), 3)},
             "actuator_diversity": diversity,
+            "spatial_weighting": {
+                "mode": spatial_mode,
+                "method": "frequency-dependent geometric position weights multiplied by minimum per-actuator measurement confidence, normalized once per frequency",
+                "representative_100_hz_weights": [
+                    round(value, 6)
+                    for value in engine.spatial_position_weights(100.0, len(positions), spatial_mode)
+                ],
+                "bass_center_priority_disabled": high_hz <= 200,
+                "prediction_curve": "same confidence-weighted mean-square transfer power used by the optimizer diagnostics",
+            },
             "prediction": prediction,
             "headroom": {
                 "before_global_scale_row_sum": round(maximum_row_sum, 6),
@@ -1157,7 +1188,7 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         "algorithm": {
             "family": "robust multichannel weighted pressure matching",
             "not_product_clone": "independent AudioDSP implementation; not Dirac ART",
-            "spatial": "three-position weighted complex pressure error",
+            "spatial": "three-position frequency-dependent spatial/SNR-weighted complex pressure error with matched power-mean prediction and weighted validation",
             "stability": "Tikhonov control effort, adjacent-frequency continuity, primary prior, usable-band and per-frequency measurement-confidence weighting, actual sub-output trim bound, global worst-case row-sum headroom",
             "phase": "bulk-arrival-restored complex low-frequency optimization, common L/R base phase and one common causal delay",
             "crossover": "minimum-phase LR4 branch spectra are part of the transfer matrix and exported FIR bank; no extra runtime stage",
@@ -1247,6 +1278,14 @@ def synthetic_response(frequencies: list[float], actuator: int, position: int) -
 
 def self_test(engine_path: Path) -> dict[str, Any]:
     os.environ["AUDIODSP_PLATFORM_CLASS"] = "test"
+    engine = load_measurement_engine(engine_path)
+    equal_bass_weights = engine.spatial_position_weights(100.0, 3, "equal")
+    center_bass_weights = engine.spatial_position_weights(100.0, 3, "center")
+    center_treble_weights = engine.spatial_position_weights(10_000.0, 3, "center")
+    if any(abs(left - right) > 1.0e-12 for left, right in zip(equal_bass_weights, center_bass_weights)):
+        raise MimoError("MIMO 중앙 우선 모드가 200 Hz 이하 방 모드 대역을 잘못 편향합니다.")
+    if center_treble_weights[0] <= center_treble_weights[1]:
+        raise MimoError("SISO 중앙 우선 고역 정책 회귀가 감지되었습니다.")
     frequencies = [20.0 * (1000.0 ** (index / 511.0)) for index in range(512)]
     results = []
     fixtures: dict[str, tuple[Path, Path]] = {}
@@ -1268,6 +1307,8 @@ def self_test(engine_path: Path) -> dict[str, Any]:
             for position in range(1, 4):
                 for actuator, source in enumerate(sources):
                     response = synthetic_response(frequencies, actuator, position - 1)
+                    response["response_algorithm_revision"] = engine.RESPONSE_ALGORITHM_REVISION
+                    response["smoothing"] = engine.SMOOTHING_NAME
                     name = f"p{position}_{source}_response.json"
                     (directory / name).write_text(json.dumps(response) + "\n", encoding="utf-8", newline="\n")
                     measurements.append({"position": position, "source": source, "response": name, "snr_db": 32.0})
@@ -1289,6 +1330,11 @@ def self_test(engine_path: Path) -> dict[str, Any]:
                     f"Flat / 추가 억제 없음 / Woofer trim 0 dB 기준 MIMO 모델 검증 실패: {mode}: "
                     f"{json.dumps({'validation': result['self_validation'], 'prediction': result['mimo']['prediction']}, ensure_ascii=False)}"
                 )
+            if any(
+                abs(value - 1.0 / 3.0) > 1.0e-6
+                for value in result["mimo"]["spatial_weighting"]["representative_100_hz_weights"]
+            ):
+                raise MimoError(f"MIMO 100 Hz 위치 가중 회귀 실패: {mode}")
             results.append({
                 "mode": mode,
                 "pass": True,
@@ -1301,6 +1347,7 @@ def self_test(engine_path: Path) -> dict[str, Any]:
                 "headroom": result["mimo"]["headroom"],
                 "causality": result["mimo"]["causality"],
                 "target_level_normalization": result["mimo"]["target_level_normalization"],
+                "spatial_weighting": result["mimo"]["spatial_weighting"],
             })
         # Every MIMO-specific value exposed by the FIR form gets an actual
         # 32768-tap 2x4 build.  Common target/voicing controls are covered by
@@ -1371,7 +1418,17 @@ def self_test(engine_path: Path) -> dict[str, Any]:
                 }
         if not remediation_baseline or not remediation_baseline["model_pass"]:
             raise MimoError("Web FAIL 안내의 권장 기준 조합을 실제로 재계산했지만 PASS하지 못했습니다.")
-    return {"result": "PASS", "bulk_delay_restored": True, "topologies": results, "mimo_option_matrix": option_results, "remediation_baseline": remediation_baseline, "paths": PATHS, "taps": TAPS, "rate": RATE}
+    return {
+        "result": "PASS",
+        "bulk_delay_restored": True,
+        "spatial_weight_consistency": True,
+        "topologies": results,
+        "mimo_option_matrix": option_results,
+        "remediation_baseline": remediation_baseline,
+        "paths": PATHS,
+        "taps": TAPS,
+        "rate": RATE,
+    }
 
 
 def main() -> int:

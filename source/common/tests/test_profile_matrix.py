@@ -711,7 +711,7 @@ def main() -> int:
             for marker in (b"32768", b"UMIK-1", b"target-graph", b"job-progress", b"workflow", b"cal-card", b"session-overview", b"session-library", b'name="woofer_measurement_attenuation_db"', b'value="-42"', b"measurement-path-lock", b'data-measurement-path="unbound"', "세션 생성".encode("utf-8"), "빠른 검사와 본 측정의 스윕 출력은 2단계".encode("utf-8"), "L+우퍼 / R+우퍼".encode("utf-8"), "정밀 분리+합산".encode("utf-8"), "L/R/우퍼/L+우퍼/R+우퍼".encode("utf-8"), "프런트 L → 프런트 R → 우퍼 → L+우퍼 → R+우퍼 → L+R+우퍼 동시 위상".encode("utf-8"), "90° · 천장 방향".encode("utf-8"), "0° · 마이크 정면".encode("utf-8"), "빠른 측정 · 기준점 1위치".encode("utf-8"), "표준 측정 · 중앙+좌우 3위치".encode("utf-8"), "활성 세션 없음".encode("utf-8")):
                 require(marker in measure_page, f"Measurement-page marker missing: {marker!r}")
             web_source = args.web.read_text(encoding="utf-8")
-            for marker in ("본 측정과 같은 15 Hz–22 kHz 스윕·라우팅·SNR 계산", "빠른 검사 저장 원본", "/measurement/reprocess-level", "저역 late/early", "저역 기준 레벨 고정", "L/R 동일 기준", "1.5 dB 넘게 악화", "실제 RT60/잔향 예측이 아니며", "디지털 크로스오버", "LR4 HPF", "additional_block_latency_samples", "set-session-note", "load-session", "build-fieldset", "validation-checklist", "음색 시작점", "타깃 그대로", "맑은 고음", "따뜻한 균형", "야간 균형", "최대 상대 보상", "상대 보상의 음량 비용", "15–20 kHz 잔여 오차", "공통 0 dB 기준", "one_common_level_reference", "premeasured_sum_validation", "필터 전 합산 교차항 확인", "합산 안전 상한", "sum_guard_enabled&&j.result.crossover?.channels", "mergeLowSystemResponse", "사후 검증 후에는 실측과 계산 예상값을 같은 공통 기준으로 비교", "predicted_sum_db", "inconclusive_low_snr", "검증 sweep 입력", "28초 ESS", "canonicalMeasurementUrl='/measure'", "소리는 자동으로 시작되지 않습니다", "--step-accent", "summary::after", "details[open]>summary::after"):
+            for marker in ("본 측정과 같은 15 Hz–22 kHz 스윕·라우팅·SNR 계산", "빠른 검사 저장 원본", "/measurement/reprocess-level", "저역 late/early", "저역 기준 레벨 고정", "L/R 동일 기준", "1.5 dB 넘게 악화", "실제 RT60/잔향 예측이 아니며", "디지털 크로스오버", "LR4 HPF", "additional_block_latency_samples", "set-session-note", "load-session", "build-fieldset", "validation-checklist", "음색 시작점", "타깃 그대로", "맑은 고음", "따뜻한 균형", "야간 균형", "최대 상대 보상", "상대 보상의 음량 비용", "15–20 kHz 잔여 오차", "공통 0 dB 기준", "공간 통합 계산", "가중 평균 파워", "상쇄 P90", "현재 지연·극성 유지", "needs_algorithm_reprocess", "one_common_level_reference", "premeasured_sum_validation", "필터 전 합산 교차항 확인", "합산 안전 상한", "sum_guard_enabled&&j.result.crossover?.channels", "mergeLowSystemResponse", "사후 검증 후에는 실측과 계산 예상값을 같은 공통 기준으로 비교", "predicted_sum_db", "inconclusive_low_snr", "검증 sweep 입력", "28초 ESS", "canonicalMeasurementUrl='/measure'", "소리는 자동으로 시작되지 않습니다", "--step-accent", "summary::after", "details[open]>summary::after"):
                 require(marker in web_source, f"Measurement/MIMO safety UI source marker missing: {marker}")
             require("new URL(location.href);url.searchParams.set('updated'" not in web_source, "measurement completion still reloads a POST-only route")
             require(b'role="tab" class="flow-step current"' in measure_page, "current measurement step is not an accessible non-destructive tab")
@@ -908,6 +908,15 @@ def main() -> int:
                     "preset": "strong",
                     "front_sha256": hashlib.sha256(browser_front.read_bytes()).hexdigest(),
                     "front_metrics": {"left": {"peak_tap": 0, "peak_delay_ms": 0.0}},
+                    "measurement_coverage": {"positions": 3},
+                    "spatial_mode": "equal",
+                    "spatial_aggregation": {
+                        "method": "noise-confidence weighted acoustic transfer power mean",
+                        "legacy_response_count": 0,
+                        "left": {"median_power_mean_lift_db": 1.25},
+                        "right": {"median_power_mean_lift_db": 1.10},
+                        "woofer": {"median_power_mean_lift_db": 1.80},
+                    },
                     "self_validation": {
                         "overall_pass": True,
                         "target_fit": {},
@@ -934,7 +943,7 @@ def main() -> int:
                 "measurement status is not strict browser-compatible JSON",
             )
             result_page, _ = get_bytes(base + "/measure")
-            for marker in ("프런트 WAV".encode("utf-8"), "우퍼 WAV".encode("utf-8"), "전체 ZIP".encode("utf-8"), b"measurement-result-graph", b'data-result-range="full"', b'data-result-range="bass"', "A/B 청취 비교".encode("utf-8"), "자동 백업".encode("utf-8"), b'action="/measurement/apply"', "정식 적용".encode("utf-8"), b'data-measurement-path="speaker"', "이 결과의 전용 경로".encode("utf-8"), "U7 스피커 출력".encode("utf-8"), b'role="tablist"', b'role="tabpanel"', b"non_destructive_measurement_tabs", "우퍼 최종 트림".encode("utf-8"), "측정 시 우퍼 감쇄".encode("utf-8"), "상대 보상의 음량 비용".encode("utf-8"), "자동 검증".encode("utf-8"), "MAE는 평균 절대오차".encode("utf-8"), b"status-badge na", b"resultToken"):
+            for marker in ("프런트 WAV".encode("utf-8"), "우퍼 WAV".encode("utf-8"), "전체 ZIP".encode("utf-8"), b"measurement-result-graph", b'data-result-range="full"', b'data-result-range="bass"', "A/B 청취 비교".encode("utf-8"), "자동 백업".encode("utf-8"), b'action="/measurement/apply"', "정식 적용".encode("utf-8"), b'data-measurement-path="speaker"', "이 결과의 전용 경로".encode("utf-8"), "U7 스피커 출력".encode("utf-8"), b'role="tablist"', b'role="tabpanel"', b"non_destructive_measurement_tabs", "우퍼 최종 트림".encode("utf-8"), "측정 시 우퍼 감쇄".encode("utf-8"), "상대 보상의 음량 비용".encode("utf-8"), "공간 통합 계산".encode("utf-8"), "가중 평균 파워".encode("utf-8"), "자동 검증".encode("utf-8"), "MAE는 평균 절대오차".encode("utf-8"), b"status-badge na", b"resultToken"):
                 require(marker in result_page, f"generated-result Web marker missing: {marker!r}")
             require(result_page.count(b'role="tab"') == 6 and result_page.count(b'role="tabpanel"') == 6, "measurement workflow is not a six-tab/six-panel interface")
             require(b'value="headphone"' not in result_page, "speaker-bound result offered the Headphone-jack profile")
@@ -983,7 +992,7 @@ def main() -> int:
             }]
             (measurements / "current.json").write_text(json.dumps(post_pass_job), encoding="utf-8")
             post_pass_page = get_bytes(base + "/measure")[0].decode("utf-8")
-            for marker in ("사후 합산 실측 PASS", "사용 PASS · 14.29 dB", "검증을 완료했습니다", "측정 품질", "표시 곡선", "설정 상한과 예상 음압은 다릅니다"):
+            for marker in ("사후 합산 실측 PASS", "사용 PASS · 14.29 dB", "검증을 완료했습니다", "저장 결과 재판정", "측정 품질", "표시 곡선", "설정 상한과 예상 음압은 다릅니다"):
                 require(marker in post_pass_page, f"post-validation PASS UX marker missing: {marker}")
             require("pass_measured" not in post_pass_page and "measurement_gate" not in post_pass_page, "developer-only post/audit status leaked into the user UI")
 
@@ -1002,6 +1011,22 @@ def main() -> int:
             advisory_section = advisory_page.split('class="post-validation-card"', 1)[1].split("</section>", 1)[0]
             require("판정 보류 · SNR 부족" in advisory_section and 'pill neutral' in advisory_section and 'diagnostic-warning' in advisory_section, "low-SNR post validation is not presented as an advisory")
             require('pill error' not in advisory_section and 'validation-fail' not in advisory_section, "low-SNR advisory is still styled as a conclusive failure")
+            post_transient_job = copy.deepcopy(post_advisory_job)
+            transient = post_transient_job["post_filter_validation"]["evaluation"]
+            transient.update({
+                "inconclusive_low_snr": False,
+                "inconclusive_switching_transient": True,
+                "recommended_retry": {"action": "5 · 적용 전 검토에서 ‘검증 초기화’를 누른 뒤 같은 검증 sweep 입력으로 다시 측정하세요."},
+            })
+            transient["prediction_consistency"] = {"status": "inconclusive_switching_transient", "pass": False}
+            post_transient_job["result"]["self_validation"]["post_filter_sum"] = transient
+            post_transient_job["result"]["self_validation"]["crossover_sum"] = {"required": True, "pass": True, "status": "warning_post_measurement_switching_transient"}
+            post_transient_job["result"]["crossover"]["status"] = "warning_post_measurement_switching_transient"
+            (measurements / "current.json").write_text(json.dumps(post_transient_job), encoding="utf-8")
+            transient_page = get_bytes(base + "/measure")[0].decode("utf-8")
+            transient_section = transient_page.split('class="post-validation-card"', 1)[1].split("</section>", 1)[0]
+            require("판정 보류 · 출력 전환 감지" in transient_section and "출력 안정화용 무음 2초" in transient_section and 'pill neutral' in transient_section, "stream-transition advisory or silent-settle guidance is missing")
+            require('pill error' not in transient_section and 'validation-fail' not in transient_section, "stream-transition advisory is still styled as a conclusive DSP failure")
             (measurements / "current.json").write_text(json.dumps(browser_job), encoding="utf-8")
             stale_job = copy.deepcopy(browser_job)
             stale_job["result"].pop("algorithm_revision")
@@ -1037,6 +1062,14 @@ def main() -> int:
             recovery_page, _ = get_bytes(base + "/measure")
             for marker in ("녹음 5/5 · 응답 0/5", "원본 재계산", "소리를 재생하지 않습니다."):
                 require(marker.encode("utf-8") in recovery_page, f"saved-recording recovery UI missing: {marker}")
+            for source in recovery_job["sources"]:
+                (browser_session / f"p1_{source}_response.json").write_text(json.dumps({
+                    "frequencies": [100.0], "db": [0.0],
+                    "smoothing": "variable 1/12 octave <200 Hz; 1/6 octave 200-2000 Hz; 1/3 octave >2 kHz",
+                }), encoding="utf-8")
+            legacy_response_page, _ = get_bytes(base + "/measure")
+            for marker in ("새 계산 0/5", "이전 방식 응답 5개", "원본 재계산"):
+                require(marker.encode("utf-8") in legacy_response_page, f"legacy response recovery UI missing: {marker}")
             (measurements / "current.json").write_text(json.dumps(browser_job), encoding="utf-8")
             directional_failed_job = copy.deepcopy(browser_job)
             directional_failed_job["result"]["self_validation"].update({

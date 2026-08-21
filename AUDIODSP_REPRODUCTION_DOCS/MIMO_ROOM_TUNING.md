@@ -53,6 +53,23 @@ Sub가 있는 topology는 기본 ON/100 Hz LR4 crossover의 complex minimum-phas
 
 각 청취 위치 `p`, 물리 제어원 `a`, 입력 채널 `c`, 주파수 `f`에 대해 복소 전달함수 `H[p,a,f]`를 독립 sweep으로 측정한다. 각 입력 채널의 출력 FIR 벡터 `g[a,c,f]`는 다음 항을 함께 최소화한다.
 
+```text
+h_p(f) = [H_p,1(f), ..., H_p,A(f)]
+q_p(f) = normalize(w_p(f) min_a c_p,a(f))
+
+J(g) = Σ_p q_p |h_p g - d|²
+     + gᴴΛ(f)g
+     + ρ||g-g₀||²
+     + κ||g-g_prev||²
+
+(HᴴQH + Λ + (ρ+κ)I)g
+  = HᴴQd + ρg₀ + κg_prev
+```
+
+`w_p`는 SISO와 같은 위치 정책이다. `equal`은 세 위치 동일 가중이고 `center`도 룸 모드가 지배하는 200 Hz 이하에서는 동일 가중이다. 중앙 0.60 가중은 2 kHz 이상에만 도달하므로 현재 최대 150 Hz MIMO 대역에는 들어오지 않는다. `c_p,a`는 위치·제어원별 주파수 신뢰도이며 가장 낮은 제어원 신뢰도를 그 행의 상한으로 사용한다. v22부터 solver 목표 phase, 예측 그래프, 공간 표준편차, target MAE가 모두 이 `q_p(f)`를 공유한다.
+
+`d`의 크기는 선택 target과 기존 SISO 저역 anchor로 정하고, phase는 가중 SISO 도착 phase를 유지한다. 이는 모든 위치에 영위상 응답을 강요하는 비인과 역필터가 아니다. `Λ`에는 Tikhonov 제어 에너지, 제어원 자연 재생대역 아래 penalty, 보조 제어원 사용 penalty가 들어간다. `g₀`는 검증된 SISO/crossover baseline, `g_prev`는 바로 앞 주파수 bin의 해다.
+
 1. 세 위치의 선택 타깃에 대한 복소 pressure 오차
 2. 제어 에너지 Tikhonov regularization
 3. 기존 안전한 SISO L/R FIR에서 과도하게 벗어나지 않는 prior
@@ -67,6 +84,7 @@ Sub가 있는 topology는 기본 ON/100 Hz LR4 crossover의 complex minimum-phas
 - 모든 경로에 하나의 공통 인과 지연을 적용하고 32768탭으로 절단·후단 taper한다.
 - 주파수별 각 물리 출력의 `|L path| + |R path|`를 0.999 이하로 투영한다. 변환·절단 후 다시 최악 상관입력 row sum을 검사하고 필요한 최소 global scale만 적용한다.
 - target MAE는 40 Hz부터 MIMO 상한 또는 130 Hz까지의 한 공통 reference-band level만 맞춘 뒤 응답 형상을 평가한다. 위치별·주파수별 normalize는 금지한다. 상관입력 headroom 때문에 생기는 broadband 감쇄는 `headroom.global_scale_db`와 raw graph로 별도 표시하므로, 단순 볼륨 저하를 음색 실패로 오판하지 않으면서 실제 감쇄를 숨기지도 않는다.
+- 대표 before/after 그래프는 `10 log10(Σq_p |H_p g|²)`의 가중 mean-square 응답이다. 좌석 편차는 같은 `q_p`의 weighted dB 표준편차이고, target MAE도 같은 위치 가중을 쓴다. 물리 출력 headroom과 최악 위치 안전 상한은 평균하지 않는다.
 - 두 programme speaker뿐인 `MIMO Stereo`는 전용 support 제어원이 없어 큰 cross-feed가 stereo target을 손상시키기 쉽다. 선택 강도의 15%만 기존 SISO에서 벗어나도록 제한한다. `MIMO 2.2`는 자유도가 큰 대신 narrow solution의 tail 위험을 줄이기 위해 선택 강도의 85%를 사용한다.
 - NaN/Inf, 정확한 tap/rate/format, manifest SHA-256, 인과성, headroom, 예측 타깃 오차와 공간 편차 비퇴행을 통과해야 Preview/Apply가 열린다.
 - 출력은 `MIMO_Front_Left_LR_32768.wav` 등 네 stereo float32 WAV다. 각 WAV의 채널 0/1은 입력 L/R에서 해당 물리 출력으로 가는 두 전달 경로다.
@@ -132,6 +150,7 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 
 ## 2026-08-21 무음 알고리즘 회귀 결과
 
+- v22 수학 감사에서 `center`가 150 Hz 이하 MIMO에도 중앙 위치를 0.60으로 고정하던 오류를 수정했다. 이제 200 Hz 이하의 기하 가중은 1/3·1/3·1/3이고, 위치별 측정 신뢰도만 추가된다. solver·그래프·검증이 동일 가중을 사용하도록 회귀시험을 추가했다.
 - `Flat / 추가 억제 없음 / Woofer trim 0 dB / 최대 상대 보상 10 dB` 기준 합성 session은 MIMO Stereo, MIMO 2.1, MIMO 2.2 모두 finite/headroom/causality/타깃·공간 비악화/modal-tail 비악화 모델 검증을 PASS했다.
 - MIMO 전용 UI 값 19개를 실제 32768탭×8경로로 생성했다. 구조·형식·headroom 검사는 19/19 PASS했다.
 - 2026-08-21 회귀에서 기존 다섯 `fail_model`은 비교 baseline이 Front-only인 반면 후보는 LR4 Front+sub였던 검증 오류로 확인했다. baseline도 실제 배포되는 crossover routing으로 수정한 뒤 19/19가 구조와 모델 비악화를 PASS했다. 실제 방에서 비기준 조합이 실패할 수 있다는 정책은 유지하며 Web은 `4 · FIR 계산`의 실제 항목명으로 조정 순서를 안내한다.
