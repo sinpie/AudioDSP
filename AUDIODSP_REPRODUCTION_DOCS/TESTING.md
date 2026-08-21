@@ -40,7 +40,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\releases\audiodsp-pi4-
 - 세 화면 UI, 반응형 signal-flow/measurement path-lock SVG marker, staged upload, A/B, apply, backup/restore/latest rollback
 - 소리 없는 session 생성/재설정, 보고서 MD/JSON/ZIP download, 측정한 U7 경로 외 Preview/Apply HTTP 400 및 무변경
 - session 주석 저장 전후 level/측정/FIR checkpoint 불변, A→B 생성 뒤 A 주석 포함 목록 표시·불러오기, active session 삭제 후 idle 복귀·정식 FIR 불변·중복 삭제 거부, 완료 artifact 누락 session 거부
-- SISO/MIMO FAIL fixture가 빨간 상태와 함께 화면의 실제 `1 · 연결·Cal`~`5 · 검토·A/B`, `MIMO 강도`, `MIMO 공동제어 상한`, `지원 제어원 제한`, 실행 버튼명을 사용해 조치를 안내
+- SISO/MIMO FAIL fixture가 빨간 상태와 함께 화면의 실제 `1 · 측정 구성`~`5 · 결과 검토`, `안정성/효과`, `공동제어 상한`, `보조 출력 사용 제한`, 실행 버튼명을 사용해 조치를 안내
 - 이전 response revision은 원본 WAV 무음 재계산을 제시하고, 새 결과는 평균제곱 공간 통합 방법과 dB 기하평균 대비 변화량을 표시
 - volume 실제 read, API/form write, -60/0, invalid JSON/range/type, 물리 knob divergence
 - 33개 동시 form write 후 JSON/config 유효성
@@ -98,6 +98,14 @@ sudo /usr/local/bin/audiodsp-measurement.py self-test-targets
 
 `test_profile_matrix.py`는 응답 fixture에 `inf/-inf/nan`을 주입해 API 직렬화가 표준 JSON `null`만 내고 브라우저 parser를 깨지 않는지 확인한다. 실제 Pi UI는 CDP smoke test에서 `liveState=실시간`, 결과 SVG/polyline 존재, 20 Hz–20 kHz 요약을 확인한다.
 
+`test_web_measurement_flow.py`는 Linux 서비스나 CamillaDSP parser 없이도 실행되는 교차 플랫폼 무음 smoke test다. 실제 `measurement_panel()`을 SISO와 MIMO fixture로 렌더링해 `세션`+1–6 총 7개 tab/panel, `측정 구성`/`결과 검토` 용어, MIMO 전용 옵션 카드, SISO에서 MIMO 제어가 숨겨지는지를 확인한다.
+
+```powershell
+python source/common/tests/test_web_measurement_flow.py `
+  --web source/common/payload/audiodsp-profile-web.py `
+  --measurement source/common/payload/audiodsp-measurement.py
+```
+
 `test_session_migration.py`는 실제 session export/import 왕복에서 ID, 모든 파일 byte 수와 SHA-256, current pointer를 검증하고 `../` 경로를 포함한 악성 archive를 거부한다. SD writer `-ValidateOnly -WindowsWifiProfile <profile> -SessionMigrationArchive <archive>`는 key를 출력하지 않은 채 WLAN profile과 archive hash까지 검사한다.
 
 `test_measurement_engine.py`는 `lrw_sum` 정밀 fixture에서 위치당 L/R/W/L+W/R+W를 모두 준비한 뒤에만 FIR 계산이 열리는지 확인한다. L+W/R+W는 합산 closure에만 쓰이고 FIR 평균·정규화에는 들어가지 않아야 한다. 측정 level -9 dB를 reference와 함께 바꿔도 복원된 전달함수와 생성 FIR이 같아야 하며, combined response를 독립 normalize하거나 두 번 보정한 fixture는 실패해야 한다. Crossover ON/OFF 모두 `pass_premeasured_model`이면 추가 사후 sweep 없이 Apply 가능해야 한다.
@@ -126,7 +134,15 @@ python3 /tmp/test_mimo_runtime.py \
   --camilladsp /usr/local/bin/camilladsp
 ```
 
-첫 명령은 Stereo/2.1/2.2 각각 상대 bulk-delay 복원, 200 Hz 이하 `center`/`equal` 동일 기하 가중, 위치/SNR 가중 solver·그래프·MAE 일치, deployable SISO base-bank 공통 정규화, 기존 SISO 저역 기준 레벨 고정, finite, 인과성, physical output별 최악 상관입력 row sum, 실제 Woofer trim 상한, LR4 FIR-bank 내장, 타깃 MAE·좌석편차·평활 전달함수 impulse-tail proxy 비퇴행과 네 WAV×32768탭을 검사한다. 세 토폴로지의 `Flat + 추가 억제 없음 + trim 0 dB` 모델은 반드시 PASS한다. 이어 MIMO UI 값 19개를 실제 8경로 bank로 만들고 구조 검증은 전부 PASS, acoustic 비퇴행 실패 조합은 `fail_model`로 안전 차단되는지 확인한다. 두 번째는 격리된 임시 config에서 8 Conv와 2→8→4 mixer를 실제 CamillaDSP `--check`로 검사하고 Pi2 enable 거부와 MIMO 백업 임시파일 회수를 확인한다. 둘 다 오디오 장치를 열거나 소리를 내지 않는다.
+첫 명령은 Stereo/2.1/2.2 각각 상대 bulk-delay 복원, 200 Hz 이하 `center`/`equal` 동일 기하 가중, 위치/행 관측 가능성 가중과 actuator별 uncertainty regularization, 실제 1-노름 조건수·자동 diagonal loading, solver·그래프·MAE 일치, deployable SISO base-bank 공통 정규화, 기존 SISO 저역 기준 레벨 고정, finite, 인과성, physical output별 최악 상관입력 row sum, 실제 Woofer trim 상한, LR4 FIR-bank 내장, 타깃 MAE·좌석편차·모든 측정 위치 MAE·평활 전달함수 impulse-tail proxy 비퇴행과 네 WAV×32768탭을 검사한다. 세 토폴로지의 `Flat + 추가 억제 없음 + trim 0 dB` 모델은 반드시 PASS한다. 이어 MIMO UI 값 19개를 실제 8경로 bank로 만들고 구조 검증은 전부 PASS, acoustic 비퇴행 실패 조합은 `fail_model`로 안전 차단되는지 확인한다. 두 번째는 격리된 임시 config에서 8 Conv와 2→8→4 mixer를 실제 CamillaDSP `--check`로 검사하고 Pi2 enable 거부와 MIMO 백업 임시파일 회수를 확인한다. 둘 다 오디오 장치를 열거나 소리를 내지 않는다.
+
+2026-08-21 v24 무음 회귀 결과:
+
+- MIMO Stereo/2.1/2.2의 `Flat + 추가 억제 없음 + trim 0 dB` 기준은 모두 model PASS. 실제 1-노름 최대 조건수는 각각 5.609/7.741/8.682이고 모든 측정 위치 비악화, 20 Hz–20 kHz graph coverage를 PASS했다.
+- MIMO UI 옵션 19개는 structural failure 0, model-limited 0으로 PASS했다. near-singular와 exact-singular 2×2 fixture는 자동 diagonal loading 뒤 조건수 10,000 이하로 복구됐다.
+- `test_web_measurement_flow.py`는 7 tab/7 panel, MIMO 전용 카드, SISO 숨김과 용어 marker를 PASS했다. Python compile, UI source stale-term 검사와 `git diff --check`도 PASS했다.
+- Pi2/Pi3/Pi4/Pi5 canonical materialization은 각각 40/40/38/38 파일 assemble/check PASS, 5.1+dual-sub dense 42경로 계획은 runtime 135 MiB/생성 530 MiB로 2 GB 제한을 PASS했다.
+- Windows 호스트에는 WSL과 실행 가능한 Linux CamillaDSP가 없어 `test_profile_matrix.py`의 실제 CamillaDSP `--check` 및 `test_mimo_runtime.py`는 v24에서 재실행하지 못했다. v23에서 같은 runtime/config 경로가 full PASS했으며, v24의 runtime topology·mixer·manager 코드는 변경하지 않았다. 다음 Pi 연결 시 이 두 Linux 회귀를 다시 실행한다.
 
 Pi 5 2 GB와 향후 5.1 worst-case 메모리는 다음 무음 시험으로 고정한다.
 
@@ -233,7 +249,9 @@ MIMO 8-path는 공통 timing reference를 갖춘 Pi4/5에서 chunksize 1024 이�
 - `algorithm_revision`이 없거나 다른 이전 결과는 재계산 경고와 disabled Preview/Apply를 보이고 두 POST를 엔진도 거부해야 한다.
 - 최신 결과라도 `self_validation.overall_pass=false`이면 Preview는 가능하지만 정식 Apply POST는 거부해야 한다.
 - Speaker/Headphone × 저장 copy/separate × 저장 bypass on/off × Preview 2ch/4ch의 16개 상태에서 `/api/status`, 실제 config topology, 설정 불변, 복귀 mode/channel을 모두 확인한다.
-- 측정 화면의 6개 tab/tabpanel, `aria-selected`/`aria-current=step`, 방향키 이동, 한 패널만 표시, 탭과 패널 간격 0, PC/모바일 document overflow 0과 4초간 자동 navigation 0회를 확인한다.
+- 측정 화면의 `세션`+1~6 총 7개 tab/tabpanel, `aria-selected`/`aria-current=step`, 방향키 이동, 한 패널만 표시, 탭과 패널 간격 0, PC/모바일 document overflow 0과 4초간 자동 navigation 0회를 확인한다.
+- POST와 A/B 미리듣기 뒤 현재 scroll/tab이 유지되고, 계산 완료 때만 5 · 결과 검토로 이동하는지 확인한다. 내부 진단 FAIL은 고정 toast가 아니며 화면 최상단으로 focus를 이동시키지 않아야 한다.
+- SISO mode의 FIR 계산 화면에는 MIMO 전용 select가 보이지 않아야 한다. MIMO mode에서는 세 핵심 select와 조건수/actuator confidence/위치별 MAE·범위 그래프가 함께 보여야 한다.
 - 활성 session 요약이 단계 탭보다 앞에 있고, 저장 session 카드의 주석/완료 막대/이어하기가 모바일과 PC에서 잘리지 않는지 확인한다. 실패 fixture에서는 tab·진단 카드가 빨간색이며 PASS/FAIL/N/A와 FAIL 해결 방법이 동시에 보여야 한다.
 - 모든 `details > summary`에 vector chevron이 보이고, 클릭/키보드로 열었을 때 open 강조와 화살표 방향이 바뀌는지 확인한다. 검사 브라우저를 응답 도중 종료해도 Web journal에 BrokenPipe/ConnectionReset traceback이 남지 않아야 한다.
 - 0 dB Woofer trim 결과에서 `Woofer 최종 trim +0 dB`와 `측정 시 Woofer 감쇄 −9 dB`가 별도 항목으로 표시되어야 한다.
@@ -244,4 +262,4 @@ MIMO 8-path는 공통 timing reference를 갖춘 Pi4/5에서 chunksize 1024 이�
 python diagnostics/render_ui_cdp.py --chrome "C:\Program Files\Google\Chrome\Application\chrome.exe" --url http://<PI-IP>:8080/measure --width 390 --height 844 --output diagnostics/ui-check/measure-mobile.png
 ```
 
-`--url`, `--width`, `--height`, `--output`을 바꿔 390×844와 1440×1200에서 `/`, `/measure`, `/settings`를 각각 실행한다. overflow, 현재 앱 탭, 1–6 단계별 한 panel만 표시, hash/ARIA 상태, disclosure toggle, 4초 동안 예기치 않은 navigation 0회를 검사한다. 스크린샷은 판정 보조 자료이고 DOM/CDP assertion이 자동 PASS 조건이다.
+`--url`, `--width`, `--height`, `--output`을 바꿔 390×844와 1440×1200에서 `/`, `/measure`, `/settings`를 각각 실행한다. overflow, 현재 앱 탭, `세션`+1–6 중 한 panel만 표시, hash/ARIA 상태, disclosure toggle, 4초 동안 예기치 않은 navigation 0회를 검사한다. 스크린샷은 판정 보조 자료이고 DOM/CDP assertion이 자동 PASS 조건이다.

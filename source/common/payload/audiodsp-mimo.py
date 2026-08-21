@@ -193,21 +193,39 @@ def spatial_confidence_weights(
     """Use the same frequency-dependent seat policy as the SISO designer.
 
     The geometric weights describe which microphone positions matter.  The
-    weakest measured actuator confidence at each position then limits how much
-    that row may steer the complex inverse.  Normalizing once here keeps the
-    solver, prediction graph and validation metric on one mathematical basis.
+    row confidence expresses whether the pressure at a position is observable
+    by the actuator set as a whole.  It must not collapse merely because one
+    band-limited actuator is weak (for example, a Front below its natural
+    roll-off or a subwoofer above its passband); actuator-specific uncertainty
+    is handled by a separate diagonal robust-control penalty in the solver.
+    The quadratic mean is deliberately between an optimistic maximum and the
+    old overly-conservative minimum.  Normalizing once here keeps the solver,
+    prediction graph and validation metric on one mathematical basis.
     """
     geometric = engine.spatial_position_weights(frequency, len(positions), spatial_mode)
-    weighted = [
-        geometric[index]
-        * min(response_confidence(position[source], frequency) for source in sources)
-        for index, position in enumerate(positions)
-    ]
+    weighted = []
+    for index, position in enumerate(positions):
+        confidence = [response_confidence(position[source], frequency) for source in sources]
+        row_confidence = math.sqrt(sum(value * value for value in confidence) / len(confidence))
+        weighted.append(geometric[index] * row_confidence)
     total = sum(weighted)
     if total <= 1.0e-9:
         total = sum(geometric)
         return [value / total for value in geometric]
     return [value / total for value in weighted]
+
+
+def actuator_confidence(
+    positions: list[dict[str, dict[str, Any]]],
+    source: str,
+    frequency: float,
+    position_weights: list[float],
+) -> float:
+    """Return the weighted confidence of one transfer-matrix column."""
+    return max(0.0, min(1.0, sum(
+        weight * response_confidence(position[source], frequency)
+        for weight, position in zip(position_weights, positions)
+    )))
 
 
 def raised_cosine(frequency: float, low: float, high: float, rising: bool) -> float:
@@ -218,17 +236,15 @@ def raised_cosine(frequency: float, low: float, high: float, rising: bool) -> fl
     return value if rising else 1.0 - value
 
 
-def solve_complex(matrix: list[list[complex]], vector: list[complex]) -> tuple[list[complex], float]:
-    """Pivoted Gaussian solve with a conservative pivot condition surrogate."""
+def _gaussian_solve(matrix: list[list[complex]], vector: list[complex]) -> list[complex]:
+    """Solve a small dense complex system using partial pivoting."""
     size = len(vector)
     augmented = [list(row) + [vector[index]] for index, row in enumerate(matrix)]
-    pivots: list[float] = []
     for column in range(size):
         pivot = max(range(column, size), key=lambda row: abs(augmented[row][column]))
         magnitude = abs(augmented[pivot][column])
         if magnitude < 1.0e-12:
             raise MimoError("MIMO 정규화 행렬이 특이합니다.")
-        pivots.append(magnitude)
         augmented[column], augmented[pivot] = augmented[pivot], augmented[column]
         divisor = augmented[column][column]
         for index in range(column, size + 1):
@@ -241,8 +257,72 @@ def solve_complex(matrix: list[list[complex]], vector: list[complex]) -> tuple[l
                 continue
             for index in range(column, size + 1):
                 augmented[row][index] -= factor * augmented[column][index]
-    condition = max(pivots) / max(min(pivots), 1.0e-12)
-    return [augmented[index][size] for index in range(size)], condition
+    return [augmented[index][size] for index in range(size)]
+
+
+def matrix_condition_number_1(matrix: list[list[complex]]) -> float:
+    """Compute the induced 1-norm condition number for a 2–4 actuator matrix.
+
+    The earlier pivot ratio was not a matrix condition number and could label
+    an unstable inverse as benign.  MIMO only solves the low-frequency bins,
+    and matrices are at most 4x4, so solving the basis vectors is inexpensive
+    and gives ||A||_1 ||A^-1||_1 directly without a NumPy runtime dependency.
+    """
+    size = len(matrix)
+    norm = max(sum(abs(matrix[row][column]) for row in range(size)) for column in range(size))
+    inverse_columns = [
+        _gaussian_solve(matrix, [1.0 + 0.0j if row == column else 0.0j for row in range(size)])
+        for column in range(size)
+    ]
+    inverse_norm = max(sum(abs(value) for value in column) for column in inverse_columns)
+    return norm * inverse_norm
+
+
+def solve_complex(matrix: list[list[complex]], vector: list[complex]) -> tuple[list[complex], float]:
+    """Solve a regularized complex system and report its true 1-norm condition."""
+    return _gaussian_solve(matrix, vector), matrix_condition_number_1(matrix)
+
+
+def solve_conditioned_complex(
+    matrix: list[list[complex]],
+    vector: list[complex],
+    condition_limit: float = 10_000.0,
+) -> tuple[list[complex], float, float, int]:
+    """Solve with the minimum scheduled diagonal loading needed for stability.
+
+    Returns the solution, final condition number, loading relative to the mean
+    original diagonal, and number of loading steps.  The input matrix is not
+    mutated, which keeps diagnostics and retry behavior deterministic.
+    """
+    working = [list(row) for row in matrix]
+    size = len(vector)
+    matrix_scale = max(
+        sum(max(float(working[index][index].real), 0.0) for index in range(size)) / size,
+        1.0e-9,
+    )
+    loading = 0.0
+    loading_step = matrix_scale * 1.0e-5
+    attempts = 0
+    try:
+        solution, condition = solve_complex(working, vector)
+    except MimoError:
+        # A genuinely singular unregularized matrix is exactly the case that
+        # diagonal loading is meant to rescue.  Do not abort before giving the
+        # robust solver that opportunity.
+        solution, condition = [0j] * size, math.inf
+    while condition > condition_limit and attempts < 6:
+        increment = loading_step * (10.0 ** attempts)
+        loading += increment
+        for index in range(size):
+            working[index][index] += increment
+        try:
+            solution, condition = solve_complex(working, vector)
+        except MimoError:
+            solution, condition = [0j] * size, math.inf
+        attempts += 1
+    if not all(math.isfinite(value.real) and math.isfinite(value.imag) for value in solution):
+        raise MimoError("MIMO 정규화 행렬을 안정화할 수 없습니다.")
+    return solution, condition, loading / matrix_scale, attempts
 
 
 def median_db(values: list[complex]) -> float:
@@ -273,6 +353,27 @@ def weighted_aligned_mae(samples: list[dict[str, Any]], level_key: str, alignmen
         for level, weight in zip(levels, weights):
             numerator += float(weight) * abs(float(level) + alignment_db - float(sample["target_db"]))
             denominator += float(weight)
+    return numerator / max(denominator, 1.0e-12)
+
+
+def position_aligned_mae(
+    samples: list[dict[str, Any]],
+    level_key: str,
+    alignment_db: float,
+    position_index: int,
+) -> float:
+    """Score one seat with the same frequency/SNR weights as the optimizer."""
+    numerator = 0.0
+    denominator = 0.0
+    for sample in samples:
+        weight = float(sample["position_weights"][position_index])
+        error = abs(
+            float(sample[level_key][position_index])
+            + alignment_db
+            - float(sample["target_db"])
+        )
+        numerator += weight * error
+        denominator += weight
     return numerator / max(denominator, 1.0e-12)
 
 
@@ -340,22 +441,31 @@ def pairwise_diversity(positions: list[dict[str, dict[str, Any]]], sources: list
     maximum = 0.0
     for left_index in range(len(sources)):
         for right_index in range(left_index + 1, len(sources)):
-            left_values: list[complex] = []
-            right_values: list[complex] = []
+            frequency_coherences = []
             for frequency in (31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 150.0):
+                left_values: list[complex] = []
+                right_values: list[complex] = []
                 for position in positions:
                     left_values.append(response_value(position[sources[left_index]], frequency, reference_db))
                     right_values.append(response_value(position[sources[right_index]], frequency, reference_db))
-            numerator = abs(sum(a.conjugate() * b for a, b in zip(left_values, right_values)))
-            denominator = math.sqrt(sum(abs(value) ** 2 for value in left_values) * sum(abs(value) ** 2 for value in right_values))
-            coherence = numerator / max(denominator, 1.0e-12)
+                numerator = abs(sum(a.conjugate() * b for a, b in zip(left_values, right_values)))
+                denominator = math.sqrt(sum(abs(value) ** 2 for value in left_values) * sum(abs(value) ** 2 for value in right_values))
+                frequency_coherences.append(numerator / max(denominator, 1.0e-12))
+            # Coherence must be computed at each frequency.  Concatenating all
+            # bins first lets a pure delay rotate phase across frequency and
+            # falsely look like spatial actuator diversity.
+            coherence = percentile(frequency_coherences, 0.90)
             maximum = max(maximum, coherence)
-            pairs.append({"a": sources[left_index], "b": sources[right_index], "coherence": round(coherence, 4)})
+            pairs.append({
+                "a": sources[left_index], "b": sources[right_index],
+                "p90_frequency_coherence": round(coherence, 4),
+                "median_frequency_coherence": round(statistics.median(frequency_coherences), 4),
+            })
     return {
         "pairs": pairs,
         "maximum_coherence": round(maximum, 4),
         "independence_warning": maximum >= 0.985,
-        "interpretation": "1.0에 가까우면 두 출력이 같은 위치/같은 물리 우퍼처럼 동작해 MIMO 자유도가 줄어듭니다.",
+        "interpretation": "주파수별 공간 coherence의 P90이 1.0에 가까우면 두 출력이 같은 위치/같은 물리 우퍼처럼 동작해 MIMO 자유도가 줄어듭니다.",
     }
 
 
@@ -468,9 +578,19 @@ def write_report(path: Path, result: dict[str, Any]) -> None:
             "",
             f"- 타깃 MAE: {item['before_target_mae_db']} → {item['after_target_mae_db']} dB",
             f"- 좌석 편차: {item['before_spatial_std_db']} → {item['after_spatial_std_db']} dB",
+            f"- 위치별 타깃 MAE: {item.get('before_position_mae_db', [])} → {item.get('after_position_mae_db', [])} dB",
             f"- 저역 late/early energy: {item['before_modal_tail_db']} → {item['after_modal_tail_db']} dB (모델 예측)",
             "",
         ]
+    condition = metrics.get("regularized_condition_number_1", {})
+    lines += [
+        "## 수치 안정성",
+        "",
+        f"- 정규화 행렬 1-노름 조건수: median {condition.get('median')} / P95 {condition.get('p95')} / max {condition.get('maximum')}",
+        f"- 자동 diagonal loading 적용 bin: {condition.get('adaptive_loading_bins', 0)}",
+        "- 조건수는 정규화가 적용된 실제 선형계의 ||A||₁||A⁻¹||₁이며, 피벗 비율 근사값이 아니다.",
+        "",
+    ]
     lines += ["## 보정 가능성 분류", ""]
     for item in audit:
         lines.append(f"- **{item['label']}** — `{item['classification']}` / `{item['status']}`: {item['action']}")
@@ -675,15 +795,15 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     actuator_count = len(sources)
     path_spectra = [[0j] * (FFT_LENGTH // 2 + 1) for _ in range(actuator_count * 2)]
     condition_values = []
+    actuator_confidence_values: dict[str, list[float]] = {source: [] for source in sources}
+    adaptive_loading_values: list[float] = []
+    adaptive_loading_frequency_bins: set[int] = set()
     control_weights = []
     support_linear = 10.0 ** (support_penalty_db / 20.0)
-    rear_limit = 10.0 ** (max(0, -woofer_trim) / 20.0)
     for source in sources:
-        if source.startswith("sub"):
-            control_weights.append(support_linear * rear_limit)
-        else:
-            control_weights.append(support_linear)
+        control_weights.append(support_linear)
     strength_regularization = {"safe": 0.080, "balanced": 0.030, "maximum": 0.012}[strength]
+    uncertainty_regularization = {"safe": 0.120, "balanced": 0.060, "maximum": 0.025}[strength]
     prior = {"safe": 0.080, "balanced": 0.035, "maximum": 0.015}[strength]
     spectral_continuity = {"safe": 0.120, "balanced": 0.060, "maximum": 0.025}[strength]
     solution_blend = {"safe": 0.25, "balanced": 0.40, "maximum": 0.65}[strength]
@@ -744,12 +864,23 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             confidence_weights = spatial_confidence_weights(
                 engine, positions, sources, max(20.0, frequency), spatial_mode,
             )
+            column_confidence = [
+                actuator_confidence(
+                    positions, source, max(20.0, frequency), confidence_weights,
+                )
+                for source in sources
+            ]
+            for source, confidence in zip(sources, column_confidence):
+                actuator_confidence_values[source].append(confidence)
             # Keep the weighted SISO arrival phase instead of asking the inverse
             # for a non-causal zero-phase room response. MIMO changes level and
             # seat variance while the common causal delay remains short.
             baseline_pressure = sum(
-                confidence_weights[index] * row[channel] * base_spectra[channel][bin_index]
-                for index, row in enumerate(h)
+                confidence_weights[position_index] * sum(
+                    row[actuator] * base_vectors[channel][actuator]
+                    for actuator in range(actuator_count)
+                )
+                for position_index, row in enumerate(h)
             )
             desired_phase = cmath.phase(baseline_pressure) if abs(baseline_pressure) > 1.0e-12 else 0.0
             normalized_target_amp = 10.0 ** ((target_level(
@@ -772,9 +903,22 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                     usable_penalty += 30.0 * (1.0 - max(0.0, frequency / max(natural_low, 1.0))) ** 2
                 primary_weight = 1.0 if actuator == channel else control_weights[actuator]
                 regularization = strength_regularization * max(energy_scale, 1.0e-6) * primary_weight ** 2 * usable_penalty
-                gram[actuator][actuator] += regularization + prior + continuity
+                confidence = column_confidence[actuator]
+                # Expected-error robustification for uncorrelated transfer
+                # uncertainty: E[(H+dH)^H W (H+dH)] contributes a positive
+                # diagonal term.  A weak band-limited actuator is therefore
+                # discouraged without discarding an otherwise useful seat.
+                uncertainty_ratio = (1.0 - confidence) ** 2 / max(confidence * confidence, 0.04)
+                uncertainty = uncertainty_regularization * max(energy_scale, 1.0e-6) * uncertainty_ratio
+                gram[actuator][actuator] += regularization + uncertainty + prior + continuity
                 rhs[actuator] += prior * base_vectors[channel][actuator] + continuity * previous[actuator]
-            solution, condition = solve_complex(gram, rhs)
+            # A true condition number above 1e4 makes the solution sensitive
+            # to small transfer-function errors.  Increase isotropic diagonal
+            # loading only as much as needed, then report the intervention.
+            solution, condition, relative_loading, loading_attempts = solve_conditioned_complex(gram, rhs)
+            if loading_attempts:
+                adaptive_loading_frequency_bins.add(bin_index)
+                adaptive_loading_values.append(relative_loading)
             solution = [
                 base + solution_blend * (candidate - base)
                 for base, candidate in zip(base_vectors[channel], solution)
@@ -844,7 +988,11 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         engine.write_float_stereo(path, output_paths[output * 2], output_paths[output * 2 + 1])
         files.append({"output": output, "label": label, "file": path.name, "sha256": sha256(path), "channels": 2, "frames": TAPS, "format": "float32"})
 
-    graph_frequencies = [20.0 * (25.0 ** (index / 159.0)) for index in range(160)]
+    # Keep the review graph full-band even though the MIMO solve is deliberately
+    # limited to the modal/crossover band.  A 20--500 Hz-only graph hid the
+    # untouched SISO hand-off and made a safe low-frequency design look like a
+    # truncated result in the Web UI.
+    graph_frequencies = [20.0 * (1000.0 ** (index / 319.0)) for index in range(320)]
     prediction: dict[str, Any] = {}
     graphs: dict[str, Any] = {}
     channel_response_samples: dict[str, list[dict[str, Any]]] = {}
@@ -964,6 +1112,10 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "effective_target_db": [round(value, 4) for value in target_curve_values],
             "raw_measured_db": [round(value, 4) for value in before_curve_raw],
             "raw_predicted_db": [round(value, 4) for value in after_curve_raw],
+            "raw_measured_min_db": [round(min(sample["before_levels"]), 4) for sample in response_samples],
+            "raw_measured_max_db": [round(max(sample["before_levels"]), 4) for sample in response_samples],
+            "raw_predicted_min_db": [round(min(sample["after_levels"]), 4) for sample in response_samples],
+            "raw_predicted_max_db": [round(max(sample["after_levels"]), 4) for sample in response_samples],
             "level_alignment_db": {
                 "measured": round(before_level_alignment_db, 3),
                 "predicted": round(after_level_alignment_db, 3),
@@ -1014,6 +1166,18 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "before_level_alignment_db": round(common_before_level_alignment_db, 3),
             "after_level_alignment_db": round(common_after_level_alignment_db, 3),
             "level_reference_scope": "one common Left/Right/MIMO-bank reference",
+            "before_position_mae_db": [
+                round(position_aligned_mae(
+                    scored_samples, "before_levels", common_before_level_alignment_db, position,
+                ), 3)
+                for position in range(len(positions))
+            ],
+            "after_position_mae_db": [
+                round(position_aligned_mae(
+                    scored_samples, "after_levels", common_after_level_alignment_db, position,
+                ), 3)
+                for position in range(len(positions))
+            ],
         })
         graphs[channel_name]["measured_db"] = [
             round(value + common_before_level_alignment_db, 4)
@@ -1030,7 +1194,25 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "scope": "one common Left/Right/MIMO-bank reference",
             "independent_channel_normalization": False,
         }
+        for key, alignment in (
+            ("measured_min_db", common_before_level_alignment_db),
+            ("measured_max_db", common_before_level_alignment_db),
+            ("predicted_min_db", common_after_level_alignment_db),
+            ("predicted_max_db", common_after_level_alignment_db),
+        ):
+            graphs[channel_name][key] = [
+                round(value + alignment, 4)
+                for value in graphs[channel_name][f"raw_{key}"]
+            ]
 
+    per_position_pass = all(
+        after <= before + 0.75
+        for channel in ("left", "right")
+        for before, after in zip(
+            prediction[channel]["before_position_mae_db"],
+            prediction[channel]["after_position_mae_db"],
+        )
+    )
     improvement_pass = all(
         prediction[channel]["after_target_mae_db"] <= prediction[channel]["before_target_mae_db"] + 0.25
         and prediction[channel]["after_spatial_std_db"] <= prediction[channel]["before_spatial_std_db"] + 0.10
@@ -1058,6 +1240,8 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
     mimo_common_attenuation_db = max(0.0, -db(scale))
     total_common_attenuation_db = base_common_attenuation_db + mimo_common_attenuation_db
     relative_compensation_limit_pass = total_common_attenuation_db <= float(max_boost) + 0.25
+    condition_limit = 10_000.0
+    condition_pass = bool(condition_values) and max(condition_values) <= condition_limit
     warnings = []
     if diversity["independence_warning"]:
         warnings.append("일부 제어원의 공간 응답이 거의 같아 독립 MIMO 자유도가 낮습니다. 우퍼 위치/배선을 확인하세요.")
@@ -1065,14 +1249,16 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
         warnings.append("일부 sweep SNR이 권장 15 dB 미만입니다. 결과는 생성되지만 재측정을 권장합니다.")
     if scale < 0.70:
         warnings.append("최악의 상관 입력 headroom을 지키기 위해 MIMO bank 전체가 3 dB 이상 감쇄되었습니다.")
+    if not condition_pass:
+        warnings.append("적응형 정규화 후에도 전달행렬 조건수가 10,000을 넘었습니다. 수치적으로 불안정하므로 적용을 차단합니다.")
     for channel in ("left", "right"):
         if prediction[channel]["after_modal_tail_db"] > prediction[channel]["before_modal_tail_db"] + 1.5:
             warnings.append(f"{channel.title()}의 평활 전달함수 기반 impulse-tail proxy가 1.5 dB 넘게 악화되었습니다. 적용을 차단하며 이를 실제 RT60/잔향 측정으로 해석하지 않습니다.")
 
     model_pass = (
         finite_pass and headroom_pass and causality_pass and improvement_pass
-        and modal_tail_pass and independent_positions["pass"]
-        and common_reference_pass and relative_compensation_limit_pass
+        and modal_tail_pass and independent_positions["pass"] and per_position_pass
+        and common_reference_pass and relative_compensation_limit_pass and condition_pass
     )
     # All actuator responses were captured against the same playback/capture
     # clock before design.  A successful multichannel complex prediction is an
@@ -1099,6 +1285,18 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "strength": strength,
             "solution_blend": solution_blend,
             "regularization": "frequency-dependent Tikhonov, adjacent-bin spectral continuity, primary-path prior and measured usable-band penalty",
+            "robust_uncertainty": {
+                "model": "uncorrelated multiplicative transfer uncertainty represented as actuator-frequency diagonal loading",
+                "row_confidence": "quadratic mean across actuators; never discard a seat solely because one band-limited actuator is weak",
+                "actuator_confidence": {
+                    source: {
+                        "median": round(statistics.median(values), 4) if values else None,
+                        "p10": round(percentile(values, 0.10), 4) if values else None,
+                    }
+                    for source, values in actuator_confidence_values.items()
+                },
+                "strength_coefficient": uncertainty_regularization,
+            },
             "support_penalty_db": support_penalty_db,
             "woofer_trim_constraint_db": woofer_trim,
             "crossover": {
@@ -1131,11 +1329,18 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             },
             "stereo_broad_rolloff_corroboration": stereo_rolloff_summary,
             "usable_low_hz": {key: round(value, 2) for key, value in usable_lows.items()},
-            "condition_surrogate": {"median": round(statistics.median(condition_values), 3), "p95": round(percentile(condition_values, 0.95), 3), "maximum": round(max(condition_values), 3)},
+            "regularized_condition_number_1": {
+                "median": round(statistics.median(condition_values), 3),
+                "p95": round(percentile(condition_values, 0.95), 3),
+                "maximum": round(max(condition_values), 3),
+                "limit": condition_limit,
+                "adaptive_loading_bins": len(adaptive_loading_frequency_bins),
+                "maximum_relative_diagonal_loading": round(max(adaptive_loading_values, default=0.0), 8),
+            },
             "actuator_diversity": diversity,
             "spatial_weighting": {
                 "mode": spatial_mode,
-                "method": "frequency-dependent geometric position weights multiplied by minimum per-actuator measurement confidence, normalized once per frequency",
+                "method": "frequency-dependent geometric position weights multiplied by quadratic-mean row observability, normalized once per frequency",
                 "representative_100_hz_weights": [
                     round(value, 6)
                     for value in engine.spatial_position_weights(100.0, len(positions), spatial_mode)
@@ -1170,7 +1375,9 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
                 "correlated_input_headroom": headroom_pass,
                 "common_causality": causality_pass,
                 "predicted_target_and_spatial_non_regression": improvement_pass,
+                "every_measured_position_target_non_regression": per_position_pass,
                 "predicted_modal_tail_non_regression": modal_tail_pass,
+                "regularized_condition_number": condition_pass,
                 "one_common_level_reference": common_reference_pass,
                 "one_common_bank_gain": True,
                 "relative_compensation_limit": relative_compensation_limit_pass,
@@ -1189,7 +1396,7 @@ def build(session_path: Path, output_dir: Path, options: dict[str, Any], engine_
             "family": "robust multichannel weighted pressure matching",
             "not_product_clone": "independent AudioDSP implementation; not Dirac ART",
             "spatial": "three-position frequency-dependent spatial/SNR-weighted complex pressure error with matched power-mean prediction and weighted validation",
-            "stability": "Tikhonov control effort, adjacent-frequency continuity, primary prior, usable-band and per-frequency measurement-confidence weighting, actual sub-output trim bound, global worst-case row-sum headroom",
+            "stability": "uncertainty-aware Tikhonov control effort, true 1-norm condition monitoring with adaptive diagonal loading, adjacent-frequency continuity, primary prior, usable-band and per-actuator measurement-confidence weighting, actual sub-output trim bound, global worst-case row-sum headroom",
             "phase": "bulk-arrival-restored complex low-frequency optimization, common L/R base phase and one common causal delay",
             "crossover": "minimum-phase LR4 branch spectra are part of the transfer matrix and exported FIR bank; no extra runtime stage",
         },
@@ -1279,6 +1486,21 @@ def synthetic_response(frequencies: list[float], actuator: int, position: int) -
 def self_test(engine_path: Path) -> dict[str, Any]:
     os.environ["AUDIODSP_PLATFORM_CLASS"] = "test"
     engine = load_measurement_engine(engine_path)
+    condition_probe = matrix_condition_number_1([[1.0 + 0.0j, 0.0j], [0.0j, 100.0 + 0.0j]])
+    if abs(condition_probe - 100.0) > 1.0e-9:
+        raise MimoError("MIMO 1-노름 조건수 계산 회귀가 감지되었습니다.")
+    _probe_solution, stabilized_condition, stabilized_loading, stabilized_attempts = solve_conditioned_complex(
+        [[1.0 + 0.0j, 0.999999 + 0.0j], [0.999999 + 0.0j, 1.0 + 0.0j]],
+        [1.0 + 0.0j, 0.0j],
+    )
+    if stabilized_condition > 10_000.0 or stabilized_loading <= 0.0 or stabilized_attempts <= 0:
+        raise MimoError("MIMO ill-conditioned matrix 자동 안정화 회귀가 감지되었습니다.")
+    _singular_solution, singular_condition, singular_loading, singular_attempts = solve_conditioned_complex(
+        [[1.0 + 0.0j, 1.0 + 0.0j], [1.0 + 0.0j, 1.0 + 0.0j]],
+        [1.0 + 0.0j, 0.0j],
+    )
+    if singular_condition > 10_000.0 or singular_loading <= 0.0 or singular_attempts <= 0:
+        raise MimoError("MIMO singular matrix diagonal-loading 복구 회귀가 감지되었습니다.")
     equal_bass_weights = engine.spatial_position_weights(100.0, 3, "equal")
     center_bass_weights = engine.spatial_position_weights(100.0, 3, "center")
     center_treble_weights = engine.spatial_position_weights(10_000.0, 3, "center")
@@ -1318,8 +1540,17 @@ def self_test(engine_path: Path) -> dict[str, Any]:
             fixtures[mode] = (session_path, directory)
             result = build(session_path, directory, {"target": "flat", "preset": "none", "mimo_high_hz": 150, "mimo_strength": "safe", "mimo_support_penalty_db": 6, "woofer_trim_db": 0, "crossover_enabled": True, "crossover_frequency_hz": 100}, engine_path, allow_unsupported=True)
             invariant_checks = result["self_validation"]["core_checks"]
-            if not all(invariant_checks[key] for key in ("finite", "correlated_input_headroom", "common_causality")):
+            if not all(
+                invariant_checks[key]
+                for key in (
+                    "finite", "correlated_input_headroom", "common_causality",
+                    "regularized_condition_number", "every_measured_position_target_non_regression",
+                )
+            ):
                 raise MimoError(f"합성 MIMO 구조·안전 검증 실패: {mode}: {json.dumps(result['self_validation'], ensure_ascii=False)}")
+            condition = result["mimo"]["regularized_condition_number_1"]
+            if float(condition["maximum"]) > float(condition["limit"]):
+                raise MimoError(f"합성 MIMO 조건수 안정화 실패: {mode}: {json.dumps(condition, ensure_ascii=False)}")
             if len(result["mimo_files"]) != 4 or any(item["frames"] != TAPS for item in result["mimo_files"]):
                 raise MimoError(f"MIMO 파일 형식 실패: {mode}")
             expected_crossover = mode in ("mimo_one_sub", "mimo_dual_sub")
@@ -1335,6 +1566,18 @@ def self_test(engine_path: Path) -> dict[str, Any]:
                 for value in result["mimo"]["spatial_weighting"]["representative_100_hz_weights"]
             ):
                 raise MimoError(f"MIMO 100 Hz 위치 가중 회귀 실패: {mode}")
+            graph = result["graphs"]["left"]
+            if float(graph["frequency"][0]) > 20.01 or float(graph["frequency"][-1]) < 19_900.0:
+                raise MimoError(f"MIMO 결과 그래프 전체 대역 회귀 실패: {mode}")
+            graph_length = len(graph["frequency"])
+            if not all(
+                len(graph[key]) == graph_length
+                for key in (
+                    "measured_db", "predicted_db", "target_db", "measured_min_db",
+                    "measured_max_db", "predicted_min_db", "predicted_max_db",
+                )
+            ):
+                raise MimoError(f"MIMO 위치 범위 그래프 길이 불일치: {mode}")
             results.append({
                 "mode": mode,
                 "pass": True,
@@ -1348,6 +1591,9 @@ def self_test(engine_path: Path) -> dict[str, Any]:
                 "causality": result["mimo"]["causality"],
                 "target_level_normalization": result["mimo"]["target_level_normalization"],
                 "spatial_weighting": result["mimo"]["spatial_weighting"],
+                "regularized_condition_number_1": condition,
+                "robust_uncertainty": result["mimo"]["robust_uncertainty"],
+                "graph_coverage_hz": [graph["frequency"][0], graph["frequency"][-1]],
             })
         # Every MIMO-specific value exposed by the FIR form gets an actual
         # 32768-tap 2x4 build.  Common target/voicing controls are covered by

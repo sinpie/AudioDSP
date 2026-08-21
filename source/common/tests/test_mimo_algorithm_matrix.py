@@ -74,6 +74,9 @@ def main() -> int:
                 "causality": item.get("causality"),
                 "target_level_normalization": item.get("target_level_normalization"),
                 "spatial_weighting": item.get("spatial_weighting"),
+                "regularized_condition_number_1": item.get("regularized_condition_number_1"),
+                "robust_uncertainty": item.get("robust_uncertainty"),
+                "graph_coverage_hz": item.get("graph_coverage_hz"),
             }
             for item in report.get("topologies", [])
         ],

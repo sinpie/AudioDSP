@@ -1,5 +1,17 @@
 # AudioDSP 계획과 기준선
 
+## 2026-08-21 v24 MIMO 수학·UI 감사
+
+- [x] 현재 2×4 optimizer의 전달행렬, 타깃 기준, crossover, headroom, 공통 gain과 인과화 경로 재유도
+- [x] 실제 1-노름 조건수와 조건부 자동 diagonal loading 구현
+- [x] 위치 행 신뢰도와 actuator별 transfer uncertainty regularization 분리
+- [x] Woofer trim의 이중 regularization 제거, 실제 physical-output bound로 단일화
+- [x] 모든 측정 위치 target MAE 비악화 gate와 위치 범위 그래프 추가
+- [x] 합산 측정이 독립 정보인지 closure 검증인지 SISO/MIMO별 역할 분리
+- [x] 세션 선행 탭, 상태/비활성 이유, 스크롤 복원, MIMO 전용 옵션 카드와 결과 진단 정리
+- [x] MIMO full option matrix, 교차 플랫폼 Web 흐름 smoke와 Pi2/3/4/5 release materialization PASS 기록; Linux CamillaDSP full matrix 재실행 조건도 명시
+- [x] 검증된 변경만 commit하고 현재 Git branch push
+
 ## 2026-08-21 v22/v23 수학·실측 감사 · 완료
 
 - [x] 저장 응답의 fractional-octave 평활을 dB 산술평균에서 전달 파워 평균으로 수정

@@ -1,5 +1,20 @@
 # 변경 이력
 
+## 2026-08-21 · v24 MIMO 수학 안정화·측정 UI 연속성
+
+- MIMO 정규화 행렬의 피벗 비율을 condition처럼 표시하던 진단을 실제 induced 1-norm condition number `||A||₁||A⁻¹||₁`로 교체
+- 조건수 10,000 초과 주파수에 필요한 만큼만 diagonal loading을 자동 추가하고 중앙/P95/최대 조건수, 적용 bin 수와 최대 추가량을 결과 JSON·보고서·Web에 기록
+- 한 band-limited actuator의 낮은 confidence가 측정 위치 전체를 제거하던 `min` 행 가중을 quadratic-mean row observability와 actuator별 uncertainty penalty로 분리
+- 음수 Woofer trim을 support penalty와 실제 Rear 전달 상한에 이중 적용하던 경로를 제거하고 `보조 출력 사용 제한`과 `우퍼 최종 트림`의 수학적 역할을 분리
+- MIMO 목표 phase를 Front 단독이 아니라 실제 배포 SISO+LR4 Front/Sub 합산 pressure로 계산하고, 제어원 coherence를 주파수별 공간 벡터의 P90으로 바꿔 지연 phase 회전을 독립성으로 오인하지 않도록 수정
+- 평균 MAE·좌석 편차만 좋아지고 한 위치가 악화되는 해를 막기 위해 모든 측정 위치의 target MAE 비악화 gate 추가; 20 Hz–20 kHz 전체 결과 그래프에 세 위치 예상 상·하한과 위치별 MAE 표시
+- `세션`을 1–6단계 선행 탭으로 분리하고 session 생성/검색/불러오기/삭제/MIMO 가용성을 한 화면에 배치; 활성 session 요약은 탭 위에 유지
+- SISO FIR 화면에서 MIMO 옵션을 숨기고 MIMO mode에서만 전달행렬→안정화→8경로 흐름과 핵심 옵션을 표시; 모드별 측정 설명을 실제 계산식에 맞게 분리
+- POST/A-B/계산 완료 뒤 현재 탭·스크롤을 복원하고 내부 FAIL 카드로 자동 focus/최상단 이동하지 않도록 navigation continuity 추가
+- 프로필 설정을 자주 쓰는 동작/FIR/우퍼 출력으로 묶고 Profile→Engine→Backup 순으로 재배치; 화면 용어를 `A/B 미리듣기`, `결과 검토`, `처리 블록` 등으로 통일
+- `세션`+1–6 실제 HTML을 렌더링하는 교차 플랫폼 Web smoke test를 추가하고 MIMO 19개 옵션, 세 토폴로지 기준, Pi2/3/4/5 materialization을 무음 PASS
+- 수식, 합산 측정의 역할, 위상 동기 제한, UI 판단을 `MIMO_MATHEMATICAL_AUDIT_20260821.md`에 기록
+
 ## 2026-08-21 · v23 사후 검증 출력 안정화
 
 - Pi5 v22 Preview 사후 검증에서 첫 L+Woofer만 30~130 Hz가 예상보다 5~18 dB 높았고 R+Woofer는 정상인 현상을 원본 UMIK 녹음, 입력 WAV, v21/v22 Front/Rear FIR FFT로 분리 분석

@@ -6,7 +6,7 @@
 
 1. `현황`: 다음 할 일, 전역 출력 볼륨, 실제 U7/DSP 상태, 현재 FIR 그래프
 2. `측정 · 보정`: calibration부터 정식 적용까지 여섯 단계
-3. `프로필 · 설정`: 전체 백업/복원, engine 설정, Speaker/Headphones 프로필 카드
+3. `프로필 · 설정`: Speaker/Headphones 프로필 카드, engine 설정, 전체 백업/복원
 
 모바일에서는 navigation이 하단 고정이고, PC에서는 콘텐츠 상단에 폭을 나눠 배치한다. 화면 사이를 이동해도 server-side 상태는 유지된다.
 
@@ -24,7 +24,7 @@
 
 ## 측정 화면
 
-상단 workflow는 PC 한 줄·모바일 3×2의 6단계 탭 `연결·Cal → 레벨 확인 → 위치 측정 → FIR 계산 → 검토·A/B → 정식 적용`이다. 선택한 단계의 패널 하나만 탭 바로 아래에 표시하며 긴 문서 anchor 이동을 사용하지 않는다.
+상단 workflow는 PC 한 줄·모바일 여러 줄의 7개 탭 `세션 → 측정 구성 → 레벨 확인 → 위치 측정 → FIR 계산 → 결과 검토 → 정식 적용`이다. 선택한 패널 하나만 탭 바로 아래에 표시하며 긴 문서 anchor 이동을 사용하지 않는다.
 
 - 모든 탭은 이전/현재/미래 상태와 관계없이 열 수 있다. 데이터가 아직 없는 단계는 선행 조건 안내를 표시하고, 실제 실행 버튼만 조건에 따라 비활성화한다.
 - 클릭·방향키·Home/End로 탭을 바꿀 수 있고 `role=tablist/tab/tabpanel`, `aria-selected`, `aria-current=step`을 함께 유지한다.
@@ -33,7 +33,7 @@
 - 재검사/재측정/재계산 버튼은 초기화 범위를 confirm 문구로 정확히 말한다.
 - 진행 중에는 progress, percent, 단계명, ETA를 0.5~1.5초 간격으로 polling한다. Polling은 DOM 수치만 바꾸며 페이지 전체를 새로고침하지 않는다. 작업 완료·위치 증가·물리 출력 변경처럼 화면 구조가 실제로 달라질 때만 한 번 reload한다.
 - 레벨 결과는 PASS/FAIL, 출력 조합별 SNR, 평가 대역, peak와 올릴 수 있는 안전 dBFS를 카드로 보여준다. 본 측정 결과는 원신호 SNR, 긴 ESS의 coherent integration 이득, 최종 유효 SNR을 한 문장 안에서 구분한다.
-- 활성 session의 ID, 생성 시각, 상태, 완료 위치, 이어갈 단계, FIR 결과 유무와 주석 편집은 1–6 단계 탭 바로 위에 항상 표시한다. 주석 저장은 별도 metadata만 바꾸며 어떤 측정·FIR 단계도 초기화하지 않는다.
+- `세션`은 번호가 붙은 1–6단계보다 앞선 독립 탭이다. 새 세션·저장 세션·검색·불러오기·삭제와 MIMO 사용 가능 여부를 이 탭에 모으고, 활성 session의 ID, 생성 시각, 상태, 완료 위치, 이어갈 단계, FIR 결과 유무와 주석 편집은 단계 탭 바로 위에 항상 표시한다. 주석 저장은 별도 metadata만 바꾸며 어떤 측정·FIR 단계도 초기화하지 않는다.
 - session은 생성 즉시 자동 저장한다. 1단계의 저장 session 목록은 최신순으로 ID·시각·측정 구성·완료 단계·위치·FIR 유무·주석을 함께 보여주고, `이어하기`는 파일 무결성을 확인한 뒤 저장된 1–6 완료 지점 전체를 복원한다. `삭제`는 복구 불가 범위와 현재 정식 FIR 불변을 confirm에 표시하고 정확한 session 하나만 지운다. 작업 중 session 전환·삭제는 차단한다.
 - 저장 session 목록은 ID·날짜·주석 client-side 검색을 제공한다. 활성 주석을 편집하면 즉시 `저장되지 않은 주석` 상태를 표시하고, 저장 전에 페이지를 떠날 때만 확인한다.
 - 레벨 검사를 누르는 순간 현재 U7 물리 출력을 session의 `measurement_profile`로 고정한다. 화면은 현재/고정 경로의 일치 여부를 별도 lock 카드로 보여주고, 불일치하면 위치 측정과 A/B를 비활성화한다.
@@ -49,20 +49,22 @@
 - 결과의 `Woofer 최종 trim`은 FIR 계산 옵션을, `측정 시 Woofer 감쇄`는 sweep SNR 확보용 측정 조건을 별도 항목으로 표시한다.
 - 결과에 기록된 `algorithm_revision`이 현재 엔진과 다르면 측정 원본은 보존하되 이전 계산임을 경고하고 4단계 FIR 재계산 전 Preview/Apply를 차단한다.
 - 최신 결과라도 `self_validation.overall_pass=false`이면 다운로드와 A/B Preview는 허용하지만 정식 Apply는 UI와 엔진 양쪽에서 차단한다.
-- 자동 검증 체크리스트는 모든 core/FIR, 독립 3위치, L/R/Woofer target-fit, crossover 합산, SNR 판정을 `PASS`, `FAIL`, `대기`, `해당 없음`으로 표시한다. FAIL 행은 빨간색과 함께 실제 화면의 `1 · 연결·Cal`, `2 · 레벨 확인`, `3 · 위치 측정`, `4 · FIR 계산`, `5 · 검토·A/B` 단계명과 실제 select/button 문구를 사용한 직접 행동 지침을 제공한다. 안내에 언급된 단계는 바로 여는 버튼도 함께 만들며, 탭 이동만으로 측정값은 바뀌지 않는다. 실행할 수 없는 사후 측정을 해결 방법으로 쓰지 않는다.
+- 자동 검증 체크리스트는 모든 core/FIR, 독립 3위치, L/R/Woofer target-fit, crossover 합산, SNR 판정을 `PASS`, `FAIL`, `대기`, `해당 없음`으로 표시한다. FAIL 행은 빨간색과 함께 실제 화면의 `1 · 측정 구성`, `2 · 레벨 확인`, `3 · 위치 측정`, `4 · FIR 계산`, `5 · 결과 검토` 단계명과 실제 select/button 문구를 사용한 직접 행동 지침을 제공한다. 안내에 언급된 단계는 바로 여는 버튼도 함께 만들며, 탭 이동만으로 측정값은 바뀌지 않는다. 실행할 수 없는 사후 측정을 해결 방법으로 쓰지 않는다.
 - 체크리스트 바로 위에서 MAE를 판정 대역 평균 절대오차, P90을 주파수 지점 90%가 그 값 이내인 오차로 설명한다. 합산 FAIL은 signed median error를 사용해 Target보다 높은지/낮은지와 dB를 밝히고, `Woofer 최종 trim`, `우퍼 과잉 억제`, `Phase 방식`, `Crossover 주파수`의 실제 표시명으로 변경 방향을 안내한다.
 - 결과 카드는 `pass`, `pass_safe_upper_phase_limited`, `pass_safe_sum_phase_limited`, `fail_target`, `fail_upper_guard`를 구분하고, 위상 제한 PASS를 정확한 복소 위상 검증으로 표현하지 않는다.
 - 선택형 사후 검증 뒤 결과 그래프는 20 Hz~20 kHz의 실제 FIR 통과 실측, 계산 예상, 선택 target을 동시에 표시한다. 실측/예상 L/R은 각각 하나의 공통 기준만 사용한다. SNR 6~15 dB에서 경계값을 조금 넘으면 빨간 FAIL 대신 `판정 보류 · SNR 부족`과 실제 메뉴 `검증 초기화`, `검증 sweep 입력 -25 dBFS`를 표시한다. active sweep 오염 또는 noise floor 불일치와 응답 FAIL이 함께 감지되면 큰 MAE를 FIR 실패로 오인하지 않고 `판정 보류 · 출력 전환 감지`, `검증 초기화`, 같은 레벨 재측정, 자동 2초 무음 안정화를 표시한다. 전·후 바닥 차이만 있고 모든 음향 지표가 PASS면 PASS를 유지한다. 완료 카드에는 `저장 결과 재판정`을 두어 소리 없이 최신 판정식을 적용한다. FIR 입력값과 공통 FIR 감쇄 뒤 실제 출력이 다를 수 있음을 control 바로 아래에서 설명한다.
 - 사후 검증 PASS 뒤에는 내부 코드 `pass_measured` 대신 `사후 합산 실측 PASS`, SNR 6~15 dB는 `사용 PASS · 권장 미달`로 표시한다. 완료된 카드에서는 더 이상 Preview 선행을 요구하지 않고 `검증 초기화 → 이번 튜닝` 재실행 순서를 안내한다. 보정 가능성 표의 개발자용 classification/status 코드는 한국어 사용자 용어로 바꾸고, 차트의 범위와 표시 곡선을 SVG 접근성 설명에도 반영한다.
 - 결과의 `최대 상대 보상`과 `최대 룸 감쇄`는 목표 음압이 아니라 FIR 계산의 상한임을 결과 카드 바로 아래에 설명한다. 실제 예상 곡선은 딥 보호·crossover·전체 공통 gain까지 반영한 값이며, 사후 결과는 예상↔실측 MAE/P90으로 비교한다.
 - Pi4/5는 SISO와 MIMO Stereo/2.1/2.2를 구분하되 공통 timing reference가 없으면 MIMO 차단 이유를 표시한다. Pi2는 조건과 무관하게 선택할 수 없다.
-- MIMO 결과는 타깃 MAE, 좌석 편차, 평활 전달함수 기반 impulse-tail proxy, 기존 SISO 저역 레벨 기준 offset, 해 혼합 강도, 제어원 coherence, crossover, 실제 output별 headroom과 전체 보정 가능성 분류표를 보인다. impulse-tail proxy는 RT60/잔향 예측이 아니며 1.5 dB 초과 악화 시 적용을 차단한다.
+- SISO FIR 계산 화면에는 사용되지 않는 MIMO 옵션을 노출하지 않는다. MIMO mode일 때만 `세 위치 전달행렬 → 불확실성·조건수 안정화 → 32768탭×8경로` 카드와 `공동제어 상한`, `안정성/효과`, `보조 출력 사용 제한`을 주요 계산 옵션으로 표시한다.
+- MIMO 결과는 타깃 MAE, 세 위치별 MAE, 좌석 편차, 평활 전달함수 기반 impulse-tail proxy, 실제 1-노름 조건수 중앙/P95/최대, 자동 diagonal loading bin, actuator confidence P10, 기존 SISO 저역 레벨 기준 offset, 해 혼합 강도, 제어원 coherence, crossover, 실제 output별 headroom과 전체 보정 가능성 분류표를 보인다. 그래프의 굵은 선은 가중 평균, 가는 점선은 세 측정 위치 예상 범위다. 평균이 좋아져도 한 위치의 MAE가 0.75 dB 넘게 악화되면 적용을 차단한다. impulse-tail proxy는 RT60/잔향 예측이 아니며 1.5 dB 초과 악화 시 적용을 차단한다.
+- 모드별 `계산에 쓰는 방법`을 실제 수식과 맞춘다. MIMO에서 위상 동기된 독립 응답의 합산을 생성식에 중복 가중하지 않고, 합산 측정은 model closure/적용 후 검증으로 설명한다. `정밀 분리+합산 SISO`의 물리 합산 제약과 혼동하지 않는다.
 - 다운로드와 A/B는 비파괴라고 명시하고, 정식 적용 버튼만 덮어쓰기 경고를 낸다.
 - 모든 펼침 영역은 일반 카드와 구분되는 테두리·배경, 최소 48 px 제목 행과 오른쪽 vector chevron을 사용한다. 닫힘/열림에 따라 chevron 방향과 제목 accent가 바뀌며 브라우저 기본 marker는 중복 표시하지 않는다.
 
 ## 설정 화면
 
-- 전체 백업은 페이지 첫 영역이다. 복원은 ZIP 선택 → 무결성 검사 → 내용 확인 → 적용의 네 단계를 시각화한다.
+- 현재 스피커/헤드폰 프로필 카드와 오디오 엔진 설정을 먼저 배치하고, 자주 쓰지 않는 전체 백업·복원은 마지막 영역에 둔다. 복원은 ZIP 선택 → 무결성 검사 → 내용 확인 → 적용의 네 단계를 시각화한다.
 - Engine 표에서 chunksize를 바꾸면 오디오가 잠시 재시작된다고 표시한다.
 - 내부 키 `speaker/headphone`은 호환성을 위해 유지하지만 화면의 두 카드는 각각 `Speaker 출력 체인`, `Headphone 잭 출력 체인`이다. 이 설치에서는 둘 다 실제 스피커에 연결됨을 subtitle로 명시한다. U7 실제 선택 카드만 `active-profile` 외곽선과 badge를 가진다.
 - 각 카드 상단은 Front FIR → Front/Rear routing → speaker chain의 compact signal-flow를 SVG 아이콘과 함께 표시한다.
@@ -78,6 +80,8 @@
 - Preview가 active이면 현재 설정 표·signal-flow·FIR API는 저장된 profile mode보다 실제 임시 CamillaDSP 구성을 우선한다. 저장 `copy_front`/Preview `separate`와 그 반대 방향을 모두 정확히 표시하고 복귀 즉시 저장 mode로 돌아간다.
 - invalid 요청은 원래 상태를 유지한 채 해당 화면에 오류를 표시한다.
 - restore는 server-side 자동 rollback을 만든 뒤에만 실제 파일을 교체한다.
+- POST 직전 현재 path, 선택 단계와 scroll Y를 sessionStorage에 기록한다. 같은 화면으로 돌아올 때 정확한 위치를 먼저 복원하고, 계산 완료처럼 다음 단계가 명확한 경우에만 논리적 다음 탭을 연다. A/B·설정 버튼 때문에 화면 최상단으로 이동하지 않는다.
+- 최상위 성공/실패 메시지만 고정 toast와 `role=alert`로 알린다. 내부 진단 `.failure`는 자동 focus하지 않아 사용자가 보고 있던 카드와 스크롤을 유지한다.
 
 ## 테마와 접근성
 

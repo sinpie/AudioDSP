@@ -14,7 +14,7 @@ AudioDSP의 MIMO는 Dirac ART의 복제품이 아니다. 공개 연구의 robust
 
 같은 T5S의 좌·우 입력은 두 우퍼가 아니다. 알고리즘과 보고서는 이를 `sub_pair` 한 제어원으로 취급한다. 독립 우퍼 모드는 실제로 서로 다른 위치에 놓고 U7 Rear L/R에 각각 연결한 경우에만 선택한다.
 
-Sub가 있는 topology는 기본 ON/100 Hz LR4 crossover의 complex minimum-phase branch spectrum을 전달행렬 자체에 포함한다. 따라서 최적화가 Front HPF/Woofer LPF를 우회하지 않으며, 결과는 8개 convolution path WAV에 이미 내장된다. 주파수별 noise confidence를 위치 가중치에 반영하고, `correction_low_hz` 아래에서는 최적화를 하지 않되 crossover routing은 유지한다. Woofer trim은 regularization 힌트가 아니라 Rear physical-output row-sum의 실제 transfer 상한으로 적용한다.
+Sub가 있는 topology는 기본 ON/100 Hz LR4 crossover의 complex minimum-phase branch spectrum을 전달행렬 자체에 포함한다. 따라서 최적화가 Front HPF/Woofer LPF를 우회하지 않으며, 결과는 8개 convolution path WAV에 이미 내장된다. 주파수별 noise confidence는 위치 전체를 버리지 않고 actuator별 불확실성 regularization에 반영하며, `correction_low_hz` 아래에서는 최적화를 하지 않되 crossover routing은 유지한다. Woofer trim은 regularization에 중복 적용하지 않고 Rear physical-output row-sum의 실제 transfer 상한으로만 적용한다.
 
 보고서의 `before/after_modal_tail_db`는 512점 평활 전달함수에서 만든 impulse-tail proxy다. 실제 RT60이나 late reverberation 예측이 아니며 1.5 dB 넘게 악화될 때 적용을 차단하는 보수적 ringing gate로만 쓴다. 실제 잔향 판정은 저장된 deconvolution impulse의 octave EDT/T20과 적용 후 측정으로 한다.
 
@@ -55,38 +55,40 @@ Sub가 있는 topology는 기본 ON/100 Hz LR4 crossover의 complex minimum-phas
 
 ```text
 h_p(f) = [H_p,1(f), ..., H_p,A(f)]
-q_p(f) = normalize(w_p(f) min_a c_p,a(f))
+q_p(f) = normalize(w_p(f) RMS_a(c_p,a(f)))
 
 J(g) = Σ_p q_p |h_p g - d|²
-     + gᴴΛ(f)g
+     + gᴴR_uncertainty(f)g
+     + gᴴΛ_control(f)g
      + ρ||g-g₀||²
      + κ||g-g_prev||²
 
-(HᴴQH + Λ + (ρ+κ)I)g
+(HᴴQH + R_uncertainty + Λ_control + (ρ+κ)I)g
   = HᴴQd + ρg₀ + κg_prev
 ```
 
-`w_p`는 SISO와 같은 위치 정책이다. `equal`은 세 위치 동일 가중이고 `center`도 룸 모드가 지배하는 200 Hz 이하에서는 동일 가중이다. 중앙 0.60 가중은 2 kHz 이상에만 도달하므로 현재 최대 150 Hz MIMO 대역에는 들어오지 않는다. `c_p,a`는 위치·제어원별 주파수 신뢰도이며 가장 낮은 제어원 신뢰도를 그 행의 상한으로 사용한다. v22부터 solver 목표 phase, 예측 그래프, 공간 표준편차, target MAE가 모두 이 `q_p(f)`를 공유한다.
+`w_p`는 SISO와 같은 위치 정책이다. `equal`은 세 위치 동일 가중이고 `center`도 룸 모드가 지배하는 200 Hz 이하에서는 동일 가중이다. 중앙 0.60 가중은 2 kHz 이상에만 도달하므로 현재 최대 150 Hz MIMO 대역에는 들어오지 않는다. `c_p,a`는 위치·제어원별 주파수 신뢰도다. actuator 전체의 quadratic mean은 위치 행의 관측 가능성을 정하고, 각 actuator의 가중 confidence는 `R_uncertainty` 대각 항을 정한다. 따라서 Front의 자연 저역 아래나 Woofer의 고역 위처럼 한 출력만 약한 경우에 위치 전체를 버리지 않는다. solver 목표 phase, 예측 그래프, 공간 표준편차, target MAE가 모두 같은 `q_p(f)`를 공유한다.
 
-`d`의 크기는 선택 target과 기존 SISO 저역 anchor로 정하고, phase는 가중 SISO 도착 phase를 유지한다. 이는 모든 위치에 영위상 응답을 강요하는 비인과 역필터가 아니다. `Λ`에는 Tikhonov 제어 에너지, 제어원 자연 재생대역 아래 penalty, 보조 제어원 사용 penalty가 들어간다. `g₀`는 검증된 SISO/crossover baseline, `g_prev`는 바로 앞 주파수 bin의 해다.
+`d`의 크기는 선택 target과 기존 SISO 저역 anchor로 정하고, phase는 실제 배포되는 SISO+LR4 Front/Sub 합산의 세 위치 가중 도착 phase를 유지한다. 이는 모든 위치에 영위상 응답을 강요하는 비인과 역필터가 아니다. `Λ`에는 Tikhonov 제어 에너지, 제어원 자연 재생대역 아래 penalty, 보조 제어원 사용 penalty가 들어간다. `g₀`는 검증된 SISO/crossover baseline, `g_prev`는 바로 앞 주파수 bin의 해다. 제어원 coherence는 주파수마다 세 위치 벡터로 계산한 뒤 P90을 쓰므로, 시간 지연의 phase 회전을 공간 독립성으로 오인하지 않는다.
 
 1. 세 위치의 선택 타깃에 대한 복소 pressure 오차
 2. 제어 에너지 Tikhonov regularization
 3. 기존 안전한 SISO L/R FIR에서 과도하게 벗어나지 않는 prior
 4. 각 제어원의 측정된 자연 저역 한계 아래 사용을 억제하는 주파수별 penalty
-5. 보조 제어원 및 우퍼의 사용량 penalty
+5. 보조 제어원 사용량 penalty와 actuator별 측정 불확실성 penalty. 우퍼 최종 trim은 별도 실제 출력 상한이다.
 
 추가 안전 처리:
 
 - MIMO 전에 L/R base FIR은 SISO와 같은 L/R 500~2,000 Hz 공통 측정·타깃 기준으로 설계하고 `normalize_fir_bank` common gain 한 번만 적용한다. MIMO target offset도 좌우에 하나만 사용하며, 최종 2×4 matrix는 설계된 출력 간 관계를 보존하는 global scale만 허용한다. 정규화하지 않은 중간값이나 Front-only 응답을 실제 Front+sub baseline과 비교해 false FAIL을 만들지 않는다.
 - MIMO 범위는 20–80/120/150 Hz 중 선택하며 끝에서 30 Hz raised-cosine으로 기존 SISO FIR에 전이한다.
 - 영위상 역필터를 요구하지 않고 기존 SISO 응답의 가중 도착 phase를 목표 phase로 유지한다.
+- 정규화 행렬은 피벗 비율이 아니라 실제 `||A||₁||A⁻¹||₁` 조건수를 계산한다. 10,000을 넘으면 필요한 최소 diagonal loading을 자동 추가하고 적용 bin 수를 보고한다.
 - 모든 경로에 하나의 공통 인과 지연을 적용하고 32768탭으로 절단·후단 taper한다.
 - 주파수별 각 물리 출력의 `|L path| + |R path|`를 0.999 이하로 투영한다. 변환·절단 후 다시 최악 상관입력 row sum을 검사하고 필요한 최소 global scale만 적용한다.
 - target MAE는 40 Hz부터 MIMO 상한 또는 130 Hz까지의 한 공통 reference-band level만 맞춘 뒤 응답 형상을 평가한다. 위치별·주파수별 normalize는 금지한다. 상관입력 headroom 때문에 생기는 broadband 감쇄는 `headroom.global_scale_db`와 raw graph로 별도 표시하므로, 단순 볼륨 저하를 음색 실패로 오판하지 않으면서 실제 감쇄를 숨기지도 않는다.
 - 대표 before/after 그래프는 `10 log10(Σq_p |H_p g|²)`의 가중 mean-square 응답이다. 좌석 편차는 같은 `q_p`의 weighted dB 표준편차이고, target MAE도 같은 위치 가중을 쓴다. 물리 출력 headroom과 최악 위치 안전 상한은 평균하지 않는다.
 - 두 programme speaker뿐인 `MIMO Stereo`는 전용 support 제어원이 없어 큰 cross-feed가 stereo target을 손상시키기 쉽다. 선택 강도의 15%만 기존 SISO에서 벗어나도록 제한한다. `MIMO 2.2`는 자유도가 큰 대신 narrow solution의 tail 위험을 줄이기 위해 선택 강도의 85%를 사용한다.
-- NaN/Inf, 정확한 tap/rate/format, manifest SHA-256, 인과성, headroom, 예측 타깃 오차와 공간 편차 비퇴행을 통과해야 Preview/Apply가 열린다.
+- NaN/Inf, 정확한 tap/rate/format, manifest SHA-256, 인과성, headroom, 예측 타깃 오차·공간 편차와 모든 측정 위치의 타깃 MAE 비퇴행, 조건수 제한을 통과해야 Preview/Apply가 열린다.
 - 출력은 `MIMO_Front_Left_LR_32768.wav` 등 네 stereo float32 WAV다. 각 WAV의 채널 0/1은 입력 L/R에서 해당 물리 출력으로 가는 두 전달 경로다.
 
 ## 측정 절차
@@ -102,6 +104,10 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 7. 적용에 쓰지 않은 별도 위치를 포함해 전/후 재측정하고 CPU load/XRUN을 확인한다.
 
 세 위치는 최소 운용 단위이지 방 전체 보증이 아니다. 넓은 소파나 여러 좌석을 보정하려면 향후 측정점 확장이 필요하며, 측정점만 늘리고 공간 가중을 설계하지 않으면 미측정 영역이 나빠질 수도 있다.
+
+독립 복소 전달함수가 공통 timing 기준으로 측정된 선형계에서는 L+Woofer/R+Woofer 합산은 독립 전달함수의 선형 결합이라 MIMO 생성 목적함수에 다시 넣지 않는다. 다시 넣으면 새 자유도가 아니라 같은 정보를 이중 가중할 수 있다. 합산 측정은 model closure와 적용 후 수락 검증에 사용한다. 독립 USB clock을 쓰는 정밀 SISO에서는 같은 녹음의 Walsh 위상 기준과 물리 합산 응답이 별도의 안전 제약으로 계속 필요하다.
+
+전체 수식 감사와 수정 근거는 [MIMO_MATHEMATICAL_AUDIT_20260821.md](MIMO_MATHEMATICAL_AUDIT_20260821.md)에 기록한다.
 
 ## 룸 튜닝 요소별 경계
 
@@ -150,6 +156,9 @@ MIMO 모드는 각 위치에서 모든 물리 제어원을 하나씩 독립 재�
 
 ## 2026-08-21 무음 알고리즘 회귀 결과
 
+- v24 수학 감사에서 condition pivot ratio를 실제 1-노름 조건수로 교체하고 조건수 10,000 초과 bin에 자동 diagonal loading을 추가했다. 출력별 주파수 confidence는 독립 uncertainty penalty로 분리했으며, Front/Woofer 중 하나가 대역 밖이라는 이유로 해당 위치 전체를 버리지 않는다.
+- 평균값만 좋아지고 특정 위치가 악화되는 해를 막기 위해 모든 측정 위치의 target MAE 비악화 gate를 추가했다. Web 결과는 평균 곡선과 세 위치 예상 상·하한, 위치별 MAE를 같이 표시한다.
+- 음수 Woofer trim을 support penalty와 physical-output bound에 이중 적용하던 경로를 제거했다. UI도 `보조 출력 사용 제한`과 `우퍼 최종 트림`을 서로 다른 제약으로 설명한다.
 - v22 수학 감사에서 `center`가 150 Hz 이하 MIMO에도 중앙 위치를 0.60으로 고정하던 오류를 수정했다. 이제 200 Hz 이하의 기하 가중은 1/3·1/3·1/3이고, 위치별 측정 신뢰도만 추가된다. solver·그래프·검증이 동일 가중을 사용하도록 회귀시험을 추가했다.
 - `Flat / 추가 억제 없음 / Woofer trim 0 dB / 최대 상대 보상 10 dB` 기준 합성 session은 MIMO Stereo, MIMO 2.1, MIMO 2.2 모두 finite/headroom/causality/타깃·공간 비악화/modal-tail 비악화 모델 검증을 PASS했다.
 - MIMO 전용 UI 값 19개를 실제 32768탭×8경로로 생성했다. 구조·형식·headroom 검사는 19/19 PASS했다.

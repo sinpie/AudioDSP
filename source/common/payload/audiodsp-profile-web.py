@@ -1274,17 +1274,17 @@ MEASUREMENT_MODE_OPTIONS = (
     ("lr", "L+우퍼 / R+우퍼 · 합산 SISO"),
     ("lrw_sum", "정밀 분리+합산 · L/R/우퍼/L+우퍼/R+우퍼 · 권장"),
     ("lrw", "표준 분리 SISO · L/R/우퍼"),
-    ("mimo_stereo", "MIMO 스테레오 · 프런트 L/R · Pi4/5"),
-    ("mimo_one_sub", "MIMO 2.1 · 프런트 L/R+T5S · Pi4/5"),
-    ("mimo_dual_sub", "MIMO 2.2 · 프런트 L/R+우퍼 2대 · Pi4/5"),
+    ("mimo_stereo", "MIMO 스테레오 · 프런트 L/R · Pi4/5·위상 동기"),
+    ("mimo_one_sub", "MIMO 2.1 · 프런트 L/R+T5S · Pi4/5·위상 동기"),
+    ("mimo_dual_sub", "MIMO 2.2 · 프런트 L/R+우퍼 2대 · Pi4/5·위상 동기"),
 )
 MEASUREMENT_MODE_HELP = {
     "lr": "각 스윕에서 프런트 L+우퍼, 프런트 R+우퍼가 함께 재생됩니다. 공통 FIR을 프런트에 한 번 처리한 뒤 우퍼로 복사합니다.",
     "lrw_sum": "위치마다 프런트 L → 프런트 R → 우퍼 → L+우퍼 → R+우퍼 → L+R+우퍼 동시 위상 순서로 측정합니다. 여섯 응답이 음압·교차항·상대 위상 제약으로 공동 FIR 합성에 사용되며, 어느 응답도 중복 평균하거나 개별 정규화하지 않습니다.",
     "lrw": "위치마다 프런트 L/R/우퍼 ESS 3회와 L+R+우퍼 동시 위상 기준 1회를 측정합니다. 물리 L+우퍼/R+우퍼 교차항이 없으므로 합산은 위상 기준과 보수적인 상한으로 계산합니다.",
-    "mimo_stereo": "프런트 L/R을 각각 독립 측정해 두 스피커를 공동 최적화합니다. 우퍼 상대 레벨은 사용하지 않습니다.",
-    "mimo_one_sub": "프런트 L, 프런트 R, T5S 한 대를 세 독립 물리 제어원으로 측정합니다. T5S 스테레오 입력은 한 우퍼로 취급합니다.",
-    "mimo_dual_sub": "프런트 L/R과 서로 다른 위치·배선의 우퍼 두 대를 네 독립 제어원으로 측정합니다.",
+    "mimo_stereo": "프런트 L/R을 각각 독립 측정해 두 스피커를 20–150 Hz에서 공동 최적화합니다. 세 위치와 출력–마이크 간 검증된 공통 위상 기준이 모두 필요합니다.",
+    "mimo_one_sub": "프런트 L, 프런트 R, T5S 한 대를 세 독립 물리 제어원으로 측정합니다. T5S 스테레오 입력은 한 우퍼로 취급하며 세 위치·공통 위상 기준이 필요합니다.",
+    "mimo_dual_sub": "프런트 L/R과 서로 다른 위치·배선의 우퍼 두 대를 네 독립 제어원으로 측정합니다. 두 우퍼가 같은 위치/신호이면 자유도가 늘지 않으며 세 위치·공통 위상 기준이 필요합니다.",
 }
 
 
@@ -1443,7 +1443,7 @@ def signal_flow_diagram(status: dict) -> str:
       <div class="signal-flow">
         <div class="signal-node">{ui_icon('input', 'Analog input')}<div><small>INPUT · 2 CH</small><b>U7 Line input</b><span>48 kHz · 24-bit device / 32-bit container</span></div></div>
         <div class="signal-wire" aria-hidden="true"><svg viewBox="0 0 70 20"><path d="M2 10h60"/><path d="m56 4 8 6-8 6"/></svg></div>
-        <div class="signal-node dsp-node">{ui_icon('dsp', 'CamillaDSP')}<div><small>DSP</small><b>{html.escape(dsp_label)}</b><span>{resolved.get('convolution_channels', 0)}ch convolution · chunk {settings.get('chunksize', '?')}</span></div></div>
+        <div class="signal-node dsp-node">{ui_icon('dsp', 'CamillaDSP')}<div><small>DSP</small><b>{html.escape(dsp_label)}</b><span>{resolved.get('convolution_channels', 0)}채널 컨볼루션 · 처리 블록 {settings.get('chunksize', '?')}</span></div></div>
         <div class="signal-wire" aria-hidden="true"><svg viewBox="0 0 70 20"><path d="M2 10h60"/><path d="m56 4 8 6-8 6"/></svg></div>
       <div class="signal-node route-node">{ui_icon('route', '채널 라우팅')}<div><small>라우팅 · 4채널</small><b>프런트 + 우퍼</b><span>프런트 L/R · 우퍼 L/R<br>{html.escape(rear_label)}</span></div></div>
         <div class="signal-wire" aria-hidden="true"><svg viewBox="0 0 70 20"><path d="M2 10h60"/><path d="m56 4 8 6-8 6"/></svg></div>
@@ -1498,6 +1498,20 @@ def measurement_panel(job: dict, preview: dict) -> str:
     installed = job.get("installed_calibrations") or {}
     capabilities = job.get("capabilities") or {}
     mimo_supported = bool(capabilities.get("mimo_supported"))
+    mimo_compute_supported = bool(capabilities.get("mimo_compute_supported"))
+    mimo_clock_shared = bool(capabilities.get("phase_clock_shared"))
+    if mimo_supported:
+        mimo_capability_html = f'''<section class="mimo-capability pass" data-measurement-step-content="session">
+          {ui_icon('check', 'MIMO 사용 가능')}<div><small>MIMO 공동제어 준비</small><b>Pi 연산·복소 위상 기준 PASS</b><span>세 위치를 측정하면 2×4 FIR 묶음을 만들 수 있습니다.</span></div>
+        </section>'''
+    elif mimo_compute_supported:
+        mimo_capability_html = f'''<section class="mimo-capability warn" data-measurement-step-content="session">
+          {ui_icon('warning', 'MIMO 위상 기준 필요')}<div><small>MIMO 공동제어 차단</small><b>Pi 연산 가능 · 출력–마이크 공통 위상 기준 없음</b><span>{html.escape(str(capabilities.get('reason') or '독립 DAC/ADC clock에서 얻은 출력 간 위상을 그대로 사용하지 않습니다.'))} 현재는 ‘정밀 분리+합산’을 사용하세요.</span></div>
+        </section>'''
+    else:
+        mimo_capability_html = f'''<section class="mimo-capability neutral" data-measurement-step-content="session">
+          {ui_icon('dsp', 'MIMO 연산 미지원')}<div><small>MIMO 공동제어</small><b>이 장치에서는 FIR 생성 비활성</b><span>{html.escape(str(capabilities.get('reason') or 'Pi4/5 64-bit에서 사용할 수 있습니다.'))}</span></div>
+        </section>'''
     selector = job.get("output_selector") or {}
     current_profile = selector.get("profile") if not selector.get("stale", True) else None
     measured_profile = job.get("measurement_profile")
@@ -1533,6 +1547,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
         and positions == total
         and (phase_result_count < phase_expected_count or phase_reliable_count < phase_expected_count)
     )
+    active_session_id = str(job.get("session_id", ""))
     if job.get("applied_profile"):
         current_step = 6
     elif result and not stale_result:
@@ -1547,25 +1562,47 @@ def measurement_panel(job: dict, preview: dict) -> str:
         current_step = 2
     else:
         current_step = 1
+    current_tab = str(current_step) if active_session_id else "session"
     result_validation = result.get("self_validation", {}) if result else {}
     result_crossover_check = result_validation.get("crossover_sum") or {}
     result_validation_pending = bool(result_crossover_check.get("required")) and result_crossover_check.get("pass") is None
     result_validation_failed = bool(result) and not stale_result and not result_validation_pending and not bool(result_validation.get("overall_pass"))
-    workflow_items = []
-    step_labels = ((1, "출력 설정"), (2, "레벨 확인"), (3, "위치 측정"), (4, "FIR 계산"), (5, "A/B 검토"), (6, "정식 적용"))
+    session_selected = current_tab == "session"
+    session_current_attr = ' aria-current="step"' if session_selected else ""
+    workflow_items = [
+        f'<button type="button" role="tab" class="flow-step session-step {"done" if active_session_id else "current"}" '
+        f'id="measurement-tab-session" aria-controls="measurement-panel-session" '
+        f'aria-selected="{"true" if session_selected else "false"}" '
+        f'tabindex="{"0" if session_selected else "-1"}" data-measurement-tab="session"'
+        f'{session_current_attr} '
+        f'aria-label="세션, {"선택 필요" if not active_session_id else "완료"}" '
+        f'title="측정 세션 생성·불러오기·삭제"><span>S</span><b>세션</b><small class="flow-state">{"선택 필요" if not active_session_id else "완료"}</small></button>'
+    ]
+    step_labels = ((1, "측정 구성"), (2, "레벨 확인"), (3, "위치 측정"), (4, "FIR 계산"), (5, "결과 검토"), (6, "정식 적용"))
     for number, label in step_labels:
-        classes = "current" if number == current_step else "done" if number < current_step else "future"
+        classes = (
+            "future" if not active_session_id else
+            "current" if number == current_step else
+            "done" if number < current_step else "future"
+        )
         step_has_failure = (result_validation_failed and number == 5) or ((premeasurement_validation_failed or phase_validation_failed) and not result and number == 3)
         if step_has_failure:
             classes += " validation-error"
-        content = f'<span>{number}</span><b>{label}</b>{"<em>FAIL</em>" if step_has_failure else ""}'
-        current_attr = ' aria-current="step"' if number == current_step else ""
-        selected = "true" if number == current_step else "false"
-        tabindex = "0" if number == current_step else "-1"
+        step_state_label = (
+            "FAIL" if step_has_failure else
+            "현재" if active_session_id and number == current_step else
+            "완료" if active_session_id and number < current_step else
+            "준비 전"
+        )
+        content = f'<span>{number}</span><b>{label}</b><small class="flow-state">{step_state_label}</small>'
+        current_attr = ' aria-current="step"' if active_session_id and number == current_step else ""
+        selected = "true" if current_tab == str(number) else "false"
+        tabindex = "0" if current_tab == str(number) else "-1"
         workflow_items.append(
             f'<button type="button" role="tab" class="flow-step {classes}" id="measurement-tab-{number}" '
             f'aria-controls="measurement-panel-{number}" aria-selected="{selected}" tabindex="{tabindex}" '
-            f'data-measurement-tab="{number}"{current_attr} title="측정값을 유지하고 {number}단계 화면 열기">{content}</button>'
+            f'data-measurement-tab="{number}"{current_attr} aria-label="{number}단계 {label}, {step_state_label}" '
+            f'title="측정값을 유지하고 {number}단계 화면 열기 · {step_state_label}">{content}</button>'
         )
     workflow = "".join(workflow_items)
     state_labels = {
@@ -1573,7 +1610,6 @@ def measurement_panel(job: dict, preview: dict) -> str:
         "processing": "응답·FIR 계산 중", "measured": "측정 완료", "built": "FIR 생성 완료",
         "cancelling": "취소 처리 중", "error": "확인 필요",
     }
-    active_session_id = str(job.get("session_id", ""))
     if active_session_id:
         active_mode_label = dict(MEASUREMENT_MODE_OPTIONS).get(str(job.get("mode", "lrw")), str(job.get("mode", "lrw")))
         created_unix = float(job.get("created_unix", 0) or 0)
@@ -1584,7 +1620,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
         note = html.escape(str(job.get("session_note", "")))
         session_overview = f'''
         <section class="session-overview" aria-labelledby="active-session-title">
-          <div class="session-overview-head"><div><small>활성 세션 · 자동 저장</small><h3 id="active-session-title">{html.escape(active_session_id)}</h3></div><span class="pill">{html.escape(state_labels.get(state, state))}</span></div>
+          <div class="session-overview-head"><div><small>활성 세션 · 자동 저장</small><h3 id="active-session-title">{html.escape(active_session_id)}</h3></div><div class="session-overview-actions"><span class="pill">{html.escape(state_labels.get(state, state))}</span><button type="button" class="secondary validation-jump" data-measurement-jump="session">세션 관리</button></div></div>
           <div class="session-meta-grid">
             <div><small>측정 구성</small><b>{html.escape(active_mode_label)}</b></div><div><small>생성</small><b>{created_text}</b></div><div><small>완료 위치</small><b>{positions}/{total}</b></div>
             <div><small>이어갈 단계</small><b>{current_step} · {dict(step_labels)[current_step]}</b></div>
@@ -1597,7 +1633,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
           </form>
         </section>'''
     else:
-        session_overview = '''<section class="session-overview empty" aria-labelledby="active-session-title"><div class="session-overview-head"><div><small>활성 세션</small><h3 id="active-session-title">활성 세션 없음</h3></div><span class="pill neutral">1단계에서 생성</span></div><p>1단계에서 새 세션을 만들거나 저장된 세션을 불러오면 완료 지점과 주석이 계속 표시됩니다.</p></section>'''
+        session_overview = '''<section class="session-overview empty" aria-labelledby="active-session-title"><div class="session-overview-head"><div><small>활성 세션</small><h3 id="active-session-title">활성 세션 없음</h3></div><div class="session-overview-actions"><span class="pill neutral">세션 탭에서 시작</span><button type="button" class="secondary validation-jump" data-measurement-jump="session">세션 관리</button></div></div><p>먼저 세션 탭에서 새 세션을 만들거나 저장된 세션을 불러오세요. 완료 지점과 주석은 자동 저장됩니다.</p></section>'''
 
     session_cards = []
     for saved in saved_sessions:
@@ -1619,14 +1655,15 @@ def measurement_panel(job: dict, preview: dict) -> str:
         note_html = html.escape(saved_note) if saved_note else '<span class="muted">주석 없음</span>'
         search_token = html.escape(f"{saved_id} {created_label} {saved.get('mode', 'lrw')} {saved_note}".lower())
         is_active = bool(saved.get("active")) or saved_id == active_session_id
-        load_action = '<span class="pill">현재 세션</span>' if is_active else f'''<form method="post" action="/measurement/load-session" onsubmit="return confirm('현재 세션은 자동 저장됩니다. 선택한 세션을 불러올까요?')"><input type="hidden" name="session_id" value="{html.escape(saved_id)}"><button class="secondary"{' disabled' if busy else ''}>이어하기 · {resume_step}단계</button></form>'''
+        busy_title = ' title="측정 작업이 끝난 뒤 세션을 변경할 수 있습니다."' if busy else ""
+        load_action = '<span class="pill">현재 세션</span>' if is_active else f'''<form method="post" action="/measurement/load-session" data-return-anchor="measurement-step-{resume_step}" onsubmit="return confirm('현재 세션은 자동 저장됩니다. 선택한 세션을 불러올까요?')"><input type="hidden" name="session_id" value="{html.escape(saved_id)}"><button class="secondary"{' disabled' if busy else ''}{busy_title}>이어하기 · {resume_step}단계</button></form>'''
         delete_text = (
             f"세션 {saved_id}을 삭제합니다. 위치 {saved_positions}/{saved_total}, "
             f"{'FIR 결과 있음' if has_result else 'FIR 결과 없음'}, 주석: {saved_note or '없음'}. "
             "측정 원본과 이 세션의 생성 파일은 복구할 수 없지만 현재 정식 프로필 FIR은 변경되지 않습니다. 삭제할까요?"
         )
         delete_message = html.escape(json.dumps(delete_text, ensure_ascii=False), quote=True)
-        delete_action = f'''<form method="post" action="/measurement/delete-session" onsubmit="return confirm({delete_message})"><input type="hidden" name="session_id" value="{html.escape(saved_id)}"><button class="danger session-delete"{' disabled' if busy else ''}>{ui_icon('trash', '세션 삭제')}<span>삭제</span></button></form>'''
+        delete_action = f'''<form method="post" action="/measurement/delete-session" data-return-anchor="measurement-session" onsubmit="return confirm({delete_message})"><input type="hidden" name="session_id" value="{html.escape(saved_id)}"><button class="danger session-delete"{' disabled' if busy else ''}{busy_title}>{ui_icon('trash', '세션 삭제')}<span>삭제</span></button></form>'''
         action = f'<div class="saved-session-actions">{load_action}{delete_action}</div>'
         progress_dots = "".join(f'<i class="{"done" if number <= completed_step else ""}"></i>' for number in range(1, 7))
         session_cards.append(f'''
@@ -1636,7 +1673,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
           <div class="saved-session-progress" aria-label="6단계 중 {completed_step}단계까지 완료">{progress_dots}<span>{completed_step}/6 완료 · 위치 {saved_positions}/{saved_total}{' · FIR 있음' if has_result else ''}</span></div>
         </article>''')
     session_library = f'''
-    <details class="session-tools" data-measurement-step-content="1" open>
+    <details class="session-tools" data-measurement-step-content="session" open>
       <summary>저장된 세션 · 이어하기 <span class="pill neutral">{len(session_cards)}개</span></summary>
       <p class="muted">세션은 자동 저장됩니다. 불러오면 완료 단계·측정값·FIR 결과를 그대로 이어갑니다.</p>
       {f'<label class="session-filter" for="session-filter-input"><span>세션 ID·주석 검색</span><input id="session-filter-input" type="search" placeholder="날짜, ID, 주석으로 찾기" autocomplete="off"></label>' if session_cards else ''}
@@ -1655,7 +1692,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
     if state == "idle":
         mode_options = measurement_mode_options("lrw_sum", mimo_supported)
         controls = f"""
-        <form method="post" action="/measurement/new" class="measure-form session-settings" data-measurement-step-content="1">
+        <form method="post" action="/measurement/new" class="measure-form session-settings" data-measurement-step-content="session" data-return-anchor="measurement-step-1">
           <label>측정 구성<select name="mode" class="measurement-mode-select">{mode_options}</select></label>
           <label>UMIK 방향<select name="orientation"><option value="90" selected>90° · 천장 방향 · 권장</option></select></label>
           <label>청취 위치 범위<select name="position_count">{position_count_options}</select></label>
@@ -1663,13 +1700,27 @@ def measurement_panel(job: dict, preview: dict) -> str:
           <button>세션 생성</button>
           {position_count_note}
           <p class="form-note mode-route">{html.escape(MEASUREMENT_MODE_HELP['lrw_sum'])}</p>
-          <p class="form-note"><b>이 단계에서 정하는 값:</b> 어떤 출력 조합을 몇 위치에서 측정할지 정합니다. 빠른 검사와 본 측정의 스윕 출력은 2단계에서 한 번만 설정합니다.</p>
+          <p class="form-note"><b>세션에서 정하는 값:</b> 어떤 출력 조합을 몇 위치에서 측정할지 정합니다. 생성 후 1단계에서 마이크 보정과 구성을 확인하고, 스윕 출력은 2단계에서 설정합니다.</p>
         </form>
+        {mimo_capability_html}
         {session_library}"""
     else:
-        disabled = " disabled" if busy else ""
+        disabled = ' disabled title="현재 측정 작업이 끝난 뒤 실행할 수 있습니다."' if busy else ""
         level_ok = bool(level.get("ok"))
-        position_disabled = " disabled" if busy or not level_ok or path_match is not True else ""
+        position_block_reason = (
+            "현재 측정 작업이 끝날 때까지 기다리세요." if busy else
+            "2단계 ‘빠른 검사’를 PASS해야 위치 측정을 시작할 수 있습니다." if not level_ok else
+            "U7 상단 버튼으로 측정 세션에 고정된 출력 경로를 다시 선택하세요." if path_match is not True else
+            ""
+        )
+        position_disabled = (
+            f' disabled title="{html.escape(position_block_reason, quote=True)}"'
+            if position_block_reason else ""
+        )
+        position_block_html = (
+            f'<p class="action-blocker" data-measurement-step-content="3"><b>측정 시작 전 확인</b> · {html.escape(position_block_reason)}</p>'
+            if position_block_reason else ""
+        )
         mode = str(job.get("mode", "lrw"))
         source_sequence = {
             "lr": "L+우퍼 → R+우퍼",
@@ -1682,6 +1733,14 @@ def measurement_panel(job: dict, preview: dict) -> str:
         source_count = len(job.get("sources") or ())
         phase_reference_included = mode in ("lrw", "lrw_sum")
         acquisition_count = source_count + (1 if phase_reference_included else 0)
+        measurement_math_note = {
+            "lr": "L+우퍼/R+우퍼를 실제 재생 상태 그대로 측정해 각 입력의 전체 시스템 응답을 보정합니다. 프런트와 우퍼를 분리 추정하지 않습니다.",
+            "lrw": "L/R/우퍼 단독 응답과 같은 녹음의 L+R+우퍼 위상 기준을 사용합니다. L+우퍼/R+우퍼 실측 교차항이 없어 크로스오버 합산은 보수적 상한으로 제한합니다.",
+            "lrw_sum": "L/R/우퍼는 분기별 전달함수, L+우퍼/R+우퍼는 실제 합산 교차항, L+R+우퍼 동시 기준은 상대 위상을 제공합니다. 합산 응답을 개별 응답에 다시 평균하지 않아 우퍼가 두 번 반영되지 않습니다.",
+            "mimo_stereo": "두 독립 출력의 복소 전달행렬을 세 위치에서 직접 최적화합니다. 위상이 동기된 선형계에서는 L+R 합산 측정이 새 자유도를 추가하지 않으므로 목적함수에 중복 삽입하지 않습니다.",
+            "mimo_one_sub": "프런트 L/R과 한 물리 우퍼의 복소 전달행렬을 세 위치에서 공동 최적화합니다. 합산 sweep은 독립 정보가 아니라 모델 검증 정보이므로 생성식에 중복 가중하지 않고, 결과 검토의 선택 실측에 사용합니다.",
+            "mimo_dual_sub": "프런트 L/R과 서로 독립인 두 우퍼의 복소 전달행렬을 세 위치에서 공동 최적화합니다. 같은 위치·같은 신호의 우퍼 두 개는 독립 제어원으로 간주하지 않습니다.",
+        }.get(mode, "선택한 출력의 독립 응답을 한 번씩 사용합니다.")
         mode_options = measurement_mode_options(mode, mimo_supported)
         level_dbfs = int(job.get("level_dbfs", -42))
         noise_level_dbfs = int(job.get("noise_level_dbfs", job.get("level_dbfs", -42)))
@@ -1720,16 +1779,17 @@ def measurement_panel(job: dict, preview: dict) -> str:
 
         session_settings = f"""
         <form method="post" action="/measurement/configure" class="measure-form session-settings" data-measurement-step-content="1" onsubmit="return confirm('측정 구성 변경을 적용하면 영향을 받는 레벨 검사·위치 측정·FIR 결과만 초기화합니다. 적용할까요?')">
-          <label>측정 구성<select name="mode" class="measurement-mode-select">{mode_options}</select></label>
-          <label>UMIK 방향<select name="orientation"><option value="90" selected>90° · 천장 방향 · 권장</option></select></label>
-          <label>청취 위치 범위<select name="position_count">{position_count_options}</select></label>
+          <label>측정 구성<select name="mode" class="measurement-mode-select"{' disabled' if busy else ''}>{mode_options}</select></label>
+          <label>UMIK 방향<select name="orientation"{' disabled' if busy else ''}><option value="90" selected>90° · 천장 방향 · 권장</option></select></label>
+          <label>청취 위치 범위<select name="position_count"{' disabled' if busy else ''}>{position_count_options}</select></label>
           <input type="hidden" name="level_dbfs" value="{level_dbfs}"><input type="hidden" name="noise_level_dbfs" value="{noise_level_dbfs}"><input type="hidden" name="woofer_measurement_attenuation_db" value="{woofer_measurement_attenuation_db}"><input type="hidden" name="sweep_seconds" value="{sweep_seconds}">
-          <button>구성 적용</button>
+          <button{' disabled title="측정 작업이 끝난 뒤 구성을 변경할 수 있습니다."' if busy else ''}>구성 적용</button>
           {position_count_note}
           <p class="form-note mode-route">{html.escape(MEASUREMENT_MODE_HELP.get(mode, ''))}</p>
-          <p class="form-note">탭을 오가거나 값을 선택만 해서는 측정값이 지워지지 않습니다. 이 버튼으로 실제 변경할 때 영향받는 이후 단계만 초기화합니다.</p>
+          <p class="form-note">탭 이동이나 선택만으로는 측정값이 지워지지 않습니다. ‘구성 적용’을 눌렀을 때 영향받는 이후 단계만 초기화합니다.{' 현재 측정 작업이 끝날 때까지 변경할 수 없습니다.' if busy else ''}</p>
         </form>
-        <div class="session-new-action" data-measurement-step-content="1"><div><b>새 세션</b><p class="muted">현재 세션은 자동 저장되어 다시 불러올 수 있습니다.</p></div><form method="post" action="/measurement/new" onsubmit="return confirm('현재 세션을 저장하고 같은 설정으로 새 측정을 시작할까요?')"><input type="hidden" name="mode" value="{mode}"><input type="hidden" name="orientation" value="90"><input type="hidden" name="level_dbfs" value="{level_dbfs}"><input type="hidden" name="noise_level_dbfs" value="{noise_level_dbfs}"><input type="hidden" name="woofer_measurement_attenuation_db" value="{woofer_measurement_attenuation_db}"><input type="hidden" name="sweep_seconds" value="{sweep_seconds}"><input type="hidden" name="position_count" value="{total}"><button class="secondary"{' disabled' if busy else ''}>새 세션</button></form></div><div class="step-nav-bar" style="margin-top:14px" data-measurement-step-content="1"><button type="button" class="validation-jump primary-jump" data-measurement-jump="2">레벨 확인으로</button></div>"""
+        <div class="step-nav-bar" style="margin-top:14px" data-measurement-step-content="1"><button type="button" class="validation-jump primary-jump" data-measurement-jump="2">레벨 확인으로</button></div>"""
+        session_new_action = f'''<div class="session-new-action" data-measurement-step-content="session"><div><b>새 세션</b><p class="muted">현재 세션은 자동 저장되어 나중에 다시 불러올 수 있습니다.</p></div><form method="post" action="/measurement/new" data-return-anchor="measurement-step-1" onsubmit="return confirm('현재 세션을 저장하고 같은 설정으로 새 측정을 시작할까요?')"><input type="hidden" name="mode" value="{mode}"><input type="hidden" name="orientation" value="90"><input type="hidden" name="level_dbfs" value="{level_dbfs}"><input type="hidden" name="noise_level_dbfs" value="{noise_level_dbfs}"><input type="hidden" name="woofer_measurement_attenuation_db" value="{woofer_measurement_attenuation_db}"><input type="hidden" name="sweep_seconds" value="{sweep_seconds}"><input type="hidden" name="position_count" value="{total}"><button class="secondary"{' disabled title="측정 작업이 끝난 뒤 새 세션을 만들 수 있습니다."' if busy else ''}>새 세션</button></form></div>'''
 
         if positions >= total:
             build_blocked = premeasurement_validation_failed or phase_validation_failed
@@ -1825,7 +1885,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 f'''<form method="post" action="/measurement/phase-reference" onsubmit="return confirm('기존 L/R/W/L+W/R+W ESS는 보존하고 L+R+W Walsh 위상 기준만 한 번 재생합니다. 진행할까요?')"><button class="secondary"{disabled}>L+R+W만 재측정</button></form>'''
                 if total == 1 and not phase_all_pass else ''
             )
-            phase_reference_html = f'''<section class="pre-sum-card {'pass' if phase_all_pass else 'fail'}" data-measurement-step-content="3"><div class="section-head"><div><h4>L+R+우퍼 주파수별 상대 위상</h4><p>같은 주파수 톤을 4개 부호 조합으로 나눠 L/R/우퍼의 상대 위상을 측정합니다. 현재 crossover 주파수에서 실제 합산에 중요한 차이를 보여줍니다.</p></div><span class="status-badge {'pass' if phase_all_pass else 'fail'}">{'측정 PASS' if phase_all_pass else '측정 FAIL'}</span></div><div class="diagnostic-grid">{phase_rows}{phase_pair_rows}</div><p class="diagnostic-note"><b>측정 PASS 기준</b> · SNR, 반복 파형 일치도, 같은 톤을 반복했을 때의 위상 오차가 모두 허용 범위입니다. 이는 측정값을 FIR에 사용할 수 있다는 뜻이며, 현재 스피커 위상이 이미 잘 맞는다는 뜻은 아닙니다. FIR은 표의 광대역 단일 delay 요약값이 아니라 주파수별 상대 위상과 L+우퍼/R+우퍼 실측 합산을 사용합니다. ms는 해당 주파수 한 주기 안의 환산값이라 거리 차이가 아닙니다.</p>{phase_action}{phase_remeasure}</section>'''
+            phase_reference_html = f'''<section class="pre-sum-card {'pass' if phase_all_pass else 'fail'}" data-measurement-step-content="3"><div class="section-head"><div><h4>L+R+우퍼 주파수별 상대 위상</h4><p>같은 주파수 톤을 4개 부호 조합으로 나눠 L/R/우퍼의 상대 위상을 측정합니다. 현재 크로스오버 주파수에서 실제 합산에 중요한 차이를 보여줍니다.</p></div><span class="status-badge {'pass' if phase_all_pass else 'fail'}">{'측정 PASS' if phase_all_pass else '측정 FAIL'}</span></div><div class="diagnostic-grid">{phase_rows}{phase_pair_rows}</div><p class="diagnostic-note"><b>측정 PASS 기준</b> · SNR, 반복 파형 일치도, 같은 톤을 반복했을 때의 위상 오차가 모두 허용 범위입니다. 이는 측정값을 FIR에 사용할 수 있다는 뜻이며, 현재 스피커 위상이 이미 잘 맞는다는 뜻은 아닙니다. FIR은 표의 광대역 단일 지연 요약값이 아니라 주파수별 상대 위상과 L+우퍼/R+우퍼 실측 합산을 사용합니다. ms는 해당 주파수 한 주기 안의 환산값이라 거리 차이가 아닙니다.</p>{phase_action}{phase_remeasure}</section>'''
 
         capture_recovery_html = ""
         if expected_capture_count:
@@ -1842,8 +1902,10 @@ def measurement_panel(job: dict, preview: dict) -> str:
             capture_recovery_html = f'''<section class="capture-recovery {'diagnostic-warning' if legacy_response_count else ''}" data-measurement-step-content="3"><div><small>저장 상태</small><b>ESS 녹음 {raw_capture_count}/{expected_capture_count} · 응답 {response_count}/{expected_capture_count}{revision_text}{phase_inventory_text}</b><span>‘원본 재계산’은 저장 WAV만 사용하며 소리를 재생하지 않습니다.{revision_note}</span></div>{recovery_action}</section>'''
 
         controls = f"""
-        {session_settings}
         {session_library}
+        {session_new_action}
+        {mimo_capability_html}
+        {session_settings}
         <div class="level-step-card" data-measurement-step-content="2">
           <section class="sub-card">
             <h4>2단계 · 출력 설정과 빠른 검사</h4>
@@ -1854,7 +1916,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 <label class="level-slider">DAC 기준 스윕 출력 <output>{level_dbfs} dBFS</output>
                   <input name="level_dbfs" type="range" min="-54" max="0" step="1" value="{level_dbfs}" data-unit="dBFS">
                   <input type="hidden" name="noise_level_dbfs" value="{level_dbfs}">
-                  <small>빠른 검사·본 측정 모두 입력 OFF → U7 PCM 0 dB → sweep → 원래 볼륨 복원 → 입력 복귀 순서로 실행합니다. 현재 청취 볼륨은 측정 출력에 더해지지 않습니다.</small>
+                  <small>빠른 검사·본 측정 모두 입력 OFF → U7 PCM 0 dB → 스윕 → 원래 볼륨 복원 → 입력 복귀 순서로 실행합니다. 현재 청취 볼륨은 측정 출력에 더해지지 않습니다.</small>
                 </label>
               <label class="level-slider woofer-level-slider"><span class="woofer-level-heading">우퍼 측정 감쇄</span> <output>{woofer_measurement_attenuation_db} dB</output>
                   <input name="woofer_measurement_attenuation_db" type="range" min="-18" max="0" step="1" value="{woofer_measurement_attenuation_db}" data-unit="dB">
@@ -1872,10 +1934,11 @@ def measurement_panel(job: dict, preview: dict) -> str:
         <div class="measure-actions" data-measurement-step-content="3">
           {position_control}
         </div>
+        {position_block_html}
         {capture_recovery_html}
         {phase_reference_html}
         {pre_sum_html}
-            <p class="muted" data-measurement-step-content="3"><b>위치당 측정 순서:</b> {html.escape(source_sequence)}. 한 위치의 {acquisition_count}회 재생을 DSP 재시작이나 FFT 대기 없이 먼저 연속 녹음하고, 소리가 모두 멈춘 뒤 응답을 일괄 계산합니다. 완료된 항목은 재시도할 때 다시 재생하지 않습니다.</p><p class="form-note" data-measurement-step-content="3"><b>여섯 측정 공동 계산:</b> L/R/우퍼는 분기별 음압, L+우퍼/R+우퍼는 실제 합산 교차항, L+R+우퍼 동시 기준은 위상 부호·상대 지연을 제공합니다. 합산 응답을 개별 응답에 평균하지 않고 수학적 제약으로 사용하므로 우퍼가 두 번 반영되지 않습니다.</p>"""
+            <p class="muted" data-measurement-step-content="3"><b>위치당 측정 순서:</b> {html.escape(source_sequence)}. 한 위치의 {acquisition_count}회 재생을 DSP 재시작이나 FFT 대기 없이 먼저 연속 녹음하고, 소리가 모두 멈춘 뒤 응답을 일괄 계산합니다. 완료된 항목은 재시도할 때 다시 재생하지 않습니다.</p><p class="form-note" data-measurement-step-content="3"><b>계산에 쓰는 방법:</b> {html.escape(measurement_math_note)}</p>"""
 
         if positions == total:
             build_open = f'<fieldset class="build-fieldset"{" disabled" if busy else ""}>'
@@ -1887,6 +1950,8 @@ def measurement_panel(job: dict, preview: dict) -> str:
             phase_options = ''.join(f'<option value="{value}" {"selected" if preferences.get("phase_mode", "bass") == value else ""}>{label}</option>' for value, label in (("bass", "저역 음량+위상"), ("magnitude", "음량만 · 최소위상")))
             if mode == "lr":
                 woofer_trim_control = f'<label>우퍼 최종 트림<input type="hidden" name="woofer_trim_db" value="{woofer_measurement_attenuation_db}"><output>{woofer_measurement_attenuation_db} dB · 합산 측정값과 고정</output></label>'
+            elif mode == "mimo_stereo":
+                woofer_trim_control = '<input type="hidden" name="woofer_trim_db" value="0"><div class="field-summary"><small>우퍼 최종 트림</small><b>해당 없음</b><span>프런트 L/R만 공동 제어합니다.</span></div>'
             else:
                 woofer_trim_control = '<label>우퍼 최종 트림<select name="woofer_trim_db">' + "".join(f'<option value="{value}" {"selected" if value == preferences.get("woofer_trim_db", 0) else ""}>{value} dB{" · 선택 타깃 기준" if value == 0 else " · 기준 저역 추가 감쇄"}</option>' for value in range(0, -19, -1)) + '</select></label>'
             if mode in ("lrw", "lrw_sum", "mimo_one_sub", "mimo_dual_sub"):
@@ -1904,6 +1969,24 @@ def measurement_panel(job: dict, preview: dict) -> str:
             else:
                 crossover_control = '<input type="hidden" name="crossover_enabled" value="off"><input type="hidden" name="crossover_frequency_hz" value="100">'
                 crossover_note = '<p class="form-note"><b>크로스오버 꺼짐:</b> 이 모드는 프런트/우퍼 독립 분기가 없어 HPF/LPF를 나눌 수 없습니다. 디지털 크로스오버를 쓰려면 L/R/우퍼 개별 측정을 선택하세요.</p>'
+            if mode.startswith("mimo_"):
+                mimo_controls = """
+              <section class="mimo-options-card">
+                <div class="section-head"><div><small>MIMO 전용</small><h4>저역 공동제어</h4><p>세 위치의 복소 전달행렬을 한 번만 사용해 타깃 오차·좌석 편차·제어량을 동시에 최소화합니다.</p></div><span class="pill">2입력 × 4출력</span></div>
+                <div class="mimo-mini-flow" aria-label="MIMO 최적화 흐름"><span>세 위치 전달행렬 H(f)</span><i>→</i><span>불확실성·조건수 안정화</span><i>→</i><span>32768탭 × 8경로</span></div>
+                <div class="advanced-grid">
+                  <label>공동제어 상한<select name="mimo_high_hz">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_high_hz", 150) else ""}>{value} Hz</option>' for value in (80, 120, 150)) + """</select><span>이 주파수 위에서는 기존 L/R 개별 FIR로 부드럽게 전환합니다.</span></label>
+                  <label>안정성/효과<select name="mimo_strength">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_strength", "balanced") else ""}>{label}</option>' for value, label in (("safe", "안전 · 변화 작음"), ("balanced", "균형 · 권장"), ("maximum", "효과 우선 · 엄격 검증"))) + """</select><span>불확실성 정규화와 기존 FIR 유지 비율을 함께 조절합니다.</span></label>
+                  <label>보조 출력 사용 제한<select name="mimo_support_penalty_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_support_penalty_db", 6) else ""}>{value} dB{" · 권장" if value == 6 else ""}</option>' for value in (3, 6, 9, 12)) + """</select><span>값이 클수록 반대편 프런트/우퍼의 보조 재생을 덜 사용합니다. 우퍼 최종 트림과는 별도입니다.</span></label>
+                </div>
+                <p class="form-note"><b>자동 안전 조건:</b> 출력별 측정 신뢰도 정규화, 실제 1-노름 조건수 ≤10,000, 위치별 비악화, 상관 입력 headroom, 하나의 공통 L/R/우퍼 이득을 모두 PASS해야 정식 적용할 수 있습니다.</p>
+              </section>"""
+            else:
+                mimo_controls = (
+                    f'<input type="hidden" name="mimo_high_hz" value="{int(preferences.get("mimo_high_hz", 150))}">'
+                    f'<input type="hidden" name="mimo_strength" value="{html.escape(str(preferences.get("mimo_strength", "balanced")), quote=True)}">'
+                    f'<input type="hidden" name="mimo_support_penalty_db" value="{int(preferences.get("mimo_support_penalty_db", 6))}">'
+                )
             controls += """
             <form method="post" action="/measurement/build" id="measurement-step-4" class="measure-form build-options" data-measurement-step-content="4" onsubmit="return confirm('측정 원본은 유지하고 기존 생성 FIR/A-B 임시 결과만 초기화한 뒤 다시 계산합니다. 계속할까요?')">
               """ + build_open + build_status + """
@@ -1914,6 +1997,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
               """ + woofer_trim_control + """
               <label>위상 방식<select name="phase_mode">""" + phase_options + """</select></label>
               """ + crossover_control + crossover_note + """
+              """ + mimo_controls + """
               <button>""" + build_button_label + """</button>
               <details class="advanced"><summary>고급 보정 설정 · 기본값은 안전 권장값</summary><div class="advanced-grid">
                 <label>공간 대표 응답<select name="spatial_mode">""" + ''.join(f'<option value="{value}" {"selected" if preferences.get("spatial_mode", "equal") == value else ""}>{label}</option>' for value, label in (("equal", "세 위치 균등 · 넓은 청취영역"), ("center", "중앙 우선 · 고역 중심 가중"))) + """</select></label>
@@ -1924,17 +2008,14 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 <label>최대 상대 보상<select name="max_boost_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("max_boost_db", 10) else ""}>+{value} dB</option>' for value in (0, 3, 6, 9, 10)) + """<span>신뢰 가능한 가장 큰 보정점을 0 dB로 두고 L/R/우퍼 전체를 같은 양만큼 내립니다. 기본 10 dB이며 좁고 깊은 딥은 별도 보호되어 이 한도를 그대로 채우지 않습니다.</span></label>
                 <label>최대 룸 감쇄<select name="max_cut_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("max_cut_db", 18) else ""}>−{value} dB</option>' for value in (6, 9, 12, 18, 24)) + """</select></label>
                 <label>저역 위상 상한<select name="phase_cutoff">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("phase_cutoff", 200) else ""}>{value} Hz</option>' for value in (80, 120, 160, 200, 250)) + """</select></label>
-                <label>MIMO 공동제어 상한<select name="mimo_high_hz">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_high_hz", 150) else ""}>{value} Hz</option>' for value in (80, 120, 150)) + """</select></label>
-                <label>MIMO 강도<select name="mimo_strength">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_strength", "balanced") else ""}>{label}</option>' for value, label in (("safe", "Safe · 높은 안정성"), ("balanced", "Balanced · 권장"), ("maximum", "Maximum · 측정영역 우선"))) + """</select></label>
-                <label>지원 제어원 제한<select name="mimo_support_penalty_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("mimo_support_penalty_db", 6) else ""}>{value} dB</option>' for value in (3, 6, 9, 12)) + """</select></label>
-              </div><p class="muted"><b>공통 기준:</b> L/R/우퍼를 따로 0 dB로 맞추지 않습니다. 전체 FIR 묶음에서 하나의 공통 gain만 적용해 상대레벨과 crossover 합산을 보존합니다. 위치별 편차가 크거나 좁고 깊은 null은 ‘최대 상대 보상’보다 우선하여 제한됩니다. MIMO 항목은 MIMO 측정 구성에만 쓰이며 Pi4/5에서 chunksize 1024 이상으로 동작합니다.</p></details></fieldset>
+              </div><p class="muted"><b>공통 기준:</b> L/R/우퍼를 따로 0 dB로 맞추지 않습니다. 전체 FIR 묶음에서 하나의 공통 이득만 적용해 상대레벨과 크로스오버 합산을 보존합니다. 위치별 편차가 크거나 좁고 깊은 딥은 ‘최대 상대 보상’보다 우선하여 제한됩니다.</p></details></fieldset>
             </form>
             <div class="target-preview" data-measurement-step-content="4"><b>선택 타깃 곡선 · 1 kHz 기준</b><svg id="target-graph" viewBox="0 0 760 230" role="img" aria-label="타깃 주파수 응답"></svg></div>"""
     result_html = ""
     if result:
         preview_active = bool(preview.get("active")) and not bool(preview.get("stale"))
         preview_profile = html.escape(str(preview.get("profile") or ""))
-        preview_label = f"이번 튜닝 테스트 중 · {preview_profile}" if preview_active else "기존 정식 튜닝 재생 중"
+        preview_label = f"이번 튜닝 미리듣기 중 · {preview_profile}" if preview_active else "기존 튜닝 재생 중"
         front_metrics = result.get("front_metrics", {})
         left = front_metrics.get("left", {})
         diagnostics = result.get("diagnostics", {})
@@ -2052,7 +2133,9 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 ("설정으로 32768탭 FIR 생성", "FIR 계산"),
                 ("이 출력 설정으로 레벨 검사 시작", "레벨 확인"),
                 ("측정 구성 변경 적용", "구성 적용"),
-                ("연결·Cal", "출력 설정"),
+                ("연결·Cal", "측정 구성"),
+                ("A/B 검토", "결과 검토"),
+                ("Preview", "미리듣기"),
                 ("Woofer 최종 trim", "우퍼 최종 트림"),
                 ("Crossover", "크로스오버"),
                 ("Target", "타깃"),
@@ -2074,7 +2157,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
             guide_label = "해결 방법" if token == "fail" else "권장 조치" if token == "warn" else "다음 단계"
             guide_html = ""
             if token in ("fail", "warn", "pending") and guide:
-                step_names = {"1": "출력 설정", "2": "레벨 확인", "3": "위치 측정", "4": "FIR 계산", "5": "A/B 검토", "6": "정식 적용"}
+                step_names = {"1": "측정 구성", "2": "레벨 확인", "3": "위치 측정", "4": "FIR 계산", "5": "결과 검토", "6": "정식 적용"}
                 guide_steps = list(dict.fromkeys(re.findall(r"(?<!\d)([1-6])\s*·", guide)))
                 jump_buttons = "".join(
                     f'<button type="button" class="secondary validation-jump" data-measurement-jump="{step}">{step} · {step_names[step]}</button>'
@@ -2087,22 +2170,24 @@ def measurement_panel(job: dict, preview: dict) -> str:
             )
 
         core_labels = {
-            "exact_32768_taps": ("32768탭 길이", "4 · FIR 계산에서 ‘FIR 계산’을 다시 누르세요. 반복되면 5 · A/B 검토에서 ‘결과 JSON’을 내려받아 오류로 보고하세요."),
+            "exact_32768_taps": ("32768탭 길이", "4 · FIR 계산에서 ‘FIR 계산’을 다시 누르세요. 반복되면 5 · 결과 검토에서 ‘결과 JSON’을 내려받아 보관하세요."),
             "finite_samples": ("FIR 유한 샘플", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘최대 상대 보상’을 한 단계 낮추고 ‘추가 저음 취향’과 ‘추가 고음 경사’를 0 dB에 가깝게 바꾼 뒤 ‘FIR 계산’을 누르세요."),
             "no_positive_transfer": ("0 dB 초과 전달이득 방지", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘최대 상대 보상’을 한 단계 낮추고 ‘FIR 계산’을 누르세요."),
             "early_impulse": ("앞쪽 임펄스·낮은 지연", "4 · FIR 계산에서 ‘위상 방식’을 ‘음량만 · 최소위상’으로 바꾸고 ‘FIR 계산’을 누르세요."),
-            "fir_matches_design": ("설계 응답과 실제 WAV 일치", "4 · FIR 계산에서 같은 설정으로 ‘FIR 계산’을 다시 누르세요. 계속 실패하면 정식 적용하지 말고 5 · A/B 검토에서 ‘결과 JSON’을 내려받아 진단하세요."),
+            "fir_matches_design": ("설계 응답과 실제 WAV 일치", "4 · FIR 계산에서 같은 설정으로 ‘FIR 계산’을 다시 누르세요. 계속 실패하면 정식 적용하지 말고 5 · 결과 검토에서 ‘결과 JSON’을 내려받아 보관하세요."),
             "time_alignment_safe": ("프런트/우퍼 시간 정렬 안전성", "4 · FIR 계산에서 ‘위상 방식’을 ‘음량만 · 최소위상’으로 바꾸거나 ‘크로스오버 주파수’를 한 단계 낮춘 뒤 ‘FIR 계산’을 누르세요. 정밀 측정이면 3 · 위치 측정의 ‘필터 전 합산 일치 검증’도 확인하세요."),
             "one_common_level_reference": ("L/R/우퍼 공통 음압 기준", "4 · FIR 계산에서 ‘FIR 계산’을 다시 누르세요. 새 계산은 L/R/우퍼를 하나의 500–2000 Hz 기준으로 평가합니다."),
             "one_common_bank_gain": ("FIR 묶음 공통 0 dB", "4 · FIR 계산에서 ‘FIR 계산’을 다시 누르세요. 채널별 정규화가 검출된 결과는 정식 적용하지 않습니다."),
-            "relative_branch_level_preserved": ("L/R/우퍼 상대레벨 보존", "4 · FIR 계산에서 ‘FIR 계산’을 다시 누르세요. 반복되면 5 · A/B 검토에서 ‘결과 JSON’을 내려받아 보고하세요."),
+            "relative_branch_level_preserved": ("L/R/우퍼 상대레벨 보존", "4 · FIR 계산에서 ‘FIR 계산’을 다시 누르세요. 반복되면 5 · 결과 검토에서 ‘결과 JSON’을 내려받아 보관하세요."),
             "relative_compensation_limit": ("최대 상대 보상 한도", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘최대 상대 보상’을 한 단계 낮추거나 ‘추가 저음 취향’과 ‘추가 고음 경사’를 0 dB에 가깝게 바꾼 뒤 ‘FIR 계산’을 누르세요."),
             "narrow_null_boost_guard": ("좁고 깊은 딥 과보정 방지", "4 · FIR 계산에서 같은 설정으로 ‘FIR 계산’을 다시 누르세요. 반복되면 ‘최대 상대 보상’을 한 단계 낮추고 스피커/청취 위치 이동을 우선하세요."),
-            "finite": ("MIMO FIR 유한 샘플", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘MIMO 강도’를 ‘Safe · 높은 안정성’으로, ‘최대 상대 보상’을 한 단계 낮춘 뒤 ‘FIR 계산’을 누르세요."),
-            "correlated_input_headroom": ("MIMO 상관 입력 여유", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘MIMO 강도’를 ‘Safe · 높은 안정성’으로, ‘지원 제어원 제한’을 9 dB 또는 12 dB로 바꾼 뒤 ‘FIR 계산’을 누르세요."),
-            "common_causality": ("MIMO 공통 인과 지연", "4 · FIR 계산 > ‘고급 보정 설정’에서 ‘MIMO 강도’를 ‘Safe · 높은 안정성’으로 하고 ‘MIMO 공동제어 상한’을 한 단계 낮춘 뒤 고급 설정을 접고 ‘설정으로 32768탭 FIR 생성’을 누르세요."),
-            "predicted_target_and_spatial_non_regression": ("MIMO 타겟·좌석 편차 비악화", "4 · FIR 계산 > ‘고급 보정 설정’에서 먼저 ‘MIMO 강도’를 ‘Safe · 높은 안정성’으로 바꾸고, 계속 FAIL이면 ‘MIMO 공동제어 상한’을 한 단계 낮추거나 ‘지원 제어원 제한’을 한 단계 높인 뒤 고급 설정을 접고 ‘설정으로 32768탭 FIR 생성’을 누르세요. 그래도 실패하면 이 측정에서는 MIMO가 SISO보다 낫지 않으므로 1 · 연결·Cal > ‘측정 구성’에서 SISO 구성을 선택하고 ‘측정 구성 변경 적용’을 누르세요."),
-            "predicted_modal_tail_non_regression": ("MIMO 저역 임펄스 꼬리 비악화", "4 · FIR 계산에서 ‘기준 음색 타깃’=‘Flat’, ‘우퍼 과잉 억제’=‘추가 억제 없음 · 타깃 기준’, ‘우퍼 최종 트림’=‘0 dB’로 되돌리세요. 이어 ‘고급 보정 설정’에서 ‘MIMO 강도’=‘Balanced · 권장’, ‘MIMO 공동제어 상한’=‘150 Hz’, ‘지원 제어원 제한’=‘6 dB’로 바꾸고, 본문의 ‘크로스오버 주파수’=‘100 Hz’로 설정한 뒤 ‘FIR 계산’을 누르세요. 기준 조합이 PASS하면 원하는 음색 값을 한 번에 하나씩 다시 바꾸세요. 기준도 실패하면 우퍼 위치를 바꿔 3 · 위치 측정의 ‘3위치 처음부터 재측정’을 실행하거나 SISO 구성을 사용하세요."),
+            "finite": ("MIMO FIR 유한 샘플", "4 · FIR 계산 > ‘저역 공동제어’에서 ‘안정성/효과’를 ‘안전 · 변화 작음’으로, ‘최대 상대 보상’을 한 단계 낮춘 뒤 ‘FIR 계산’을 누르세요."),
+            "correlated_input_headroom": ("MIMO 상관 입력 여유", "4 · FIR 계산 > ‘저역 공동제어’에서 ‘안정성/효과’를 ‘안전 · 변화 작음’으로, ‘보조 출력 사용 제한’을 9 dB 또는 12 dB로 바꾼 뒤 ‘FIR 계산’을 누르세요."),
+            "common_causality": ("MIMO 공통 인과 지연", "4 · FIR 계산 > ‘저역 공동제어’에서 ‘안정성/효과’를 ‘안전 · 변화 작음’으로 하고 ‘공동제어 상한’을 한 단계 낮춘 뒤 ‘FIR 계산’을 누르세요."),
+            "predicted_target_and_spatial_non_regression": ("MIMO 타겟·좌석 편차 비악화", "4 · FIR 계산 > ‘저역 공동제어’에서 먼저 ‘안정성/효과’를 ‘안전 · 변화 작음’으로 바꾸고, 계속 FAIL이면 ‘공동제어 상한’을 한 단계 낮추거나 ‘보조 출력 사용 제한’을 한 단계 높인 뒤 ‘FIR 계산’을 누르세요. 그래도 실패하면 이 측정에서는 MIMO가 SISO보다 낫지 않으므로 1 · 측정 구성의 ‘측정 구성’에서 SISO 구성을 선택하고 ‘구성 적용’을 누르세요."),
+            "every_measured_position_target_non_regression": ("MIMO 각 측정 위치 비악화", "4 · FIR 계산 > ‘저역 공동제어’에서 ‘안정성/효과’를 ‘안전 · 변화 작음’으로 바꾸고 ‘공동제어 상한’을 한 단계 낮춘 뒤 ‘FIR 계산’을 누르세요. 계속 FAIL이면 평균 응답은 좋아져도 한 위치가 나빠지는 해이므로 적용하지 말고 우퍼 위치를 조정하거나 SISO 구성을 사용하세요."),
+            "regularized_condition_number": ("MIMO 전달행렬 수치 안정성", "4 · FIR 계산 > ‘저역 공동제어’에서 ‘안정성/효과’를 ‘안전 · 변화 작음’으로 바꾸고 ‘공동제어 상한’을 한 단계 낮춘 뒤 ‘FIR 계산’을 누르세요. 계속 FAIL이면 제어원 응답이 너무 비슷해 독립 제어가 불가능한 상태이므로 우퍼 위치를 바꾸거나 SISO 구성을 사용하세요."),
+            "predicted_modal_tail_non_regression": ("MIMO 저역 임펄스 꼬리 비악화", "4 · FIR 계산에서 ‘기준 음색 타깃’=‘Flat’, ‘우퍼 과잉 억제’=‘추가 억제 없음 · 타깃 기준’, ‘우퍼 최종 트림’=‘0 dB’로 되돌리세요. 이어 ‘저역 공동제어’에서 ‘안정성/효과’=‘균형 · 권장’, ‘공동제어 상한’=‘150 Hz’, ‘보조 출력 사용 제한’=‘6 dB’로 바꾸고, 본문의 ‘크로스오버 주파수’=‘100 Hz’로 설정한 뒤 ‘FIR 계산’을 누르세요. 기준 조합이 PASS하면 원하는 음색 값을 한 번에 하나씩 다시 바꾸세요. 기준도 실패하면 우퍼 위치를 바꿔 3 · 위치 측정의 ‘3위치 처음부터 재측정’을 실행하거나 SISO 구성을 사용하세요."),
         }
 
 
@@ -2118,7 +2203,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 add_validation_row(
                     "서로 다른 3위치 측정", "pass" if independent.get("pass") else "fail",
                     "세 위치가 독립 측정입니다." if independent.get("pass") else f"재사용 응답 {len(reused)}개가 검출되었습니다.",
-                    "1 · 출력 설정에서 ‘청취 위치 범위’를 ‘표준 측정 · 중앙+좌우 3위치 · 권장’으로 확인하고 ‘구성 적용’을 누른 뒤, 3 · 위치 측정에서 ‘3곳 처음부터 재측정’을 눌러 마이크를 서로 다른 세 위치로 옮겨 측정하세요.",
+                    "1 · 측정 구성에서 ‘청취 위치 범위’를 ‘표준 측정 · 중앙+좌우 3위치 · 권장’으로 확인하고 ‘구성 적용’을 누른 뒤, 3 · 위치 측정에서 ‘3곳 처음부터 재측정’을 눌러 마이크를 서로 다른 세 위치로 옮겨 측정하세요.",
                 )
         if isinstance(premeasured_model, dict):
             model_channels = premeasured_model.get("channels") or {}
@@ -2165,7 +2250,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
         if crossover_check.get("required"):
             crossover_status = str(crossover_check.get("status", ""))
             if crossover_check.get("pass") is None:
-                add_validation_row("프런트+우퍼 전체 합산", "pending", "이전 알고리즘 결과라 합산 안전성 판정이 없습니다.", "4 · FIR 계산에서 현재 설정을 확인하고 ‘FIR 계산’을 다시 누르세요. 새 계산은 보수적인 감쇄 전용 합산 상한으로 판정하며 사후 스윕을 요구하지 않습니다. 물리 합산 검증까지 원하면 다음 세션의 1 · 출력 설정 > ‘측정 구성’에서 ‘정밀 분리+합산’을 선택하세요.")
+                add_validation_row("프런트+우퍼 전체 합산", "pending", "이전 알고리즘 결과라 합산 안전성 판정이 없습니다.", "4 · FIR 계산에서 현재 설정을 확인하고 ‘FIR 계산’을 다시 누르세요. 새 계산은 보수적인 감쇄 전용 합산 상한으로 판정하며 사후 스윕을 요구하지 않습니다. 물리 합산 검증까지 원하면 다음 세션의 1 · 측정 구성에서 ‘정밀 분리+합산’을 선택하세요.")
             else:
                 if crossover_status == "fail_premeasured_sum_snr" and isinstance(premeasured_model, dict):
                     crossover_detail = f"정밀 합산 측정 SNR {premeasured_model.get('minimum_snr_db', '?')} dB · 사용 기준 {premeasured_model.get('thresholds', {}).get('minimum_snr_db', 6)} dB"
@@ -2204,7 +2289,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
                         )
                 elif crossover_status in ("limited_unverified_phase", "pass_safe_upper_phase_limited", "pass_safe_sum_phase_limited"):
                     crossover_detail = "합산 안전성 PASS · 절대 위상 정밀도 제한 · 감쇄 전용 상한 사용"
-                    crossover_guide = "정식 적용은 가능합니다. 더 정확한 확인이 필요하면 5 · A/B 검토에서 이번 튜닝을 듣고 선택적으로 합산 실측을 실행하세요."
+                    crossover_guide = "정식 적용은 가능합니다. 더 정확한 확인이 필요하면 5 · 결과 검토에서 ‘이번 튜닝’을 미리듣고 선택적 합산 실측을 실행하세요."
                 else:
                     crossover_detail = CROSSOVER_STATUS_LABELS.get(crossover_status, crossover_status or "합산 판정")
                     signed_errors = [
@@ -2253,7 +2338,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
                         "최종 합산 절대 위상 정밀도",
                         "warn",
                         "위상 비의존 상한으로 안전성을 통과했습니다. 그래프의 깊은 복소 딥은 확정값으로 표시하지 않습니다.",
-                        "정식 적용은 가능합니다. 실제 방에서 최종 합산을 확인하려면 5 · A/B 검토의 선택적 합산 실측을 사용하세요.",
+                        "정식 적용은 가능합니다. 실제 방에서 최종 합산을 확인하려면 5 · 결과 검토의 선택적 합산 실측을 사용하세요.",
                     )
         else:
             add_validation_row("프런트+우퍼 전체 합산", "na", "독립 우퍼 분기가 없는 합산 SISO 구성이라 별도 판정에서 제외합니다.")
@@ -2336,24 +2421,39 @@ def measurement_panel(job: dict, preview: dict) -> str:
             '<p class="diagnostic-note"><b>위상 정밀도 제한 그래프</b> · 개별 측정의 시간 기준 신뢰도가 부족해 복소 합산 딥을 사실로 표시하지 않습니다. 현재 그래프는 프런트와 우퍼가 최대로 더해질 때의 안전 상한을 표시합니다. 이전에 보인 약 150 Hz 딥은 검증된 실측 딥이 아닙니다.</p>'
             if phase_unverified else ""
         )
+        preview_block_reason = (
+            "현재 FIR 계산 또는 측정 작업이 끝난 뒤 미리들을 수 있습니다." if busy else
+            "U7 상단 버튼으로 이 세션을 측정한 출력 경로를 다시 선택하세요." if measured_profile in PROFILE_UI and path_match is not True else
+            ""
+        )
+        preview_disabled_action = (
+            f'<button disabled title="{html.escape(preview_block_reason, quote=True)}">이번 튜닝</button>'
+            if preview_block_reason else ""
+        )
+        apply_busy_action = '<button disabled title="현재 작업이 끝난 뒤 정식 적용할 수 있습니다.">작업 완료 대기</button>'
+        result_restore_action = (
+            '<form method="post" action="/measurement/restore"><button>기존 튜닝</button></form>'
+            if preview_active else
+            '<button class="secondary" disabled title="현재 기존 정식 튜닝을 재생하고 있습니다.">기존 튜닝</button>'
+        )
         if measured_profile in PROFILE_UI:
             result_profile_ui = PROFILE_UI[measured_profile]
             result_path_note = f'<p class="measurement-result-path"><b>{ui_icon("check", "측정 경로")} 이 결과의 전용 경로</b><span>{html.escape(result_profile_ui["detail"])}</span></p>'
             final_apply_target = f'{result_profile_ui["title"]} · {result_profile_ui["detail"]}'
-            preview_actions = f'<form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="{measured_profile}"><button>이번 튜닝</button></form>'
-            apply_actions = f'<form method="post" action="/measurement/apply" onsubmit="return confirm(\'{html.escape(result_profile_ui["title"])}의 기존 FIR WAV를 새 결과로 덮어씁니다. 기존 파일은 자동 백업됩니다. 정식 적용할까요?\')"><input type="hidden" name="profile" value="{measured_profile}"><button>정식 적용</button></form>'
+            preview_actions = preview_disabled_action or f'<form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="{measured_profile}"><button>이번 튜닝</button></form>'
+            apply_actions = apply_busy_action if busy else f'<form method="post" action="/measurement/apply" onsubmit="return confirm(\'{html.escape(result_profile_ui["title"])}의 기존 FIR WAV를 새 결과로 덮어씁니다. 기존 파일은 자동 백업됩니다. 정식 적용할까요?\')"><input type="hidden" name="profile" value="{measured_profile}"><button>정식 적용</button></form>'
         else:
             result_path_note = '<p class="measurement-result-path legacy"><b>이전 세션</b><span>측정 당시 U7 물리 경로가 기록되지 않았습니다. 경로를 직접 확인한 뒤 사용하세요.</span></p>'
             final_apply_target = "측정 경로를 직접 확인해야 하는 이전 세션"
-            preview_actions = '<form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="speaker"><button>스피커 A/B</button></form><form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="headphone"><button>헤드폰 A/B</button></form>'
-            apply_actions = '<form method="post" action="/measurement/apply" onsubmit="return confirm(\'스피커 출력 체인의 기존 FIR을 덮어씁니다. 정식 적용할까요?\')"><input type="hidden" name="profile" value="speaker"><button>스피커 적용</button></form><form method="post" action="/measurement/apply" onsubmit="return confirm(\'헤드폰 출력 체인의 기존 FIR을 덮어씁니다. 정식 적용할까요?\')"><input type="hidden" name="profile" value="headphone"><button>헤드폰 적용</button></form>'
+            preview_actions = preview_disabled_action or '<form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="speaker"><button>스피커로 듣기</button></form><form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="headphone"><button>헤드폰으로 듣기</button></form>'
+            apply_actions = apply_busy_action if busy else '<form method="post" action="/measurement/apply" onsubmit="return confirm(\'스피커 출력 체인의 기존 FIR을 덮어씁니다. 정식 적용할까요?\')"><input type="hidden" name="profile" value="speaker"><button>스피커 적용</button></form><form method="post" action="/measurement/apply" onsubmit="return confirm(\'헤드폰 출력 체인의 기존 FIR을 덮어씁니다. 정식 적용할까요?\')"><input type="hidden" name="profile" value="headphone"><button>헤드폰 적용</button></form>'
         stale_result_notice = ""
         if stale_result:
-            stale_result_notice = '<div class="failure" role="alert"><b>이전 알고리즘으로 계산된 결과</b><br>측정 원본은 유지되어 있습니다. 4단계에서 FIR 계산만 다시 실행해야 Preview와 정식 적용을 사용할 수 있습니다.</div>'
+            stale_result_notice = '<div class="failure" role="alert"><b>이전 알고리즘으로 계산된 결과</b><br>측정 원본은 유지되어 있습니다. 4단계에서 FIR 계산만 다시 실행해야 미리듣기와 정식 적용을 사용할 수 있습니다.</div>'
             preview_actions = '<button disabled>A/B 대기</button>'
             apply_actions = '<button disabled>적용 대기</button>'
         elif crossover_pending and not validation_failed:
-            stale_result_notice = '<div class="diagnostic-note" role="status"><b>이전 합산 판정 · FIR 재계산 필요</b><br>4 · FIR 계산에서 현재 설정으로 다시 계산하세요. 새 계산은 모든 필수 측정을 3단계에서 끝내며, FIR 생성 뒤 추가 sweep을 요구하지 않습니다.</div>'
+            stale_result_notice = '<div class="diagnostic-note" role="status"><b>이전 합산 판정 · FIR 재계산 필요</b><br>4 · FIR 계산에서 현재 설정으로 다시 계산하세요. 새 계산은 모든 필수 측정을 3단계에서 끝내며, FIR 생성 뒤 추가 스윕을 요구하지 않습니다.</div>'
             apply_actions = '<button disabled>재계산 필요</button>'
         elif not self_validation.get("overall_pass"):
             stale_result_notice = '<div class="failure" role="alert"><b>타겟/합산 셀프검증 미통과</b><br>WAV 다운로드와 A/B 확인은 가능하지만 정식 적용은 차단됩니다. 진단 항목을 확인하고 설정을 조정해 다시 계산하세요.</div>'
@@ -2392,11 +2492,11 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 prediction_consistency = post_evaluation.get("prediction_consistency") or {}
                 prediction_status = {"pass": "PASS", "fail": "FAIL", "inconclusive_switching_transient": "판정 보류 · 출력 전환 감지", "inconclusive_low_snr": "판정 보류 · SNR 부족", "warning_phase_limited": "권장 · 위상 제한"}.get(str(prediction_consistency.get("status")), "판정 없음")
                 post_failure_guide = "" if post_evaluation.get("overall_pass") else (
-                    f'<p class="diagnostic-note"><b>판정 보류 · 출력 전환 감지</b> · {html.escape(str((post_evaluation.get("recommended_retry") or {}).get("action", "5 · 적용 전 검토에서 ‘검증 초기화’ 후 같은 레벨로 다시 측정하세요.")))}</p>'
+                    f'<p class="diagnostic-note"><b>판정 보류 · 출력 전환 감지</b> · {html.escape(str((post_evaluation.get("recommended_retry") or {}).get("action", "5 · 결과 검토에서 ‘검증 초기화’ 후 같은 레벨로 다시 측정하세요.")))}</p>'
                     if inconclusive_transient else
-                    f'<p class="diagnostic-note"><b>판정 보류 · SNR 부족</b> · {html.escape(str((post_evaluation.get("recommended_retry") or {}).get("action", "5 · 적용 전 검토에서 ‘검증 초기화’ 후 ‘검증 sweep 입력 -25 dBFS’로 다시 측정하세요.")))}</p>'
+                    f'<p class="diagnostic-note"><b>판정 보류 · SNR 부족</b> · {html.escape(str((post_evaluation.get("recommended_retry") or {}).get("action", "5 · 결과 검토에서 ‘검증 초기화’ 후 ‘검증 스윕 입력 -25 dBFS’로 다시 측정하세요.")))}</p>'
                     if inconclusive_low_snr else
-                    '<p class="failure"><b>조치</b> · 먼저 <b>5 · 적용 전 검토 → 기존 튜닝</b>으로 복귀한 뒤 U7 경로·마이크 위치가 원측정과 같은지 확인하세요. 예상↔실측만 FAIL이면 <b>3 · 위치 측정 → 저장 원본 재계산</b> 후 <b>4 · FIR 계산</b>을 다시 실행하세요. 실측↔타깃도 FAIL이면 <b>4 · FIR 계산</b>의 크로스오버·최종 우퍼 트림·추가 억제를 한 항목씩 바꿔 비교하세요.</p>'
+                    '<p class="failure"><b>조치</b> · 먼저 <b>5 · 결과 검토 → 기존 튜닝</b>으로 복귀한 뒤 U7 경로·마이크 위치가 원측정과 같은지 확인하세요. 예상↔실측만 FAIL이면 <b>3 · 위치 측정 → 저장 원본 재계산</b> 후 <b>4 · FIR 계산</b>을 다시 실행하세요. 실측↔타깃도 FAIL이면 <b>4 · FIR 계산</b>의 크로스오버·최종 우퍼 트림·추가 억제를 한 항목씩 바꿔 비교하세요.</p>'
                 )
                 post_verdict_label = "PASS" if post_evaluation.get("overall_pass") else "판정 보류 · 출력 전환 감지" if inconclusive_transient else "판정 보류 · SNR 부족" if inconclusive_low_snr else "FAIL"
                 post_verdict_class = "success" if post_evaluation.get("overall_pass") else "diagnostic-note" if inconclusive_post else "failure"
@@ -2409,7 +2509,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
                     f"FAIL · {post_snr_minimum} dB"
                 )
                 post_snr_class = "" if post_snr_recommended else "diagnostic-warning" if post_snr.get("pass") else "validation-fail"
-                post_result = f'<div class="diagnostic-grid post-validation-metrics">{post_metrics}<div><small>L/R 일치</small><b>{post_evaluation.get("lr_match", {}).get("median_shape_difference_db", "?")} dB</b></div><div><small>예상 모델 일치</small><b>{prediction_status}</b><span>신뢰 가능한 합산 위상은 정식 PASS에 포함</span></div><div class="{post_snr_class}"><small>사후 SNR 최소</small><b>{post_snr_label}</b><span>사용 최소 6 dB · 권장 ≥15 dB · 현재 {post_evaluation.get("sweep_seconds", "?")}초 ESS</span></div></div><p class="{post_verdict_class}"><b>{post_verdict_label}</b> · 실제 Preview FIR을 통과한 합산 음압 판정</p>{post_failure_guide}'
+                post_result = f'<div class="diagnostic-grid post-validation-metrics">{post_metrics}<div><small>L/R 일치</small><b>{post_evaluation.get("lr_match", {}).get("median_shape_difference_db", "?")} dB</b></div><div><small>예상 모델 일치</small><b>{prediction_status}</b><span>신뢰 가능한 합산 위상은 정식 PASS에 포함</span></div><div class="{post_snr_class}"><small>사후 SNR 최소</small><b>{post_snr_label}</b><span>사용 최소 6 dB · 권장 ≥15 dB · 현재 {post_evaluation.get("sweep_seconds", "?")}초 ESS</span></div></div><p class="{post_verdict_class}"><b>{post_verdict_label}</b> · 실제 미리듣기 FIR을 통과한 합산 음압 판정</p>{post_failure_guide}'
             else:
                 post_result = '<p class="muted">아직 실제 FIR을 통과한 합산 음압 결과가 없습니다.</p>'
             next_position = min(post_total, post_completed + 1)
@@ -2417,7 +2517,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
             post_action_note = (
                 "검증을 완료했습니다. 소리 없이 최신 판정만 적용하려면 ‘저장 결과 재판정’, 다시 측정하려면 ‘검증 초기화’ 후 ‘이번 튜닝’을 누르세요."
                 if post_completed >= post_total else
-                "먼저 위의 ‘이번 튜닝’을 눌러 Preview를 적용하세요."
+                "먼저 위의 ‘이번 튜닝’을 눌러 미리듣기 FIR을 적용하세요."
                 if not preview_active else
                 f"마이크를 {'기준점' if post_total == 1 else f'검증 위치 {next_position}/{post_total}'}에 놓고 실행하세요. 원측정과 생성 FIR은 지워지지 않습니다."
             )
@@ -2435,9 +2535,9 @@ def measurement_panel(job: dict, preview: dict) -> str:
             post_pill_class = "" if post_evaluation.get("overall_pass") else "neutral" if (post_evaluation.get("inconclusive_low_snr") or post_evaluation.get("inconclusive_switching_transient")) else "error" if post_evaluation else ""
             post_validation_html = f'''
             <section class="post-validation-card" aria-labelledby="post-validation-title">
-              <div class="section-head"><div><h4 id="post-validation-title">선택 사항 · Preview FIR 적용 후 합산 실측</h4><p class="muted">실제 스테레오 입력 → 현재 프런트/우퍼 FIR → U7 4채널 → 방 → UMIK-1 경로를 측정합니다. 정식 적용 필수 단계가 아니며 원측정과 생성 FIR은 유지됩니다.</p></div><span class="pill {post_pill_class}">{post_completed}/{post_total} 위치</span></div>
-              <form method="post" action="/measurement/post-validation" class="measure-form" onsubmit="return confirm('현재 Preview FIR을 통과한 L+우퍼/R+우퍼 검증 스윕을 재생합니다. 원측정과 생성 FIR은 유지됩니다. 시작할까요?')">
-                <label>검증 sweep 입력<select name="level_dbfs"{' disabled' if post_completed else ''}>{level_options}</select>{post_level_hidden}<span>U7 청취 볼륨과 무관한 FIR 입력 기준입니다. 현재 FIR의 공통 감쇄는 {common_attenuation_label}이므로 대부분의 실제 출력은 선택값보다 그만큼 낮을 수 있습니다. 입력 OFF → PCM 0 dB → 출력 안정화용 무음 2초 → 28초 ESS → 원래 볼륨 복원 → 입력 복귀 순서로 실행합니다.</span></label>
+              <div class="section-head"><div><h4 id="post-validation-title">선택 사항 · 미리듣기 FIR 적용 후 합산 실측</h4><p class="muted">실제 스테레오 입력 → 현재 프런트/우퍼 FIR → U7 4채널 → 방 → UMIK-1 경로를 측정합니다. 정식 적용 필수 단계가 아니며 원측정과 생성 FIR은 유지됩니다.</p></div><span class="pill {post_pill_class}">{post_completed}/{post_total} 위치</span></div>
+              <form method="post" action="/measurement/post-validation" class="measure-form" onsubmit="return confirm('현재 미리듣기 FIR을 통과한 L+우퍼/R+우퍼 검증 스윕을 재생합니다. 원측정과 생성 FIR은 유지됩니다. 시작할까요?')">
+                <label>검증 스윕 입력<select name="level_dbfs"{' disabled' if post_completed else ''}>{level_options}</select>{post_level_hidden}<span>U7 청취 볼륨과 무관한 FIR 입력 기준입니다. 현재 FIR의 공통 감쇄는 {common_attenuation_label}이므로 대부분의 실제 출력은 선택값보다 그만큼 낮을 수 있습니다. 입력 OFF → PCM 0 dB → 출력 안정화용 무음 2초 → 28초 ESS → 원래 볼륨 복원 → 입력 복귀 순서로 실행합니다.</span></label>
               <button{post_button_disabled}>위치 {next_position}/{post_total} 합산 측정</button>
               </form>
               <p class="form-note">{html.escape(post_action_note)}</p>
@@ -2445,7 +2545,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
               {post_reset_control}
             </section>'''
         result_html = f"""
-        <div class="result-box" id="measurement-step-5" data-measurement-step-content="5"><h3>적용 전 검토 · 생성 결과</h3>
+        <div class="result-box" id="measurement-step-5" data-measurement-step-content="5"><h3>결과 검토 · 생성 FIR</h3>
           {stale_result_notice}
           {result_path_note}
           <p><b>{html.escape(dict(target_labels).get(str(result.get('target')), str(result.get('target'))))}</b> · {html.escape(dict((('none', '추가 억제 없음'), ('primus360', 'Primus 360 수준'), ('strong', 'T5S 강한 억제'))).get(str(result.get('preset')), str(result.get('preset'))))} · {result.get('taps')}탭 · 프런트 피크 {left.get('peak_tap', '?')}탭 ({left.get('peak_delay_ms', '?')} ms)</p>
@@ -2467,59 +2567,85 @@ def measurement_panel(job: dict, preview: dict) -> str:
           {('<a class="button" download href="/api/measurement/download/all">전체 ZIP</a>' if result.get('rear') else '')}
           {('<a class="button secondary" download href="/api/measurement/download/report-md">보고서 MD</a>' if result.get('report_md') else '')}
           {('<a class="button secondary" download href="/api/measurement/download/report-json">결과 JSON</a>' if result.get('report_json') else '')}</div>
-          <div class="result-box"><b>A/B 청취 비교</b><p class="muted">현재 상태: <span class="pill">{preview_label}</span> · 테스트 적용은 프로필 WAV와 설정을 덮어쓰지 않습니다.</p><div class="measure-actions">
+          <div class="result-box ab-review-group"><b>A/B 미리듣기</b><p class="muted">현재 상태: <span class="pill">{preview_label}</span> · 미리듣기는 프로필 WAV와 저장 설정을 바꾸지 않습니다.</p><div class="measure-actions">
           {preview_actions}
-          <form method="post" action="/measurement/restore"><button>기존 튜닝</button></form></div></div>
+          {result_restore_action}</div></div>
           {post_validation_html}
-          <section class="final-apply-card" id="measurement-step-6" data-measurement-step-content="6"><div><h4>검토한 결과를 정식 프로필에 적용</h4><p><b>현재 판정: {validation_label}</b><br>대상: {html.escape(final_apply_target)}<br>적용 직전 기존 FIR을 자동 백업하며, A/B Preview와 달리 이 단계에서만 프로필 WAV를 교체합니다.</p></div><div class="measure-actions">{apply_actions}</div></section>
+          <section class="final-apply-card" id="measurement-step-6" data-measurement-step-content="6"><div><h4>검토한 결과를 정식 프로필에 적용</h4><p><b>현재 판정: {validation_label}</b><br>대상: {html.escape(final_apply_target)}<br>적용 직전 기존 FIR을 자동 백업하며, A/B 미리듣기와 달리 이 단계에서만 프로필 WAV를 교체합니다.</p></div><div class="measure-actions">{apply_actions}</div></section>
         </div>"""
         if result.get("kind") == "mimo_2x4":
             mimo = result.get("mimo", {})
             prediction = mimo.get("prediction", {})
             metric_cards = "".join(
-                f'<div><small>{channel.title()} target MAE</small><b>{values.get("before_target_mae_db", "?")} → {values.get("after_target_mae_db", "?")} dB</b><small>좌석 편차 {values.get("before_spatial_std_db", "?")} → {values.get("after_spatial_std_db", "?")} dB<br>저역 late/early {values.get("before_modal_tail_db", "?")} → {values.get("after_modal_tail_db", "?")} dB · 낮을수록 양호</small></div>'
+                f'<div><small>{"L" if channel == "left" else "R"} 타깃 평균 오차</small><b>{values.get("before_target_mae_db", "?")} → {values.get("after_target_mae_db", "?")} dB</b><small>위치별 {" / ".join(str(value) for value in values.get("after_position_mae_db", [])) or "?"} dB<br>좌석 편차 {values.get("before_spatial_std_db", "?")} → {values.get("after_spatial_std_db", "?")} dB</small></div>'
                 for channel, values in prediction.items()
             )
-            topology = html.escape(str(mimo.get("topology", "mimo")))
+            topology_value = str(mimo.get("topology", "mimo"))
+            topology = html.escape({
+                "mimo_stereo": "MIMO Stereo",
+                "mimo_one_sub": "MIMO 2.1 · 우퍼 1대",
+                "mimo_dual_sub": "MIMO 2.2 · 우퍼 2대",
+            }.get(topology_value, topology_value))
+            strength_value = str(mimo.get("strength", "?"))
+            strength_label = html.escape({
+                "safe": "안전 · 변화 작음",
+                "balanced": "균형 · 권장",
+                "maximum": "효과 우선 · 엄격 검증",
+            }.get(strength_value, strength_value))
             headroom = mimo.get("headroom", {})
             diversity = mimo.get("actuator_diversity", {})
             normalization = mimo.get("target_level_normalization", {})
             target_offsets = normalization.get("target_offset_db", {})
             resource_budget = mimo.get("resource_budget", {})
+            condition = mimo.get("regularized_condition_number_1", {})
+            uncertainty = mimo.get("robust_uncertainty", {})
+            condition_limit = float(condition.get("limit", 10_000) or 10_000)
+            condition_max = condition.get("maximum")
+            condition_fail = isinstance(condition_max, (int, float)) and float(condition_max) > condition_limit
+            actuator_confidence = uncertainty.get("actuator_confidence", {})
+            confidence_summary = " · ".join(
+                f'{html.escape(str(source))} {values.get("p10", "?")}'
+                for source, values in actuator_confidence.items()
+            ) or "계산값 없음"
             mimo_crossover = result.get("crossover", mimo.get("crossover", {}))
             mimo_validation_failed = validation_failed
             mimo_crossover_failed = bool(crossover_check.get("required")) and crossover_check.get("pass") is False
             mimo_crossover_pending = bool(crossover_check.get("required")) and crossover_check.get("pass") is None and not validation_failed
             mimo_validation_label = "FAIL · 적용 차단" if mimo_validation_failed else "사후 실측 대기" if mimo_crossover_pending else "PASS"
             mimo_crossover_label = (
-                f'{mimo_crossover.get("frequency_hz", "?")} Hz · FIR bank 내장 · 추가 block latency {mimo_crossover.get("additional_block_latency_samples", 0)} samples'
+                f'{mimo_crossover.get("frequency_hz", "?")} Hz · FIR 묶음 내장 · 추가 블록 지연 {mimo_crossover.get("additional_block_latency_samples", 0)} 샘플'
                 if mimo_crossover.get("enabled") else "비적용"
             )
             if stale_result:
                 mimo_preview_actions = '<button disabled>A/B 대기</button>'
                 mimo_apply_actions = '<button disabled>적용 대기</button>'
+            elif preview_block_reason:
+                mimo_preview_actions = preview_disabled_action
+                mimo_apply_actions = apply_busy_action if busy else '<button disabled title="U7 출력 경로를 측정 경로와 맞춘 뒤 결과를 검토하세요.">경로 확인 필요</button>'
             else:
                 mimo_preview_actions = '<form method="post" action="/measurement/preview"><input type="hidden" name="profile" value="speaker"><button>이번 튜닝</button></form>'
-                if mimo_crossover_pending:
+                if busy:
+                    mimo_apply_actions = apply_busy_action
+                elif mimo_crossover_pending:
                     mimo_apply_actions = '<button disabled>검증 대기</button>'
                 elif not self_validation.get("overall_pass"):
                     mimo_apply_actions = '<button disabled>적용 차단</button>'
                 else:
                     mimo_apply_actions = '<form method="post" action="/measurement/apply" onsubmit="return confirm(\'검증된 MIMO 필터 묶음을 스피커 프로필에 설치합니다. 기존 설정은 자동 백업됩니다. 정식 적용할까요?\')"><input type="hidden" name="profile" value="speaker"><button>정식 적용</button></form>'
             result_html = f"""
-            <div class="result-box" id="measurement-step-5" data-measurement-step-content="5"><h3>MIMO 2×4 적용 전 검토</h3>
+            <div class="result-box" id="measurement-step-5" data-measurement-step-content="5"><h3>MIMO 2×4 결과 검토</h3>
               {stale_result_notice}
               {result_path_note}
-              <p><b>{topology}</b> · {result.get('taps')} taps × 8 convolution paths · 공동 제어 {mimo.get('frequency_range_hz', ['?', '?'])[0]}–{mimo.get('frequency_range_hz', ['?', '?'])[1]} Hz</p>
-        <div class="diagnostic-grid">{metric_cards}<div class="{'validation-fail' if mimo_crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if mimo_crossover_failed else '실측 대기 · ' if mimo_crossover_pending else ''}{html.escape(mimo_crossover_label)}</b><small>{html.escape(str(crossover_check.get('status', mimo_crossover.get('status', ''))))}</small></div><div><small>최악 상관입력 행 합계</small><b>{headroom.get('maximum_correlated_input_row_sum', '?')}</b><small>전체 {headroom.get('global_scale_db', '?')} dB · 우퍼 트림 실제 전달 제한</small></div><div><small>공통 0 dB 기준</small><b>L/R/우퍼 전체 · 공통 gain {common_gain_label}</b><small>채널별 정규화 없음 · 최대 상대 보상 {limits.get('max_relative_compensation_db', '?')} dB</small></div><div><small>제어원 최대 코히어런스</small><b>{diversity.get('maximum_coherence', '?')}</b><small>1에 가까우면 독립성 부족</small></div><div><small>저역 기준 레벨 고정</small><b>공통 {target_offsets.get('left', '?')} dB</b><small>{normalization.get('reference_band_hz', ['?', '?'])[0]}–{normalization.get('reference_band_hz', ['?', '?'])[1]} Hz · L/R 동일 기준</small></div><div><small>MIMO 해 강도</small><b>{html.escape(str(mimo.get('strength', '?')))} · 혼합 {mimo.get('solution_blend', '?')}</b><small>기존 안정 해와 공동제어 해의 혼합</small></div><div><small>메모리 계획값</small><b>실시간 {resource_budget.get('runtime_dsp_planning_mib', '?')} / 생성 {resource_budget.get('filter_generation_planning_mib', '?')} MiB</b><small>실측 부하가 아닌 보수적 상한 · CPU/XRUN은 별도 검증</small></div><div class="{'validation-fail' if mimo_validation_failed else ''}"><small>자체 검증</small><b>{mimo_validation_label}</b></div></div>
+              <p><b>{topology}</b> · {result.get('taps')}탭 · 컨볼루션 8경로 · 공동 제어 {mimo.get('frequency_range_hz', ['?', '?'])[0]}–{mimo.get('frequency_range_hz', ['?', '?'])[1]} Hz</p>
+        <div class="diagnostic-grid">{metric_cards}<div class="{'validation-fail' if mimo_crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if mimo_crossover_failed else '실측 대기 · ' if mimo_crossover_pending else ''}{html.escape(mimo_crossover_label)}</b><small>{html.escape(str(crossover_check.get('status', mimo_crossover.get('status', ''))))}</small></div><div class="{'validation-fail' if condition_fail else ''}"><small>수치 안정성 · 조건수</small><b>중앙 {condition.get('median', '?')} · P95 {condition.get('p95', '?')} · 최대 {condition_max if condition_max is not None else '?'}</b><small>실제 1-노름 조건수 · 허용 ≤{condition_limit:g}<br>자동 안정화 {condition.get('adaptive_loading_bins', 0)}개 주파수</small></div><div><small>출력별 측정 신뢰도 P10</small><b>{confidence_summary}</b><small>약한 출력만 정규화하며 다른 출력이 유효한 위치 전체를 버리지 않음</small></div><div><small>최악 상관입력 행 합계</small><b>{headroom.get('maximum_correlated_input_row_sum', '?')}</b><small>전체 {headroom.get('global_scale_db', '?')} dB · 우퍼 트림 실제 전달 제한</small></div><div><small>공통 0 dB 기준</small><b>L/R/우퍼 전체 · 공통 이득 {common_gain_label}</b><small>채널별 정규화 없음 · 최대 상대 보상 {limits.get('max_relative_compensation_db', '?')} dB</small></div><div><small>제어원 공간 코히어런스 P90</small><b>{diversity.get('maximum_coherence', '?')}</b><small>주파수별 계산 · 1에 가까우면 독립성 부족</small></div><div><small>저역 기준 레벨 고정</small><b>공통 {target_offsets.get('left', '?')} dB</b><small>{normalization.get('reference_band_hz', ['?', '?'])[0]}–{normalization.get('reference_band_hz', ['?', '?'])[1]} Hz · L/R 동일 기준</small></div><div><small>MIMO 안정성/효과</small><b>{strength_label} · 혼합 {mimo.get('solution_blend', '?')}</b><small>기존 안정 해와 공동제어 해의 혼합</small></div><div><small>메모리 계획값</small><b>실시간 {resource_budget.get('runtime_dsp_planning_mib', '?')} / 생성 {resource_budget.get('filter_generation_planning_mib', '?')} MiB</b><small>실측 부하가 아닌 보수적 상한이며 성능 검증은 별도 진단에서 확인합니다.</small></div><div class="{'validation-fail' if mimo_validation_failed else ''}"><small>자체 검증</small><b>{mimo_validation_label}</b></div></div>
               <div class="graph-toolbar"><div><b>응답 비교</b><small>전체 대역 / 저역 확대</small></div><div role="group" aria-label="그래프 주파수 범위"><button type="button" class="secondary selected" data-result-range="full" aria-pressed="true">전체</button><button type="button" class="secondary" data-result-range="bass" aria-pressed="false">저역</button></div></div>
               <svg id="measurement-result-graph" data-result-target="{html.escape(str(result.get('target', 'harman')))}" viewBox="0 0 760 250" role="img" aria-label="MIMO 보정 예상 응답"></svg><p id="measurement-result-summary" class="muted" aria-live="polite"></p>
               {validation_checklist_html}<div class="diagnostic-note"><b>추가 자동 진단 메모</b><ul>{warning_html}</ul></div>{audit_html}
-              <p class="muted">예측은 측정한 세 위치의 선형 모델에만 유효합니다. 평활 전달함수 기반 impulse-tail proxy가 1.5 dB 넘게 악화되면 적용을 차단합니다. 이 값은 실제 RT60/잔향 예측이 아니며, 실제 적용 전 Preview와 이후 별도 위치 재측정·XRUN/CPU 확인이 필요합니다.</p>
+              <p class="muted">실선은 세 위치의 가중 평균, 가는 점선은 세 위치 예상 범위입니다. 평균이 좋아져도 어느 한 측정 위치의 타깃 MAE가 0.75 dB 넘게 악화되거나 조건수가 허용값을 넘으면 적용을 차단합니다. 이는 미측정 위치를 보장하지 않으므로 5단계의 A/B 미리듣기와 선택적 합산 실측으로 실제 결과를 확인하세요.</p>
               <div class="measure-actions"><a class="button" download href="/api/measurement/download/all">MIMO WAV 4개 + 보고서 ZIP</a><a class="button secondary" download href="/api/measurement/download/report-md">한계 포함 보고서 MD</a><a class="button secondary" download href="/api/measurement/download/report-json">전체 결과 JSON</a></div>
-              <div class="result-box"><b>A/B 청취 비교</b><p class="muted">현재 상태: <span class="pill">{preview_label}</span> · MIMO는 실제 4채널 스피커 출력 전용입니다.</p><div class="measure-actions">{mimo_preview_actions}<form method="post" action="/measurement/restore"><button>기존 튜닝</button></form></div></div>
+              <div class="result-box ab-review-group"><b>A/B 미리듣기</b><p class="muted">현재 상태: <span class="pill">{preview_label}</span> · MIMO는 실제 4채널 스피커 출력 전용입니다.</p><div class="measure-actions">{mimo_preview_actions}{result_restore_action}</div></div>
               {post_validation_html}
-              <section class="final-apply-card" id="measurement-step-6" data-measurement-step-content="6"><div><h4>MIMO bank 정식 적용</h4><p><b>현재 판정: {mimo_validation_label}</b><br>대상: Speaker 4채널 출력 · 32768탭 × 8 convolution paths<br>적용 직전 기존 MIMO bank와 설정을 자동 백업합니다.</p></div><div class="measure-actions">{mimo_apply_actions}</div></section>
+              <section class="final-apply-card" id="measurement-step-6" data-measurement-step-content="6"><div><h4>MIMO FIR 묶음 정식 적용</h4><p><b>현재 판정: {mimo_validation_label}</b><br>대상: 스피커 4채널 출력 · 32768탭 · 컨볼루션 8경로<br>적용 직전 기존 MIMO FIR 묶음과 설정을 자동 백업합니다.</p></div><div class="measure-actions">{mimo_apply_actions}</div></section>
             </div>"""
     error = ""
     if job.get("error"):
@@ -2546,7 +2672,10 @@ def measurement_panel(job: dict, preview: dict) -> str:
         woofer_semantics = "합산 응답 조건이며 최종 재생 트림과 동일" if mode == "lr" else ("사용하지 않음" if mode == "mimo_stereo" else "측정 감쇄는 역컨볼루션에서 복원되며 SNR에만 영향")
         configured_output = f'''<div class="measurement-output-summary" data-measurement-step-content="2"><div><small>측정 구성</small><b>{html.escape(mode_label)}</b><span>{html.escape(MEASUREMENT_MODE_HELP.get(mode, ''))}</span></div><div><small>DAC 기준 출력</small><b>출력별 빠른 스윕 2초 · 본 스윕 {configured_sweep} dBFS</b><span>U7 청취 볼륨 무시·자동 복원 · 우퍼 감쇄 {configured_woofer} dB · 우퍼 실효 {configured_sweep + configured_woofer} dBFS<br>{html.escape(woofer_semantics)}</span></div></div>'''
     path_match_token = "" if path_match is None else str(path_match).lower()
+    calibration_input_disabled = " disabled" if busy else ""
+    calibration_button_disabled = ' disabled title="측정 작업이 끝난 뒤 마이크 보정 파일을 바꿀 수 있습니다."' if busy else ""
     panel_empty = {
+        "session": "새 세션을 만들거나 저장된 세션을 불러온 뒤 측정 흐름을 시작합니다.",
         1: "출력 조합과 측정 위치 수를 선택합니다.",
         2: "세션을 만든 뒤 출력 레벨을 확인합니다.",
         3: "레벨 검사를 통과하면 청취 위치 측정이 활성화됩니다.",
@@ -2554,32 +2683,33 @@ def measurement_panel(job: dict, preview: dict) -> str:
         5: "FIR 계산이 끝나면 전후 그래프·진단·A/B 비교가 표시됩니다.",
         6: "검증된 FIR 결과가 있어야 정식 적용할 수 있습니다.",
     }
+    panel_definitions = (("session", "S", "세션"),) + tuple((str(number), str(number), label) for number, label in step_labels)
     panels = "".join(
-        f'''<section class="measurement-panel" id="measurement-panel-{number}" role="tabpanel" aria-labelledby="measurement-tab-{number}" tabindex="0" {'' if number == current_step else 'hidden'}>
-          <div class="measurement-panel-heading"><span>{number}</span><div><b>{label}</b><small>{panel_empty[number]}</small></div></div>
-          <div class="measurement-panel-content" data-measurement-panel-content="{number}"></div>
-          <div class="measurement-panel-empty" data-measurement-panel-empty="{number}">{panel_empty[number]}</div>
+        f'''<section class="measurement-panel" id="measurement-panel-{key}" role="tabpanel" aria-labelledby="measurement-tab-{key}" tabindex="0" {'' if key == current_tab else 'hidden'}>
+          <div class="measurement-panel-heading"><span>{marker}</span><div><b>{label}</b><small>{panel_empty[key if key == "session" else int(key)]}</small></div></div>
+          <div class="measurement-panel-content" data-measurement-panel-content="{key}"></div>
+          <div class="measurement-panel-empty" data-measurement-panel-empty="{key}">{panel_empty[key if key == "session" else int(key)]}</div>
         </section>'''
-        for number, label in step_labels
+        for key, marker, label in panel_definitions
     )
     return f"""
     <section class="measurement card-wide" data-job-state="{html.escape(state)}" data-job-position="{positions}" data-job-post-position="{int((job.get('post_filter_validation') or {}).get('positions_completed', 0))}" data-job-updated="{job.get('updated_unix', 0)}" data-job-result-token="{html.escape(str(job.get('result_token', 'none')))}" data-job-path-match="{path_match_token}" data-job-output="{html.escape(str(current_profile or ''))}">
       <div class="section-head"><div><h2>UMIK-1 측정 · 32768탭 자동 보정</h2><p class="muted">선택한 청취 위치 {total}곳 · 위치당 {panel_acquisition_count if state != 'idle' else '선택 구성'}회 재생 · UMIK 천장 방향 90°. 재생 중 CamillaDSP direct bypass 및 U7 입력 OFF.</p></div><span class="pill">{'UMIK 연결' if job.get('umik_connected') else 'UMIK 없음'}</span></div>
       {error}<div class="job-status"><div class="job-status-head"><div role="status" aria-live="polite" aria-atomic="true"><b id="job-stage">{html.escape(str(job.get('stage', '대기')))}</b><span id="job-eta">{eta_text}</span></div><span id="job-live-state" class="job-live-state"><i aria-hidden="true"></i>실시간</span></div><progress id="job-progress" max="100" value="{progress:.2f}"></progress><small id="job-percent">{progress:.0f}%</small></div>
       {session_overview}
-      <nav class="workflow" role="tablist" aria-label="측정·보정 6단계 탭">{workflow}</nav>
+      <nav class="workflow" role="tablist" aria-label="세션과 측정·보정 6단계 탭">{workflow}</nav>
       <div class="measurement-tab-panels">{panels}</div>
       <div class="measurement-step-sources">
       {path_lock_html}
       {configured_output}
       <details class="cal-card" id="measurement-step-1" data-measurement-step-content="1" open><summary class="cal-head"><span class="state-icon">μ</span><div><b>UMIK-1 마이크 보정</b><p class="muted">0°/90° 보정 파일 상태 및 교체 · 단계 이동만으로는 값이 지워지지 않습니다.</p></div></summary><div class="cal-slots">
-        <form method="post" action="/measurement/calibration" enctype="multipart/form-data" class="cal-slot" onsubmit="return confirm('90° 보정 파일을 바꾸면 영향받는 측정과 FIR 결과가 초기화됩니다. 계속할까요?')"><input type="hidden" name="orientation" value="90"><div><b>90° · 천장 방향</b><span class="pill">룸 측정용 · 권장</span></div><p>{cal90_summary}</p><label>miniDSP 90° TXT<input required type="file" name="file" accept="text/plain,.txt"></label><button>90° 교체</button></form>
-        <form method="post" action="/measurement/calibration" enctype="multipart/form-data" class="cal-slot"><input type="hidden" name="orientation" value="0"><div><b>0° · 마이크 정면</b><span class="pill neutral">근접 진단용</span></div><p>{cal0_summary}</p><label>miniDSP 0° TXT<input required type="file" name="file" accept="text/plain,.txt"></label><button>0° 교체</button></form>
+        <form method="post" action="/measurement/calibration" enctype="multipart/form-data" class="cal-slot" data-return-anchor="measurement-step-1" onsubmit="return confirm('90° 보정 파일을 바꾸면 영향받는 측정과 FIR 결과가 초기화됩니다. 계속할까요?')"><input type="hidden" name="orientation" value="90"><div><b>90° · 천장 방향</b><span class="pill">룸 측정용 · 권장</span></div><p>{cal90_summary}</p><label>miniDSP 90° TXT<input required type="file" name="file" accept="text/plain,.txt"{calibration_input_disabled}></label><button{calibration_button_disabled}>90° 교체</button></form>
+        <form method="post" action="/measurement/calibration" enctype="multipart/form-data" class="cal-slot" data-return-anchor="measurement-step-1"><input type="hidden" name="orientation" value="0"><div><b>0° · 마이크 정면</b><span class="pill neutral">근접 진단용</span></div><p>{cal0_summary}</p><label>miniDSP 0° TXT<input required type="file" name="file" accept="text/plain,.txt"{calibration_input_disabled}></label><button{calibration_button_disabled}>0° 교체</button></form>
       </div></details>
       {'' if mimo_supported else f'<p class="diagnostic-note" data-measurement-step-content="1"><b>MIMO 비활성</b> · {html.escape(str(capabilities.get("reason", "플랫폼 또는 timing reference 조건 미충족")))} SISO L/R/우퍼 보정은 그대로 사용할 수 있습니다.</p>'}
       {controls}
       {result_html}{MEASUREMENT_LEVEL_SCRIPT}
-      <details data-measurement-step-content="4"><summary>알고리즘과 안전 제한</summary><p>세 위치 대표 응답에는 저역 1/12-oct, 중역 1/6-oct, 고역 1/3-oct 가변 smoothing을 사용합니다. Sweep 정합 deconvolution에 더해 pre/post-roll noise PSD로 대역별 SNR을 계산하고, 6–15 dB 신뢰도 ramp로 오염된 위치·대역의 보정과 boost를 줄입니다. 순간 생활소음은 100 ms sweep-envelope 이상치로 표시하며 원본 impulse/잔향을 잘라내지 않습니다. 위치 편차가 큰 null은 주파수별 regularization으로 boost를 축소하고, 반 옥타브 중앙값으로 추정한 스피커 자연 roll-off 밖은 boost하지 않습니다. 정밀 모드는 L/R/우퍼 음압, L+우퍼/R+우퍼의 |S|² 교차항, L+R+우퍼 동시 신호의 위상 부호·상대 지연을 공동 사용합니다. 합산 응답은 분기에 평균하지 않으며 한쪽 분기가 지배하는 주파수에서는 불안정한 교차항의 가중치를 자동으로 낮춥니다. 옥타브별 noise-compensated Schroeder EDT/T20으로 잔향을 진단하고 신뢰 가능한 300 Hz 이하 장시간 공진만 cut-only로 최대 3 dB 더 감쇄합니다. late reverb는 역보정하지 않습니다. 고역은 magnitude 위주이며 L/R은 공통 phase를 사용합니다. 저역 phase 모드는 FIR 자체 지연과 음향 도달 지연을 합산해 Front/Woofer를 정렬하고, 합산 개선이 없으면 현재 지연·극성을 유지합니다. MIMO는 검증된 공통 timing reference가 있을 때만 활성화합니다. 모든 최종 FIR의 최대 전달 이득은 0 dB 이하입니다.</p></details>
+      <details data-measurement-step-content="4"><summary>알고리즘과 안전 제한</summary><p>세 위치 대표 응답에는 저역 1/12옥타브, 중역 1/6옥타브, 고역 1/3옥타브 가변 평활을 사용합니다. 스윕 역컨볼루션과 재생 전후 잡음 전력으로 대역별 SNR을 계산하고, 6–15 dB 신뢰도 구간에서 오염된 위치·대역의 보정과 부스트를 줄입니다. 순간 생활소음은 100 ms 스윕 포락선 이상치로 표시하며 원본 임펄스와 잔향을 잘라내지 않습니다. 위치 편차가 큰 딥은 주파수별 정규화로 부스트를 축소하고, 반 옥타브 중앙값으로 추정한 스피커 자연 롤오프 밖은 부스트하지 않습니다. 정밀 모드는 L/R/우퍼 음압, L+우퍼/R+우퍼의 |S|² 교차항, L+R+우퍼 동시 신호의 위상 부호·상대 지연을 공동 사용합니다. 합산 응답은 분기에 평균하지 않으며 한쪽 분기가 지배하는 주파수에서는 불안정한 교차항의 가중치를 자동으로 낮춥니다. 옥타브별 잡음 보정 Schroeder EDT/T20으로 잔향을 진단하고 신뢰 가능한 300 Hz 이하 장시간 공진만 감쇄 전용으로 최대 3 dB 더 줄입니다. 후반 잔향은 역보정하지 않습니다. 고역은 음압 위주이며 L/R은 공통 위상을 사용합니다. 저역 위상 모드는 FIR 자체 지연과 음향 도달 지연을 합산해 프런트/우퍼를 정렬하고, 합산 개선이 없으면 현재 지연·극성을 유지합니다. MIMO는 검증된 공통 시간 기준이 있을 때만 활성화합니다. 모든 최종 FIR의 최대 전달 이득은 0 dB 이하입니다.</p></details>
       </div>
       <noscript><style>.measurement-tab-panels{{display:none!important}}.measurement-step-sources{{display:block!important}}</style><p class="failure">단계 탭에는 JavaScript가 필요합니다. 아래에 전체 단계를 순서대로 표시합니다.</p></noscript>
     </section>"""
@@ -2632,18 +2762,19 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
         if staged["active"]:
             preview_active = bool(status.get("preview", {}).get("active")) and not bool(status.get("preview", {}).get("stale"))
             previewing = preview_active and status.get("preview", {}).get("profile") == profile
+            restore_disabled = "" if preview_active else ' disabled title="현재 기존 정식 FIR을 재생하고 있습니다."'
             stage_html = f"""
             <div class="stage-workflow" aria-label="WAV 적용 단계">
               <div class="stage-step done"><span>1</span><b>WAV 선택</b><small>임시 보관 완료</small></div>
               <div class="stage-step current"><span>2</span><b>응답 비교</b><small>기존 점선 · 새 값 실선</small></div>
-              <div class="stage-step"><span>3</span><b>A/B 청취</b><small>프로필은 그대로</small></div>
+              <div class="stage-step"><span>3</span><b>A/B 미리듣기</b><small>프로필은 그대로</small></div>
               <div class="stage-step"><span>4</span><b>정식 적용</b><small>백업 후 교체</small></div>
             </div>
-            <div class="stage-summary"><span class="state-icon">∿</span><div><b>적용 대기 중</b><p>{('프런트 · ' + staged_front_name) if staged_front['present'] else '프런트 · 기존값 유지'}<br>{('우퍼 · ' + staged_rear_name) if staged_rear['present'] else ('우퍼 · 기존값 유지' if candidate_rear else '우퍼 · 프런트 복사')}</p></div><span class="pill">{'업로드값 테스트 중' if previewing else '기존값 재생 중'}</span></div>
+            <div class="stage-summary"><span class="state-icon">∿</span><div><b>적용 대기 중</b><p>{('프런트 · ' + staged_front_name) if staged_front['present'] else '프런트 · 기존값 유지'}<br>{('우퍼 · ' + staged_rear_name) if staged_rear['present'] else ('우퍼 · 기존값 유지' if candidate_rear else '우퍼 · 프런트 복사')}</p></div><span class="pill">{'업로드 FIR 미리듣기 중' if previewing else '기존 FIR 재생 중'}</span></div>
             {staged_compare_graph(profile, candidate_rear)}
-            <div class="stage-actions"><div><b>3 · 소리로 확인</b><p class="muted">업로드값 테스트는 설정과 정식 WAV를 바꾸지 않습니다.</p></div><div class="measure-actions">
-              <form method="post" action="/staging/preview"><input type="hidden" name="profile" value="{profile}"><button>업로드 듣기</button></form>
-              <form method="post" action="/staging/restore"><button class="secondary">기존값 듣기</button></form>
+            <div class="stage-actions"><div><b>3 · A/B 미리듣기</b><p class="muted">미리듣기는 설정과 정식 WAV를 바꾸지 않습니다.</p></div><div class="measure-actions">
+              <form method="post" action="/staging/preview"><input type="hidden" name="profile" value="{profile}"><button>업로드 FIR</button></form>
+              <form method="post" action="/staging/restore"><button class="secondary"{restore_disabled}>기존 FIR</button></form>
             </div></div>
             <div class="stage-actions final"><div><b>4 · 확인 후 정식 적용</b><p class="muted">기존 WAV는 자동 백업됩니다. 이 버튼을 누르기 전에는 덮어쓰지 않습니다.</p></div><div class="measure-actions">
               <form method="post" action="/staging/apply" onsubmit="return confirm('{korean}의 기존 FIR을 업로드한 값으로 교체합니다. 정식 적용할까요?')"><input type="hidden" name="profile" value="{profile}"><button>정식 적용</button></form>
@@ -2653,6 +2784,7 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
         <section class="card {'active-profile' if is_active else ''}" data-profile="{profile}">
           <div class="profile-title"><div><h2><span class="profile-icon">{ui_icon('speaker' if profile == 'speaker' else 'input', PROFILE_UI[profile]['short'])}</span>{korean}</h2><p class="profile-subtitle">{html.escape(PROFILE_UI[profile]['detail'])} · 현재 실제 연결은 스피커</p></div>{'<span class="active-badge">U7 현재 출력</span>' if is_active else ''}</div>
           <div class="profile-mini-flow" aria-label="{html.escape(PROFILE_UI[profile]['short'])} 처리 흐름"><span>{ui_icon('dsp', 'FIR')} 프런트 FIR</span><i>→</i><span>{ui_icon('route', '라우팅')} {html.escape('프런트→우퍼 복사' if mode == 'copy_front' else '프런트/우퍼 분리')}</span><i>→</i><span>{ui_icon('speaker', '스피커 체인')} 스피커 체인</span></div>
+          <div class="profile-control-group"><div class="profile-group-head"><b>프로필 동작</b><small>전체 FIR 사용 여부와 MIMO 묶음을 관리합니다.</small></div>
           <form method="post" action="/bypass" class="bypass {'enabled' if bypass else ''}">
             <input type="hidden" name="profile" value="{profile}">
             <input type="hidden" name="enabled" value="{'off' if bypass else 'on'}">
@@ -2660,6 +2792,8 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
             <button>{'끄기' if bypass else '켜기'}</button>
           </form>
           {mimo_control}
+          </div>
+          <div class="profile-control-group"><div class="profile-group-head"><b>FIR 파일</b><small>프런트와 우퍼 WAV를 먼저 임시 보관한 뒤 그래프와 A/B 미리듣기로 확인합니다.</small></div><div class="profile-file-grid">
           <div class="file"><b>프런트 L/R FIR</b><p>{file_summary(files['front'])}</p>
             <form method="post" action="/upload-stage" enctype="multipart/form-data">
               <input type="hidden" name="profile" value="{profile}"><input type="hidden" name="band" value="front">
@@ -2672,7 +2806,10 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
               <label class="file-picker-label" for="{profile}-rear-wav-input">우퍼 FIR WAV 선택</label><input id="{profile}-rear-wav-input" required type="file" name="wav" accept="audio/wav,.wav"><button>우퍼 WAV</button>
             </form>
           </div>
+          </div>
           {stage_html}
+          </div>
+          <div class="profile-control-group"><div class="profile-group-head"><b>우퍼 출력</b><small>채널 복사/분리와 실시간 우퍼 레벨을 함께 설정합니다.</small></div><div class="profile-output-grid">
           <form method="post" action="/rear-mode" class="mode">
             <input type="hidden" name="profile" value="{profile}">
             <label><input type="radio" name="mode" value="copy_front" {'checked' if mode == 'copy_front' else ''}> 프런트 처리 후 우퍼로 복사 · 2채널 컨볼루션</label>
@@ -2684,11 +2821,12 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
             <label>실시간 우퍼 트림 <select name="trim_db">{''.join(f'<option value="{value}" {"selected" if value == woofer_trim else ""}>{value} dB</option>' for value in range(0, -19, -1))}</select></label>
             <button>트림 적용</button>
           </form>
+          </div></div>
         </section>""")
     camilla = "정상" if service_active("camilladsp.service") else "중지/오류"
     monitor = "정상" if service_active_any("audiodsp-profile-monitor.service") else "중지/오류"
-    notice = f'<div class="notice" role="status" aria-live="polite">{html.escape(message)}</div>' if message else ""
-    failure = f'<div class="failure" role="alert" tabindex="-1">{html.escape(error)}</div>' if error else ""
+    notice = f'<div class="notice page-message" role="status" aria-live="polite">{html.escape(message)}</div>' if message else ""
+    failure = f'<div class="failure page-message" role="alert" tabindex="-1">{html.escape(error)}</div>' if error else ""
     woofer_query = "0" if show_woofer else "1"
     nav_parts = []
     for key, path, label in (("status", "/", f"{ui_icon('wave', '현황')}<span>현황</span>"), ("measure", "/measure", f"{ui_icon('mic', '측정')}<span>측정·보정</span>"), ("settings", "/settings", f"{ui_icon('dsp', '설정')}<span>프로필·설정</span>")):
@@ -2703,7 +2841,7 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
         if job_state in ("running", "processing", "cancelling"):
             next_label, next_href, next_note = "진행 상황 보기", "/measure", str(job.get("stage", "측정 작업 진행 중"))
         elif job_state == "idle":
-            next_label, next_href, next_note = "룸 보정 시작", "/measure#measurement-step-1", "UMIK 보정 파일을 확인한 뒤 새 세션을 만듭니다."
+            next_label, next_href, next_note = "룸 보정 시작", "/measure#measurement-session", "세션을 만들거나 저장된 세션을 불러온 뒤 출력 설정을 확인합니다."
         elif not (job.get("level_check") or {}).get("ok"):
             next_label, next_href, next_note = "빠른 검사로 이동", "/measure#measurement-step-2", "모든 출력 조합을 각 2초씩 재생해 본 측정과 같은 방식으로 SNR과 클리핑을 확인합니다."
         elif job_positions < int(job.get("positions_total", 3)):
@@ -2711,7 +2849,7 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
         elif not job.get("result"):
             next_label, next_href, next_note = "FIR 설정·계산으로 이동", "/measure#measurement-step-4", "원본 측정값은 유지하고 보정 설정을 선택합니다."
         elif not job.get("applied_profile"):
-            next_label, next_href, next_note = "A/B 검토로 이동", "/measure#measurement-step-5", "다운로드와 A/B 비교 후에만 정식 적용합니다."
+            next_label, next_href, next_note = "결과 검토로 이동", "/measure#measurement-step-5", "그래프·다운로드·A/B 미리듣기를 확인한 뒤 정식 적용합니다."
         else:
             next_label, next_href, next_note = "적용 결과 확인", "/measure#measurement-step-6", f"{job.get('applied_profile')} 프로필에 정식 적용된 상태입니다."
         graph_note = (
@@ -2743,13 +2881,13 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
           <tr><td>DSP 요청 프로필</td><td id="dsp-requested">{html.escape(selected_label)}</td></tr>
           <tr><td>실제 적용 프로필</td><td id="dsp-effective" role="status" aria-live="polite" aria-atomic="true">{html.escape(effective_label)}{' (fallback)' if selected != effective else ''}</td></tr>
         <tr><td>DSP 바이패스</td><td>{'켜짐 · 원본 L/R 복사' if resolved['bypass'] else '꺼짐'}</td></tr>
-          <tr><td>A/B 청취 상태</td><td>{('이번 튜닝 테스트 중 · ' + html.escape(str(status.get('preview', {}).get('profile')))) if status.get('preview', {}).get('active') and not status.get('preview', {}).get('stale') else '기존 정식 튜닝'}</td></tr>
+        <tr><td>A/B 미리듣기 상태</td><td>{('이번 튜닝 미리듣기 중 · ' + html.escape(str(status.get('preview', {}).get('profile')))) if status.get('preview', {}).get('active') and not status.get('preview', {}).get('stale') else '기존 튜닝'}</td></tr>
         <tr><td>우퍼 처리</td><td>{html.escape(resolved['effective_rear_mode'])}</td></tr>
           <tr><td>컨볼루션</td><td>{resolved['convolution_channels']}채널</td></tr>
-          <tr><td>MIMO bank</td><td>{'활성 · ' + html.escape(str(resolved.get('mimo_topology'))) if resolved.get('mimo_paths') else ('설정됨, 현재 플랫폼에서 비활성: ' + html.escape(str(resolved.get('mimo_unavailable_reason'))) if resolved.get('mimo_unavailable_reason') else '비활성')}</td></tr>
+          <tr><td>MIMO FIR 묶음</td><td>{'활성 · ' + html.escape(str(resolved.get('mimo_topology'))) if resolved.get('mimo_paths') else ('설정됨, 현재 플랫폼에서 비활성: ' + html.escape(str(resolved.get('mimo_unavailable_reason'))) if resolved.get('mimo_unavailable_reason') else '비활성')}</td></tr>
           <tr><td>CamillaDSP / HID 감시</td><td>{camilla} / {monitor}</td></tr>
           <tr><td>시스템 상태</td><td id="system-health">확인 중…</td></tr>
-          <tr><td>오디오</td><td>48 kHz · 입력 2ch · 출력 4ch · chunksize {chunksize}</td></tr>
+          <tr><td>오디오</td><td>48 kHz · 입력 2채널 · 출력 4채널 · 처리 블록 {chunksize}</td></tr>
         </table></section>
         <section class="graphbox"><h2>현재 FIR 보정 전달함수</h2>
         <a class="button" href="/?woofer={woofer_query}">{'우퍼 숨기기' if show_woofer else '우퍼 표시'}</a>
@@ -2768,24 +2906,25 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
             restored_settings = restore_stage.get("settings", {})
             restore_detail = f"""
             <div class="restore-review">
-              <div class="stage-workflow" aria-label="백업 복원 단계"><div class="stage-step done"><span>1</span><b>ZIP 선택</b><small>임시 보관</small></div><div class="stage-step done"><span>2</span><b>무결성 검사</b><small>해시·WAV·Cal</small></div><div class="stage-step current"><span>3</span><b>내용 확인</b><small>아직 미적용</small></div><div class="stage-step"><span>4</span><b>복원 확정</b><small>자동 백업 후</small></div></div>
-              <div class="diagnostic-grid"><div><small>백업 버전</small><b>schema {restore_stage.get('schema_version')} · app {html.escape(str(restore_stage.get('app_version')))}</b></div><div><small>요청 프로필</small><b>{html.escape(str(restored_settings.get('requested_profile')))}</b></div><div><small>chunksize</small><b>{restored_settings.get('chunksize')}</b></div><div><small>FIR</small><b>{len(restore_stage.get('firs', {}))}개 검증</b></div><div><small>Calibration</small><b>{len(restore_stage.get('calibrations', {}))}개 검증</b></div></div>
+              <div class="stage-workflow" aria-label="백업 복원 단계"><div class="stage-step done"><span>1</span><b>ZIP 선택</b><small>임시 보관</small></div><div class="stage-step done"><span>2</span><b>무결성 검사</b><small>해시·WAV·마이크 보정</small></div><div class="stage-step current"><span>3</span><b>내용 확인</b><small>아직 미적용</small></div><div class="stage-step"><span>4</span><b>복원 확정</b><small>자동 백업 후</small></div></div>
+              <div class="diagnostic-grid"><div><small>백업 버전</small><b>스키마 {restore_stage.get('schema_version')} · 앱 {html.escape(str(restore_stage.get('app_version')))}</b></div><div><small>요청 프로필</small><b>{html.escape(str(restored_settings.get('requested_profile')))}</b></div><div><small>처리 블록 크기</small><b>{restored_settings.get('chunksize')}</b></div><div><small>FIR</small><b>{len(restore_stage.get('firs', {}))}개 검증</b></div><div><small>마이크 보정</small><b>{len(restore_stage.get('calibrations', {}))}개 검증</b></div></div>
               <p class="muted">{html.escape(str(restore_stage.get('original_name')))} · 현재 설정은 아직 바뀌지 않았습니다. 복원 직전 현재 전체 상태를 Pi의 복구용 ZIP으로 자동 백업합니다.</p>
           <div class="measure-actions"><form method="post" action="/backup/apply" onsubmit="return confirm('현재 전체 설정을 자동 백업한 뒤 검증된 ZIP을 복원합니다. 오디오가 잠시 재시작됩니다. 계속할까요?')"><button>전체 복원</button></form><form method="post" action="/backup/discard"><button class="secondary">복원 취소</button></form></div>
             </div>"""
         else:
             restore_detail = '<p class="muted">복원 ZIP을 선택하면 먼저 임시 검토만 합니다. 검증 완료 후 별도 확정 버튼을 눌러야 실제 설정이 바뀝니다.</p>'
         settings_html = f"""
-        <section class="card-wide backup-panel"><div class="section-head"><div><h2>전체 백업 · 안전 복원</h2><p class="muted">프로필 설정, Speaker/Headphones/Factory FIR, 선택적 MIMO bank, 0°/90° UMIK calibration을 버전형 ZIP 하나로 관리합니다.</p></div><span class="pill neutral">schema v{BACKUP_SCHEMA_VERSION}</span></div>
+        <section class="next-action settings-overview"><div><small>프로필 관리</small><h2>FIR과 출력 경로</h2><p>U7에서 선택된 출력 체인이 강조됩니다. 두 체인은 이 장비에서 모두 스피커에 연결되어 있습니다.</p></div><span class="pill">현재 {html.escape(physical_label)}</span></section>
+        <div class="grid">{''.join(cards)}</div>
+        <section class="status"><h2>엔진 설정</h2><table>
+          <tr><td>오디오 형식</td><td>48 kHz · 입력 2ch · 출력 4ch</td></tr>
+          <tr><td>처리 블록 크기</td><td><form method="post" action="/chunksize"><select name="chunksize" aria-label="CamillaDSP 처리 블록 크기">{chunk_options}</select> <button>적용</button></form><span class="muted">변경 시 오디오가 잠시 재시작됩니다. Pi 2는 2048, Pi 4/5는 1024를 권장합니다.</span></td></tr>
+        </table></section>
+        <section class="card-wide backup-panel"><div class="section-head"><div><h2>전체 백업 · 안전 복원</h2><p class="muted">프로필 설정, 스피커/헤드폰/기본 FIR, 선택적 MIMO FIR 묶음, 0°/90° UMIK-1 보정 파일을 버전형 ZIP 하나로 관리합니다.</p></div><span class="pill neutral">스키마 v{BACKUP_SCHEMA_VERSION}</span></div>
         <div class="backup-actions"><div><b>현재 상태 보관</b><p>다운로드는 오디오를 바꾸지 않습니다.</p><a class="button" download href="/api/backup/download">전체 백업 ZIP</a>{automatic_backup_html}</div><form method="post" action="/backup/stage" enctype="multipart/form-data"><b>백업에서 복원</b><p>업로드 → 검사 → 확인 → 복원</p><label class="file-picker-label" for="backup-zip-input">AudioDSP 백업 ZIP 선택</label><input id="backup-zip-input" required type="file" name="backup" accept="application/zip,.zip"><button>ZIP 검토</button></form></div>
           {restore_detail}
         </section>
-        <section class="status"><h2>엔진 설정</h2><table>
-          <tr><td>오디오 형식</td><td>48 kHz · 입력 2ch · 출력 4ch</td></tr>
-          <tr><td>처리 블록</td><td><form method="post" action="/chunksize"><select name="chunksize" aria-label="CamillaDSP chunksize">{chunk_options}</select> <button>적용</button></form><span class="muted">변경 시 오디오가 잠시 재시작됩니다. Pi 2는 2048, Pi 4/5는 1024를 권장합니다.</span></td></tr>
-        </table></section>
-        <div class="grid">{''.join(cards)}</div>
-        <p class="muted">업로드 조건: stereo, 48 kHz, PCM/IEEE-float WAV, 최대 262,144 taps. LAN 내부 포트 8080에서만 사용하세요.</p>"""
+        <p class="muted">FIR 업로드 조건: 스테레오, 48 kHz, PCM/IEEE-float WAV, 최대 262,144탭. 이 웹 UI는 내부 LAN의 8080 포트에서만 사용하세요.</p>"""
     page_title = {"status": "현황 · AudioDSP", "measure": "측정 · 보정 · AudioDSP", "settings": "프로필 · 설정 · AudioDSP"}.get(view, "AudioDSP")
     body = f"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
     <title>{page_title}</title>
@@ -2800,16 +2939,17 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
     .app-nav{{display:flex;gap:7px;overflow-x:auto;padding:5px;margin:0 0 16px;background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow)}}.app-nav a{{position:relative;display:flex;align-items:center;justify-content:center;gap:8px;flex:1;min-width:max-content;padding:11px 16px;border-radius:10px;text-decoration:none;color:var(--muted);font-weight:800;text-align:center;touch-action:manipulation}}.app-nav a.active{{background:var(--accent-soft);color:var(--text);box-shadow:inset 0 -3px 0 var(--accent)}}.app-nav a:hover{{color:var(--text)}}.ui-icon{{display:inline-block;width:1.25em;height:1.25em;flex:0 0 auto;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;vertical-align:-.2em}}
     .theme-switch{{display:flex;padding:4px;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow)}}.theme-switch button{{padding:7px 10px;background:transparent;color:var(--muted);box-shadow:none}}.theme-switch button[aria-pressed="true"]{{background:var(--accent-soft);color:var(--text)}}
     .status,.card,.graphbox{{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:clamp(16px,2.5vw,24px);margin:16px 0;box-shadow:var(--shadow);backdrop-filter:blur(16px)}}
-    .grid{{display:grid;grid-template-columns:1fr;gap:16px}}.grid .card{{margin:0}}.card.active-profile{{border:2px solid var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 13%,transparent),var(--shadow)}}.profile-title{{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}}.profile-title h2{{display:flex;align-items:center;gap:9px;margin:0}}.profile-title>div{{min-width:0}}.profile-subtitle{{margin:5px 0 0 41px;color:var(--muted);font-size:.82rem}}.profile-icon,.state-icon{{display:inline-grid;place-items:center;width:32px;height:32px;border-radius:10px;background:var(--accent-soft);color:var(--accent);font-weight:900;font-size:.9rem}}.profile-icon .ui-icon{{width:19px;height:19px}}.active-badge{{display:inline-flex;padding:5px 9px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:.78rem;font-weight:800;white-space:nowrap}}.profile-mini-flow{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:15px 0;padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:color-mix(in srgb,var(--surface-strong) 74%,transparent);color:var(--muted);font-size:.78rem}}.profile-mini-flow span{{display:flex;align-items:center;gap:5px}}.profile-mini-flow i{{color:var(--accent);font-style:normal;font-weight:900}}
+    .grid{{display:grid;grid-template-columns:1fr;gap:16px}}.grid .card{{margin:0}}.card.active-profile{{border:2px solid var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 13%,transparent),var(--shadow)}}.profile-title{{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}}.profile-title h2{{display:flex;align-items:center;gap:9px;margin:0}}.profile-title>div{{min-width:0}}.profile-subtitle{{margin:5px 0 0 41px;color:var(--muted);font-size:.82rem}}.profile-icon,.state-icon{{display:inline-grid;place-items:center;width:32px;height:32px;border-radius:10px;background:var(--accent-soft);color:var(--accent);font-weight:900;font-size:.9rem}}.profile-icon .ui-icon{{width:19px;height:19px}}.active-badge{{display:inline-flex;padding:5px 9px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:.78rem;font-weight:800;white-space:nowrap}}.profile-mini-flow{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:15px 0;padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:color-mix(in srgb,var(--surface-strong) 74%,transparent);color:var(--muted);font-size:.78rem}}.profile-mini-flow span{{display:flex;align-items:center;gap:5px}}.profile-mini-flow i{{color:var(--accent);font-style:normal;font-weight:900}}.profile-control-group{{display:grid;gap:10px;padding:14px;margin-top:12px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 62%,transparent)}}.profile-group-head{{display:grid;gap:3px}}.profile-group-head>b{{font-size:.95rem}}.profile-group-head>small{{color:var(--muted);line-height:1.4}}.profile-file-grid,.profile-output-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}.profile-control-group .bypass{{margin:0}}.profile-control-group .file{{padding:12px;border:1px solid var(--border);border-radius:11px;background:var(--surface-strong)}}.profile-control-group .file p{{min-height:0}}.profile-output-grid .mode{{margin:0}}
     .pill{{display:inline-flex;align-items:center;padding:5px 10px;border-radius:999px;background:var(--success-bg);color:var(--success);font-weight:700;text-transform:capitalize}}.pill.warn{{background:color-mix(in srgb,var(--warning) 14%,var(--surface-strong));color:var(--warning)}}.pill.error{{border:1px solid var(--danger);background:var(--danger-bg);color:var(--danger)}}.muted{{color:var(--muted);overflow-wrap:anywhere}}
     .file{{border-top:1px solid var(--border);padding:15px 0}}.file p{{min-height:42px;color:var(--muted)}}form{{margin:9px 0;min-width:0}}.file-picker-label{{display:block;margin-top:7px;color:var(--muted);font-size:.82rem;font-weight:700}}input[type=file]{{max-width:100%;margin:7px 0;color:var(--muted)}}input::file-selector-button{{min-height:36px;margin-right:9px;padding:7px 11px;border:1px solid var(--border);border-radius:8px;background:var(--surface-strong);color:var(--text);font:inherit;font-weight:700;cursor:pointer}}select{{max-width:100%;min-width:0;min-height:40px;font:inherit;background:var(--surface-strong);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:9px 12px}}
     button,.button{{min-height:40px;font:inherit;font-weight:700;background:var(--accent);color:var(--on-accent);border:0;border-radius:10px;padding:9px 14px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;box-shadow:0 6px 14px color-mix(in srgb,var(--accent) 25%,transparent);transition:transform .15s,background .15s;touch-action:manipulation}}
     button:hover,.button:hover{{background:var(--accent-hover);transform:translateY(-1px)}}button.secondary,.button.secondary{{background:transparent;color:var(--text);border:1px solid var(--border);box-shadow:none}}button.secondary:hover,.button.secondary:hover{{background:var(--accent-soft);color:var(--text)}}button:focus-visible,.button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,.app-nav a:focus-visible,.flow-step:focus-visible,.graph-scroll:focus-visible{{outline:3px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:2px}}
     .mode{{background:color-mix(in srgb,var(--surface-strong) 72%,transparent);border:1px solid var(--border);border-radius:12px;padding:12px}}.mode label{{display:block;margin:9px 0;line-height:1.45}}.bypass{{display:flex;align-items:center;justify-content:space-between;gap:12px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent);border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:14px}}.bypass.enabled{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-strong))}}.bypass small{{display:block;color:var(--muted);margin-top:3px}}.missing{{color:var(--warning)}}.bad,.failure{{color:var(--danger)}}
-    .notice{{background:var(--success-bg);color:var(--success);padding:13px 15px;border-radius:11px;margin:12px 0}}.failure{{background:var(--danger-bg);padding:13px 15px;border-radius:11px;margin:12px 0}}.graphbox>.muted{{word-break:keep-all}}.graph-scroll{{overflow-x:auto;overscroll-behavior-inline:contain;border-radius:12px}}.response{{display:block;width:100%;height:auto;margin-top:10px;border-radius:12px}}
-    .card-wide{{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:clamp(16px,2.5vw,24px);margin:16px 0;box-shadow:var(--shadow)}}.next-action{{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:18px 20px;margin:16px 0;border:1px solid color-mix(in srgb,var(--accent) 48%,var(--border));border-radius:18px;background:linear-gradient(135deg,var(--accent-soft),var(--surface));box-shadow:var(--shadow)}}.next-action small{{color:var(--accent);font-weight:900;text-transform:uppercase;letter-spacing:.08em}}.next-action h2{{margin:4px 0}}.next-action p{{margin:0;color:var(--muted)}}.section-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}}.section-head h2{{display:flex;align-items:center;gap:8px;margin-bottom:6px}}.signal-console{{overflow:hidden;background:linear-gradient(145deg,var(--surface),color-mix(in srgb,var(--accent-soft) 34%,var(--surface)))}}.signal-live{{display:inline-flex;align-items:center;gap:7px;padding:6px 9px;border:1px solid color-mix(in srgb,var(--success) 35%,var(--border));border-radius:999px;color:var(--success);font-size:.72rem;font-weight:900;letter-spacing:.08em}}.signal-live i{{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 0 5px color-mix(in srgb,var(--success) 14%,transparent)}}.signal-flow{{display:grid;grid-template-columns:minmax(135px,1fr) 42px minmax(150px,1.1fr) 42px minmax(145px,1fr) 42px minmax(155px,1.15fr) 42px minmax(135px,1fr);align-items:stretch;gap:0;margin-top:18px}}.signal-node{{position:relative;display:flex;gap:10px;align-items:flex-start;min-width:0;padding:14px 12px;border:1px solid var(--border);border-radius:13px;background:var(--surface-strong);box-shadow:0 8px 24px color-mix(in srgb,var(--text) 6%,transparent)}}.signal-node>.ui-icon{{width:25px;height:25px;padding:4px;border-radius:7px;background:var(--accent-soft);color:var(--accent)}}.signal-node>div{{display:grid;gap:3px;min-width:0}}.signal-node small{{color:var(--muted);font-size:.62rem;font-weight:900;letter-spacing:.07em}}.signal-node b{{font-size:.88rem;overflow-wrap:anywhere}}.signal-node span{{color:var(--muted);font-size:.69rem;line-height:1.35;overflow-wrap:anywhere}}.signal-node.is-active{{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 13%,transparent)}}.signal-node.is-waiting{{border-style:dashed}}.signal-wire{{display:grid;place-items:center;color:color-mix(in srgb,var(--accent) 72%,var(--muted))}}.signal-wire svg{{display:block;width:100%;height:20px;overflow:visible;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}}.signal-legend{{display:flex;gap:16px;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid var(--border);color:var(--muted);font-size:.76rem}}.signal-legend span{{display:flex;align-items:center;gap:5px}}.measurement-path-lock{{display:flex;align-items:flex-start;gap:12px;padding:14px;margin:12px 0;border:1px solid var(--border);border-radius:14px;background:var(--surface-strong)}}.measurement-path-lock>.ui-icon{{width:28px;height:28px;padding:4px;border-radius:8px;background:var(--accent-soft);color:var(--accent)}}.measurement-path-lock>div{{display:grid;gap:3px}}.measurement-path-lock small{{color:var(--muted);font-size:.67rem;font-weight:900;letter-spacing:.08em}}.measurement-path-lock span{{color:var(--muted);font-size:.82rem;line-height:1.45}}.measurement-path-lock.path-ok{{border-color:var(--success)}}.measurement-path-lock.path-ok>.ui-icon{{background:var(--success-bg);color:var(--success)}}.measurement-path-lock.path-error{{border-color:var(--danger);background:var(--danger-bg)}}.measurement-path-lock.path-error>.ui-icon{{background:transparent;color:var(--danger)}}.measurement-result-path{{display:flex;align-items:center;gap:12px;padding:12px;border:1px solid var(--success);border-radius:12px;background:var(--success-bg);color:var(--success)}}.measurement-result-path b,.measurement-result-path span{{display:flex;align-items:center;gap:6px}}.measurement-result-path.legacy{{border-color:var(--warning);background:var(--warning-bg);color:var(--warning)}}.output-volume output{{min-width:6ch;color:var(--accent);font-size:clamp(1.7rem,5vw,2.5rem);font-weight:900;text-align:right;font-variant-numeric:tabular-nums}}.output-volume form{{display:grid;gap:12px;margin-top:14px}}.output-volume input[type=range]{{width:100%;height:28px;accent-color:var(--accent);cursor:pointer}}.volume-actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}.volume-presets{{display:flex;gap:6px;flex:1;flex-wrap:wrap}}.volume-note{{margin-bottom:4px;font-weight:700}}.job-status{{padding:14px;border:1px solid var(--border);border-radius:12px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent);margin:14px 0}}.session-overview{{display:grid;gap:14px;padding:16px;margin:14px 0 0;border:1px solid color-mix(in srgb,var(--step-accent) 48%,var(--border));border-radius:15px;background:linear-gradient(135deg,color-mix(in srgb,var(--step-soft) 58%,var(--surface)),var(--surface-strong))}}.session-overview.empty{{border-style:dashed}}.session-overview.empty p{{margin:0;color:var(--muted)}}.session-overview-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}}.session-overview-head small{{color:var(--step-accent);font-size:.67rem;font-weight:900;letter-spacing:.09em}}.session-overview h3{{margin:3px 0 0;font-size:1.05rem}}.session-meta-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}}.session-meta-grid>div{{display:grid;gap:3px;padding:10px;border:1px solid var(--border);border-radius:10px;background:color-mix(in srgb,var(--surface-strong) 78%,transparent)}}.session-meta-grid small{{color:var(--muted)}}.session-note-form{{display:grid;grid-template-columns:minmax(150px,.65fr) minmax(260px,1.35fr);gap:10px 14px;align-items:center}}.session-note-form label{{display:grid;gap:3px}}.session-note-form label span{{color:var(--muted);font-size:.76rem;line-height:1.4}}.session-note-form textarea{{width:100%;min-height:58px;resize:vertical}}.session-note-form>div{{grid-column:2;display:flex;align-items:center;justify-content:space-between;gap:10px}}.session-note-form>div small{{color:var(--muted)}}.session-new-action{{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px;margin:12px 0;border:1px dashed var(--border);border-radius:12px}}.session-new-action p{{margin:4px 0 0}}.session-tools>summary{{justify-content:space-between;gap:12px}}.session-library{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}}.saved-session{{display:grid;gap:9px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.saved-session.active{{border-color:var(--step-accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--step-accent) 12%,transparent)}}.saved-session-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}}.saved-session-head>div{{display:grid;gap:3px}}.saved-session-head small{{color:var(--muted)}}.saved-session-head form{{margin:0}}.session-note-preview{{min-height:2.7em;margin:0;padding:8px;border-radius:8px;background:color-mix(in srgb,var(--step-soft) 45%,transparent);font-size:.82rem;line-height:1.4;white-space:pre-wrap}}.saved-session-progress{{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;align-items:center}}.saved-session-progress i{{height:5px;border-radius:999px;background:var(--border)}}.saved-session-progress i.done{{background:var(--success)}}.saved-session-progress span{{grid-column:1/-1;color:var(--muted);font-size:.72rem}}progress{{width:100%;height:13px;accent-color:var(--accent);margin:10px 0 4px}}.measure-form{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end;padding:14px;border:1px solid var(--border);border-radius:12px;margin:14px 0}}.measure-form label{{display:grid;gap:6px;color:var(--muted);font-size:.86rem}}.level-slider{{padding:10px;border:1px solid var(--border);border-radius:11px;background:var(--surface-strong)}}.level-slider output{{color:var(--accent);font-weight:900;font-variant-numeric:tabular-nums}}.level-slider input[type=range]{{width:100%;height:24px;accent-color:var(--accent);cursor:pointer}}.level-slider small{{line-height:1.35}}.level-slider.not-used{{opacity:.48}}.measurement-output-summary{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0}}.measurement-output-summary>div{{display:grid;gap:4px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.measurement-output-summary small{{color:var(--muted)}}.measurement-output-summary span{{color:var(--muted);font-size:.8rem;line-height:1.4}}.output-safety-note,.output-level-warning{{padding:9px;border-radius:9px;background:var(--success-bg);color:var(--success)}}.output-level-warning{{grid-column:1/-1;margin:0}}.output-safety-note,.output-level-warning.loud{{background:var(--warning-bg);color:var(--warning)}}.build-options{{display:block}}.build-fieldset{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end;min-width:0;margin:0;padding:0;border:0}}.build-fieldset[disabled]{{opacity:.78}}.build-running-note{{padding:10px;border-radius:10px;background:var(--warning-bg);color:var(--warning)}}.build-options .advanced{{grid-column:1/-1;margin:2px 0 0;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.advanced-grid{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-top:12px}}.measure-actions{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}}.measure-actions form{{margin:0}}button.danger{{background:var(--danger)}}.target-preview,.result-box{{border-top:1px solid var(--border);margin-top:16px;padding-top:16px}}#target-graph,#measurement-result-graph{{display:block;width:100%;height:auto;background:var(--graph-bg);border-radius:12px;margin-top:10px}}details{{margin-top:14px;border-top:1px solid var(--border);padding-top:12px}}summary{{display:flex;align-items:center;min-height:44px;cursor:pointer;font-weight:700}}
-    .workflow{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:3px;margin:18px 0 0;padding:4px;border:1px solid color-mix(in srgb,var(--step-accent) 38%,var(--border));border-radius:14px 14px 0 0;background:color-mix(in srgb,var(--surface-strong) 78%,transparent)}}.flow-step{{display:flex;min-width:0;align-items:center;justify-content:center;gap:7px;min-height:48px;padding:9px 8px;border:0;border-radius:10px;color:var(--muted);background:transparent;box-shadow:none;font-size:.78rem;text-align:center;text-decoration:none}}button.flow-step{{cursor:pointer}}button.flow-step:hover{{color:var(--text);background:var(--step-soft);transform:none}}.flow-step>span{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;background:var(--border);color:var(--text);font-weight:800}}.flow-step.done{{color:var(--success)}}.flow-step.done>span{{background:var(--success-bg);color:var(--success)}}.flow-step.current:not(.selected){{box-shadow:inset 0 -3px 0 var(--step-accent)}}.flow-step.current>span{{background:var(--step-accent);color:var(--on-step)}}.flow-step.selected{{color:var(--text);background:var(--step-soft);box-shadow:inset 0 -3px 0 var(--step-accent)}}.flow-step.future{{opacity:.66}}.measurement-tab-panels{{border:1px solid color-mix(in srgb,var(--step-accent) 38%,var(--border));border-top:0;border-radius:0 0 14px 14px;background:color-mix(in srgb,var(--surface-strong) 32%,transparent);min-height:240px}}.measurement-panel{{padding:clamp(14px,2.5vw,22px);outline:none}}.measurement-panel[hidden]{{display:none}}.measurement-panel:focus-visible{{outline:3px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:-3px}}.measurement-panel-heading{{display:flex;align-items:center;gap:11px;padding-bottom:12px;border-bottom:1px solid var(--border)}}.measurement-panel-heading>span{{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--step-accent);color:var(--on-step);font-weight:900}}.measurement-panel-heading>div{{display:grid;gap:2px;min-width:0}}.measurement-panel-heading small{{color:var(--muted);line-height:1.35}}.measurement-panel-content{{min-width:0}}.measurement-panel-empty{{margin-top:14px;padding:16px;border:1px dashed var(--border);border-radius:12px;color:var(--muted);background:var(--surface-strong)}}.measurement-step-sources{{display:none}}[id^="measurement-step-"]{{scroll-margin-top:18px}}.form-note{{grid-column:1/-1;margin:0;color:var(--muted);font-size:.8rem;line-height:1.45}}.cal-card{{display:grid;gap:14px;padding:14px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent)}}.cal-head{{display:flex;gap:10px;align-items:center}}.cal-head p,.cal-card p{{margin:5px 0 0}}.cal-slots{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.cal-slot{{display:grid;grid-template-columns:1fr auto;gap:8px 12px;padding:12px;margin:0;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.cal-slot>div{{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:8px}}.cal-slot>p{{grid-column:1/-1;color:var(--muted);font-size:.82rem}}.cal-slot label{{display:grid;gap:5px;color:var(--muted);font-size:.82rem}}.cal-slot input[type=file]{{margin:0}}.pill.neutral{{background:var(--border);color:var(--muted)}}
-    .flow-step.validation-error,.flow-step.validation-error.selected{{border:1px solid var(--danger);background:var(--danger-bg);color:var(--danger);box-shadow:inset 0 -3px 0 var(--danger)}}.flow-step.validation-error>span{{background:var(--danger);color:#fff}}.flow-step>em{{padding:2px 5px;border-radius:999px;background:var(--danger);color:#fff;font-size:.58rem;font-style:normal;font-weight:900;letter-spacing:.04em}}.validation-jumps{{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}}.validation-jump{{min-height:34px;padding:6px 10px;font-size:.76rem}}
+    .notice{{background:var(--success-bg);color:var(--success);padding:13px 15px;border-radius:11px;margin:12px 0}}.failure{{background:var(--danger-bg);padding:13px 15px;border-radius:11px;margin:12px 0}}.page-message{{position:fixed;z-index:80;top:max(12px,env(safe-area-inset-top));right:clamp(12px,3vw,32px);width:min(520px,calc(100vw - 24px));max-height:min(45vh,360px);overflow:auto;margin:0;box-shadow:0 16px 44px #0004;border:1px solid currentColor}}.graphbox>.muted{{word-break:keep-all}}.graph-scroll{{overflow-x:auto;overscroll-behavior-inline:contain;border-radius:12px}}.response{{display:block;width:100%;height:auto;margin-top:10px;border-radius:12px}}
+    .card-wide{{background:var(--surface);border:1px solid var(--border);border-radius:18px;padding:clamp(16px,2.5vw,24px);margin:16px 0;box-shadow:var(--shadow)}}.next-action{{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:18px 20px;margin:16px 0;border:1px solid color-mix(in srgb,var(--accent) 48%,var(--border));border-radius:18px;background:linear-gradient(135deg,var(--accent-soft),var(--surface));box-shadow:var(--shadow)}}.next-action small{{color:var(--accent);font-weight:900;text-transform:uppercase;letter-spacing:.08em}}.next-action h2{{margin:4px 0}}.next-action p{{margin:0;color:var(--muted)}}.section-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}}.section-head h2{{display:flex;align-items:center;gap:8px;margin-bottom:6px}}.signal-console{{overflow:hidden;background:linear-gradient(145deg,var(--surface),color-mix(in srgb,var(--accent-soft) 34%,var(--surface)))}}.signal-live{{display:inline-flex;align-items:center;gap:7px;padding:6px 9px;border:1px solid color-mix(in srgb,var(--success) 35%,var(--border));border-radius:999px;color:var(--success);font-size:.72rem;font-weight:900;letter-spacing:.08em}}.signal-live i{{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 0 5px color-mix(in srgb,var(--success) 14%,transparent)}}.signal-flow{{display:grid;grid-template-columns:minmax(135px,1fr) 42px minmax(150px,1.1fr) 42px minmax(145px,1fr) 42px minmax(155px,1.15fr) 42px minmax(135px,1fr);align-items:stretch;gap:0;margin-top:18px}}.signal-node{{position:relative;display:flex;gap:10px;align-items:flex-start;min-width:0;padding:14px 12px;border:1px solid var(--border);border-radius:13px;background:var(--surface-strong);box-shadow:0 8px 24px color-mix(in srgb,var(--text) 6%,transparent)}}.signal-node>.ui-icon{{width:25px;height:25px;padding:4px;border-radius:7px;background:var(--accent-soft);color:var(--accent)}}.signal-node>div{{display:grid;gap:3px;min-width:0}}.signal-node small{{color:var(--muted);font-size:.62rem;font-weight:900;letter-spacing:.07em}}.signal-node b{{font-size:.88rem;overflow-wrap:anywhere}}.signal-node span{{color:var(--muted);font-size:.69rem;line-height:1.35;overflow-wrap:anywhere}}.signal-node.is-active{{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 13%,transparent)}}.signal-node.is-waiting{{border-style:dashed}}.signal-wire{{display:grid;place-items:center;color:color-mix(in srgb,var(--accent) 72%,var(--muted))}}.signal-wire svg{{display:block;width:100%;height:20px;overflow:visible;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}}.signal-legend{{display:flex;gap:16px;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid var(--border);color:var(--muted);font-size:.76rem}}.signal-legend span{{display:flex;align-items:center;gap:5px}}.measurement-path-lock{{display:flex;align-items:flex-start;gap:12px;padding:14px;margin:12px 0;border:1px solid var(--border);border-radius:14px;background:var(--surface-strong)}}.measurement-path-lock>.ui-icon{{width:28px;height:28px;padding:4px;border-radius:8px;background:var(--accent-soft);color:var(--accent)}}.measurement-path-lock>div{{display:grid;gap:3px}}.measurement-path-lock small{{color:var(--muted);font-size:.67rem;font-weight:900;letter-spacing:.08em}}.measurement-path-lock span{{color:var(--muted);font-size:.82rem;line-height:1.45}}.measurement-path-lock.path-ok{{border-color:var(--success)}}.measurement-path-lock.path-ok>.ui-icon{{background:var(--success-bg);color:var(--success)}}.measurement-path-lock.path-error{{border-color:var(--danger);background:var(--danger-bg)}}.measurement-path-lock.path-error>.ui-icon{{background:transparent;color:var(--danger)}}.measurement-result-path{{display:flex;align-items:center;gap:12px;padding:12px;border:1px solid var(--success);border-radius:12px;background:var(--success-bg);color:var(--success)}}.measurement-result-path b,.measurement-result-path span{{display:flex;align-items:center;gap:6px}}.measurement-result-path.legacy{{border-color:var(--warning);background:var(--warning-bg);color:var(--warning)}}.output-volume output{{min-width:6ch;color:var(--accent);font-size:clamp(1.7rem,5vw,2.5rem);font-weight:900;text-align:right;font-variant-numeric:tabular-nums}}.output-volume form{{display:grid;gap:12px;margin-top:14px}}.output-volume input[type=range]{{width:100%;height:28px;accent-color:var(--accent);cursor:pointer}}.volume-actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}.volume-presets{{display:flex;gap:6px;flex:1;flex-wrap:wrap}}.volume-note{{margin-bottom:4px;font-weight:700}}.job-status{{padding:14px;border:1px solid var(--border);border-radius:12px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent);margin:14px 0}}.session-overview{{display:grid;gap:14px;padding:16px;margin:14px 0 0;border:1px solid color-mix(in srgb,var(--step-accent) 48%,var(--border));border-radius:15px;background:linear-gradient(135deg,color-mix(in srgb,var(--step-soft) 58%,var(--surface)),var(--surface-strong))}}.session-overview.empty{{border-style:dashed}}.session-overview.empty p{{margin:0;color:var(--muted)}}.session-overview-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}}.session-overview-actions{{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}}.session-overview-head small{{color:var(--step-accent);font-size:.67rem;font-weight:900;letter-spacing:.09em}}.session-overview h3{{margin:3px 0 0;font-size:1.05rem}}.session-meta-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}}.session-meta-grid>div{{display:grid;gap:3px;padding:10px;border:1px solid var(--border);border-radius:10px;background:color-mix(in srgb,var(--surface-strong) 78%,transparent)}}.session-meta-grid small{{color:var(--muted)}}.session-note-form{{display:grid;grid-template-columns:minmax(150px,.65fr) minmax(260px,1.35fr);gap:10px 14px;align-items:center}}.session-note-form label{{display:grid;gap:3px}}.session-note-form label span{{color:var(--muted);font-size:.76rem;line-height:1.4}}.session-note-form textarea{{width:100%;min-height:58px;resize:vertical}}.session-note-form>div{{grid-column:2;display:flex;align-items:center;justify-content:space-between;gap:10px}}.session-note-form>div small{{color:var(--muted)}}.session-new-action{{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px;margin:12px 0;border:1px dashed var(--border);border-radius:12px}}.session-new-action p{{margin:4px 0 0}}.session-tools>summary{{justify-content:space-between;gap:12px}}.session-library{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:10px}}.saved-session{{display:grid;gap:9px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.saved-session.active{{border-color:var(--step-accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--step-accent) 12%,transparent)}}.saved-session-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}}.saved-session-head>div{{display:grid;gap:3px}}.saved-session-head small{{color:var(--muted)}}.saved-session-head form{{margin:0}}.session-note-preview{{min-height:2.7em;margin:0;padding:8px;border-radius:8px;background:color-mix(in srgb,var(--step-soft) 45%,transparent);font-size:.82rem;line-height:1.4;white-space:pre-wrap}}.saved-session-progress{{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;align-items:center}}.saved-session-progress i{{height:5px;border-radius:999px;background:var(--border)}}.saved-session-progress i.done{{background:var(--success)}}.saved-session-progress span{{grid-column:1/-1;color:var(--muted);font-size:.72rem}}progress{{width:100%;height:13px;accent-color:var(--accent);margin:10px 0 4px}}.measure-form{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end;padding:14px;border:1px solid var(--border);border-radius:12px;margin:14px 0}}.measure-form label{{display:grid;gap:6px;color:var(--muted);font-size:.86rem}}.level-slider{{padding:10px;border:1px solid var(--border);border-radius:11px;background:var(--surface-strong)}}.level-slider output{{color:var(--accent);font-weight:900;font-variant-numeric:tabular-nums}}.level-slider input[type=range]{{width:100%;height:24px;accent-color:var(--accent);cursor:pointer}}.level-slider small{{line-height:1.35}}.level-slider.not-used{{opacity:.48}}.measurement-output-summary{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0}}.measurement-output-summary>div{{display:grid;gap:4px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.measurement-output-summary small{{color:var(--muted)}}.measurement-output-summary span{{color:var(--muted);font-size:.8rem;line-height:1.4}}.output-safety-note,.output-level-warning{{padding:9px;border-radius:9px;background:var(--success-bg);color:var(--success)}}.output-level-warning{{grid-column:1/-1;margin:0}}.output-safety-note,.output-level-warning.loud{{background:var(--warning-bg);color:var(--warning)}}.build-options{{display:block}}.build-fieldset{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:end;min-width:0;margin:0;padding:0;border:0}}.build-fieldset[disabled]{{opacity:.78}}.build-running-note{{padding:10px;border-radius:10px;background:var(--warning-bg);color:var(--warning)}}.build-options .advanced{{grid-column:1/-1;margin:2px 0 0;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.advanced-grid{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-top:12px}}.measure-actions{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}}.measure-actions form{{margin:0}}button.danger{{background:var(--danger)}}.target-preview,.result-box{{border-top:1px solid var(--border);margin-top:16px;padding-top:16px}}#target-graph,#measurement-result-graph{{display:block;width:100%;height:auto;background:var(--graph-bg);border-radius:12px;margin-top:10px}}details{{margin-top:14px;border-top:1px solid var(--border);padding-top:12px}}summary{{display:flex;align-items:center;min-height:44px;cursor:pointer;font-weight:700}}
+    .workflow{{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:3px;margin:18px 0 0;padding:4px;border:1px solid color-mix(in srgb,var(--step-accent) 38%,var(--border));border-radius:14px 14px 0 0;background:color-mix(in srgb,var(--surface-strong) 78%,transparent)}}.flow-step{{display:flex;min-width:0;align-items:center;justify-content:center;gap:7px;min-height:48px;padding:9px 8px;border:0;border-radius:10px;color:var(--muted);background:transparent;box-shadow:none;font-size:.78rem;text-align:center;text-decoration:none}}button.flow-step{{cursor:pointer}}button.flow-step:hover{{color:var(--text);background:var(--step-soft);transform:none}}.flow-step>span{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;background:var(--border);color:var(--text);font-weight:800}}.flow-step.session-step>span{{border-radius:8px}}.flow-step.done{{color:var(--success)}}.flow-step.done>span{{background:var(--success-bg);color:var(--success)}}.flow-step.current:not(.selected){{box-shadow:inset 0 -3px 0 var(--step-accent)}}.flow-step.current>span{{background:var(--step-accent);color:var(--on-step)}}.flow-step.selected{{color:var(--text);background:var(--step-soft);box-shadow:inset 0 -3px 0 var(--step-accent)}}.flow-step.future{{opacity:.66}}.measurement-tab-panels{{border:1px solid color-mix(in srgb,var(--step-accent) 38%,var(--border));border-top:0;border-radius:0 0 14px 14px;background:color-mix(in srgb,var(--surface-strong) 32%,transparent);min-height:240px}}.measurement-panel{{padding:clamp(14px,2.5vw,22px);outline:none}}.measurement-panel[hidden]{{display:none}}.measurement-panel:focus-visible{{outline:3px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:-3px}}.measurement-panel-heading{{display:flex;align-items:center;gap:11px;padding-bottom:12px;border-bottom:1px solid var(--border)}}.measurement-panel-heading>span{{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--step-accent);color:var(--on-step);font-weight:900}}.measurement-panel-heading>div{{display:grid;gap:2px;min-width:0}}.measurement-panel-heading small{{color:var(--muted);line-height:1.35}}.measurement-panel-content{{min-width:0}}.measurement-panel-empty{{margin-top:14px;padding:16px;border:1px dashed var(--border);border-radius:12px;color:var(--muted);background:var(--surface-strong)}}.measurement-step-sources{{display:none}}[id^="measurement-step-"],#measurement-session{{scroll-margin-top:18px}}.form-note{{grid-column:1/-1;margin:0;color:var(--muted);font-size:.8rem;line-height:1.45}}.action-blocker{{padding:10px 12px;border:1px solid var(--warning);border-radius:10px;background:var(--warning-bg);color:var(--warning)}}.cal-card{{display:grid;gap:14px;padding:14px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent)}}.cal-head{{display:flex;gap:10px;align-items:center}}.cal-head p,.cal-card p{{margin:5px 0 0}}.cal-slots{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.cal-slot{{display:grid;grid-template-columns:1fr auto;gap:8px 12px;padding:12px;margin:0;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.cal-slot>div{{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:8px}}.cal-slot>p{{grid-column:1/-1;color:var(--muted);font-size:.82rem}}.cal-slot label{{display:grid;gap:5px;color:var(--muted);font-size:.82rem}}.cal-slot input[type=file]{{margin:0}}.pill.neutral{{background:var(--border);color:var(--muted)}}
+    .flow-step.validation-error,.flow-step.validation-error.selected{{border:1px solid var(--danger);background:var(--danger-bg);color:var(--danger);box-shadow:inset 0 -3px 0 var(--danger)}}.flow-step.validation-error>span{{background:var(--danger);color:#fff}}.flow-state{{padding:2px 5px;border-radius:999px;background:color-mix(in srgb,currentColor 10%,transparent);color:currentColor;font-size:.56rem;font-weight:900;line-height:1.3;white-space:nowrap}}.flow-step.validation-error .flow-state{{background:var(--danger);color:#fff}}.validation-jumps{{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}}.validation-jump{{min-height:34px;padding:6px 10px;font-size:.76rem}}
+    .mimo-capability{{display:flex;align-items:center;gap:12px;padding:13px 14px;margin:12px 0;border:1px solid var(--border);border-radius:13px;background:var(--surface-strong)}}.mimo-capability .ui-icon{{flex:0 0 auto;width:25px;height:25px}}.mimo-capability>div{{display:grid;gap:3px}}.mimo-capability small,.mimo-capability span{{color:var(--muted);font-size:.8rem;line-height:1.45}}.mimo-capability.pass{{border-color:var(--success);background:color-mix(in srgb,var(--success-bg) 48%,var(--surface-strong))}}.mimo-capability.warn{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 8%,var(--surface-strong))}}.mimo-capability.neutral{{opacity:.88}}.mimo-options-card{{grid-column:1/-1;display:grid;gap:13px;padding:15px;border:1px solid color-mix(in srgb,var(--accent) 46%,var(--border));border-radius:14px;background:color-mix(in srgb,var(--accent-soft) 28%,var(--surface-strong))}}.mimo-options-card h4,.mimo-options-card p{{margin:0}}.mimo-mini-flow{{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;align-items:center;gap:8px}}.mimo-mini-flow span{{padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong);text-align:center;font-size:.78rem;font-weight:800}}.mimo-mini-flow i{{color:var(--accent);font-style:normal}}.field-summary{{display:grid;gap:5px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.field-summary small,.field-summary span{{color:var(--muted);font-size:.78rem}}
     .level-result{{margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:14px}}.level-result.ok{{border-color:var(--success);background:color-mix(in srgb,var(--success-bg) 55%,transparent)}}.level-result.not-ok{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 8%,var(--surface-strong))}}.level-verdict{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}.level-verdict>b{{font-size:1.05rem}}.metric-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-top:12px}}.metric-grid>div{{display:grid;gap:3px;padding:9px;border-radius:10px;background:var(--surface-strong)}}.metric-grid small{{color:var(--muted)}}button:disabled{{cursor:not-allowed;opacity:.45;transform:none;box-shadow:none}}
     .diagnostic-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:12px 0}}.diagnostic-grid>div{{display:grid;gap:4px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.diagnostic-grid>div.validation-fail{{border-color:var(--danger);background:var(--danger-bg);color:var(--danger);box-shadow:0 0 0 2px color-mix(in srgb,var(--danger) 12%,transparent)}}.diagnostic-grid>div.validation-fail small{{color:var(--danger)}}.diagnostic-grid>div.diagnostic-warning,.diagnostic-grid>div.phase-complex{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 8%,var(--surface-strong))}}.diagnostic-grid>div.diagnostic-warning small,.diagnostic-grid>div.phase-complex small{{color:var(--warning)}}.diagnostic-grid small{{color:var(--muted)}}.validation-checklist{{margin:16px 0;padding:14px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent)}}.validation-checklist h4{{margin:0 0 4px;font-size:1rem}}.validation-checklist .section-head+div{{display:grid;gap:7px;margin-top:12px}}.validation-row{{display:grid;grid-template-columns:72px 1fr;gap:10px;align-items:start;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.validation-row.fail{{border-color:var(--danger);background:var(--danger-bg)}}.validation-row.pending{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-strong))}}.validation-row.na{{opacity:.82}}.validation-row>div{{display:grid;gap:3px}}.validation-row small{{color:var(--muted);line-height:1.4}}.validation-row.fail small{{color:color-mix(in srgb,var(--danger) 76%,var(--text))}}.validation-row p{{margin:5px 0 0;padding:8px;border-radius:8px;background:color-mix(in srgb,var(--surface-strong) 68%,transparent);color:var(--danger);font-size:.82rem;line-height:1.5}}.validation-row.pending p{{color:var(--warning)}}.status-badge{{display:inline-grid;place-items:center;min-height:25px;padding:4px 7px;border-radius:999px;font-size:.68rem;font-weight:950;letter-spacing:.04em}}.status-badge.pass{{background:var(--success-bg);color:var(--success)}}.status-badge.fail{{background:var(--danger);color:#fff}}.status-badge.pending{{background:var(--warning);color:#10151e}}.status-badge.na{{background:var(--border);color:var(--muted)}}.pre-sum-card{{margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:14px;background:var(--surface-strong)}}.pre-sum-card.pass{{border-color:var(--success)}}.pre-sum-card.fail{{border-color:var(--danger);background:var(--danger-bg)}}.diagnostic-note{{padding:12px;border-left:4px solid var(--accent);border-radius:8px;background:var(--accent-soft)}}.diagnostic-note ul{{margin:6px 0 0;padding-left:20px}}.target-fit{{margin:10px 0}}.decay-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}}.decay-grid>div{{display:grid;gap:5px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.decay-grid small{{color:var(--muted);font-weight:800}}.decay-grid span{{display:flex;justify-content:space-between;gap:8px;font-size:.82rem}}
     .stage-workflow{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding-top:16px;border-top:1px solid var(--border)}}.stage-step{{display:grid;grid-template-columns:30px 1fr;column-gap:8px;align-items:center;padding:10px;border:1px solid var(--border);border-radius:12px;color:var(--muted)}}.stage-step span{{grid-row:1/3;display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:var(--border);font-weight:900;color:var(--text)}}.stage-step b{{font-size:.88rem;color:var(--text)}}.stage-step small{{font-size:.72rem}}.stage-step.done span{{background:var(--success-bg);color:var(--success)}}.stage-step.current{{border-color:var(--accent);background:var(--accent-soft)}}.stage-step.current span{{background:var(--accent);color:var(--on-accent)}}.stage-summary{{display:flex;align-items:center;gap:12px;padding:14px;margin:12px 0;border-radius:13px;background:color-mix(in srgb,var(--accent-soft) 56%,var(--surface-strong));border:1px solid color-mix(in srgb,var(--accent) 45%,var(--border))}}.stage-summary>div{{flex:1}}.stage-summary p{{margin:4px 0 0;color:var(--muted);font-size:.84rem;line-height:1.45}}.staged-compare h3{{margin:18px 0 4px;font-size:1rem}}.stage-actions{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:14px;margin-top:12px;border:1px solid var(--border);border-radius:13px;background:color-mix(in srgb,var(--surface-strong) 70%,transparent)}}.stage-actions p{{margin:4px 0 0}}.stage-actions.final{{border-color:color-mix(in srgb,var(--success) 52%,var(--border));background:color-mix(in srgb,var(--success-bg) 35%,var(--surface-strong))}}
@@ -2823,7 +2963,8 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
     .job-status-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}}.job-live-state{{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;color:var(--success);font-size:.72rem;font-weight:850}}.job-live-state i{{width:7px;height:7px;border-radius:50%;background:currentColor}}.job-live-state.retrying{{color:var(--warning)}}.job-live-state.refreshing{{color:var(--accent)}}
     .validation-row.warn{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-strong))}}.validation-row.warn p{{color:var(--warning)}}.status-badge.warn{{background:var(--warning);color:#10151e}}
     @media(max-width:980px){{.signal-flow{{grid-template-columns:1fr;justify-items:stretch}}.signal-wire{{height:30px}}.signal-wire svg{{width:42px;transform:rotate(90deg)}}.signal-node{{min-height:76px}}}}
-    @media(max-width:760px){{html{{scroll-padding-bottom:96px}}body{{padding-bottom:88px}}button,.button,select,input::file-selector-button,.app-nav a{{min-height:44px}}.grid{{grid-template-columns:1fr}}.topbar,.section-head,.stage-actions{{align-items:flex-start;flex-direction:column}}.app-nav{{position:fixed;z-index:20;left:10px;right:10px;bottom:max(8px,env(safe-area-inset-bottom));margin:0;padding:6px;background:color-mix(in srgb,var(--surface) 92%,transparent);box-shadow:0 8px 28px #0005;backdrop-filter:blur(14px)}}.app-nav a{{flex:1;text-align:center;padding:10px 5px;font-size:.78rem}}.theme-switch{{align-self:stretch;justify-content:center}}.theme-switch button{{flex:1}}td{{display:block;width:100%!important;padding:6px 2px}}td:first-child{{border-bottom:0;padding-top:11px}}.status,.card,.graphbox,.card-wide{{border-radius:15px}}.bypass{{align-items:stretch;flex-direction:column}}.bypass button{{width:100%}}.graph-scroll .response{{width:700px;max-width:none}}.measure-form,.advanced-grid,.backup-actions,.decay-grid,.measurement-output-summary{{grid-template-columns:1fr}}.measure-form button,.cal-slot button,.backup-actions .button,.backup-actions button{{width:100%}}.workflow{{position:sticky;z-index:12;top:6px;grid-template-columns:repeat(3,minmax(0,1fr));padding:6px;margin-inline:-6px;border-radius:14px 14px 0 0;background:color-mix(in srgb,var(--surface) 94%,transparent);box-shadow:var(--shadow);backdrop-filter:blur(12px)}}.flow-step{{min-height:46px;padding:7px 4px;gap:5px}}.flow-step>span{{min-width:22px;height:22px}}.measurement-tab-panels{{margin-inline:-6px}}.stage-workflow,.cal-slots{{grid-template-columns:1fr}}.cal-slot{{grid-template-columns:1fr}}.metric-grid,.diagnostic-grid{{grid-template-columns:1fr 1fr}}}}
+    @media(max-width:760px){{html{{scroll-padding-bottom:96px}}body{{padding-bottom:88px}}button,.button,select,input::file-selector-button,.app-nav a{{min-height:44px}}.grid{{grid-template-columns:1fr}}.topbar,.section-head,.stage-actions{{align-items:flex-start;flex-direction:column}}.app-nav{{position:fixed;z-index:20;left:10px;right:10px;bottom:max(8px,env(safe-area-inset-bottom));margin:0;padding:6px;background:color-mix(in srgb,var(--surface) 92%,transparent);box-shadow:0 8px 28px #0005;backdrop-filter:blur(14px)}}.app-nav a{{flex:1;text-align:center;padding:10px 5px;font-size:.78rem}}.theme-switch{{align-self:stretch;justify-content:center}}.theme-switch button{{flex:1}}td{{display:block;width:100%!important;padding:6px 2px}}td:first-child{{border-bottom:0;padding-top:11px}}.status,.card,.graphbox,.card-wide{{border-radius:15px}}.bypass{{align-items:stretch;flex-direction:column}}.bypass button{{width:100%}}.graph-scroll .response{{width:700px;max-width:none}}.measure-form,.advanced-grid,.backup-actions,.decay-grid,.measurement-output-summary,.profile-file-grid,.profile-output-grid{{grid-template-columns:1fr}}.measure-form button,.cal-slot button,.backup-actions .button,.backup-actions button{{width:100%}}.workflow{{position:sticky;z-index:12;top:6px;grid-template-columns:repeat(4,minmax(0,1fr));padding:6px;margin-inline:-6px;border-radius:14px 14px 0 0;background:color-mix(in srgb,var(--surface) 94%,transparent);box-shadow:var(--shadow);backdrop-filter:blur(12px)}}.flow-step{{min-height:46px;padding:7px 4px;gap:5px}}.flow-step>span{{min-width:22px;height:22px}}.measurement-tab-panels{{margin-inline:-6px}}.stage-workflow,.cal-slots{{grid-template-columns:1fr}}.cal-slot{{grid-template-columns:1fr}}.metric-grid,.diagnostic-grid{{grid-template-columns:1fr 1fr}}}}
+    @media(max-width:760px){{.mimo-mini-flow{{grid-template-columns:1fr}}.mimo-mini-flow i{{transform:rotate(90deg);text-align:center}}}}
 @media(max-width:760px){{.session-library,.session-note-form,.session-filter{{grid-template-columns:1fr}}.session-note-form>div{{grid-column:1}}.session-new-action{{align-items:stretch;flex-direction:column}}.saved-session-head{{align-items:stretch;flex-direction:column}}.saved-session-actions{{width:100%;justify-content:stretch}}.saved-session-actions form{{flex:1}}.saved-session-head form button{{width:100%}}}}
     .topbar,.app-nav,.status,.card,.graphbox,.card-wide,.measurement,.backup-panel{{min-width:0;max-width:100%}}.flow-step{{min-width:0;overflow:hidden}}.flow-step b{{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.cal-card>summary{{margin:0;padding:0;border:0;list-style:none}}.cal-card>summary::-webkit-details-marker{{display:none}}
     @media(max-width:760px){{.next-action{{align-items:flex-start;flex-direction:column}}.app-nav a{{min-width:0}}.theme-switch{{width:100%}}}}
@@ -2833,7 +2974,41 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
     </style></head><body data-physical="{physical or ''}" data-requested="{selected}" data-effective="{effective}"><a class="skip-link" href="#main-content">본문으로 바로가기</a><main id="main-content" tabindex="-1">
     <header class="topbar"><div><h1>AudioDSP</h1><p class="subtitle">Xonar U7 · 룸 보정 · FIR 프로필</p></div><div class="theme-switch" role="group" aria-label="색상 테마"><button type="button" data-theme-choice="auto">자동</button><button type="button" data-theme-choice="light">밝게</button><button type="button" data-theme-choice="dark">어둡게</button></div></header>
     <nav class="app-nav" aria-label="주요 화면">{nav}</nav>{notice}{failure}{status_html}{measurement_html}{settings_html}
-    <script>(()=>{{const buttons=[...document.querySelectorAll('[data-theme-choice]')];const current=()=>localStorage.getItem('audiodsp-theme')||'auto';const paint=()=>buttons.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.themeChoice===current())));buttons.forEach(b=>b.addEventListener('click',()=>{{const t=b.dataset.themeChoice;if(t==='auto'){{localStorage.removeItem('audiodsp-theme');delete document.documentElement.dataset.theme;}}else{{localStorage.setItem('audiodsp-theme',t);document.documentElement.dataset.theme=t;}}paint();}}));paint();const failure=document.querySelector('.failure');if(failure)failure.focus();}})();</script>
+    <script>(()=>{{const buttons=[...document.querySelectorAll('[data-theme-choice]')];const current=()=>localStorage.getItem('audiodsp-theme')||'auto';const paint=()=>buttons.forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.themeChoice===current())));buttons.forEach(b=>b.addEventListener('click',()=>{{const t=b.dataset.themeChoice;if(t==='auto'){{localStorage.removeItem('audiodsp-theme');delete document.documentElement.dataset.theme;}}else{{localStorage.setItem('audiodsp-theme',t);document.documentElement.dataset.theme=t;}}paint();}}));paint();const failure=document.querySelector('.page-message.failure');if(failure)failure.focus({{preventScroll:true}});}})();</script>
+    <script>(()=>{{/* navigation_continuity */
+      const KEY='audiodsp-navigation-return-v1';
+      history.scrollRestoration='manual';
+      const currentAnchor=()=>{{
+        const explicit=location.hash.slice(1);
+        if(explicit)return explicit;
+        const tab=document.querySelector('[data-measurement-tab][aria-selected="true"]');
+        if(!tab)return '';
+        return tab.dataset.measurementTab==='session'?'measurement-session':`measurement-step-${{tab.dataset.measurementTab}}`;
+      }};
+      const remember=(anchor=currentAnchor())=>{{
+        try{{sessionStorage.setItem(KEY,JSON.stringify({{path:location.pathname,y:window.scrollY,anchor,time:Date.now()}}));}}catch(_error){{}}
+      }};
+      const forget=()=>{{try{{sessionStorage.removeItem(KEY);}}catch(_error){{}}}};
+      let restored=false;
+      const restore=()=>{{
+        if(restored)return;
+        let value=null;
+        try{{value=JSON.parse(sessionStorage.getItem(KEY)||'null');}}catch(_error){{forget();}}
+        if(!value||value.path!==location.pathname||Date.now()-Number(value.time||0)>120000){{forget();restored=true;return;}}
+        restored=true;
+        requestAnimationFrame(()=>requestAnimationFrame(()=>{{window.scrollTo({{top:Math.max(0,Number(value.y)||0),left:0,behavior:'instant'}});forget();}}));
+      }};
+      document.addEventListener('submit',event=>{{
+        if(event.defaultPrevented)return;
+        const form=event.target;
+        if(!(form instanceof HTMLFormElement)||form.method.toLowerCase()!=='post')return;
+        const anchor=form.dataset.returnAnchor||currentAnchor();
+        try{{const action=new URL(form.getAttribute('action')||location.href,location.href);if(action.origin===location.origin){{if(anchor)action.searchParams.set('_return',anchor);form.action=action.pathname+action.search;}}}}catch(_error){{}}
+        remember(anchor);
+      }});
+      window.AudioDSPNavigation={{currentAnchor,remember,forget,restore}};
+      if(!document.querySelector('.measurement'))setTimeout(restore,0);
+    }})();</script>
     <script>(()=>{{/* output_volume_control */const root=document.getElementById('output-volume-control');if(!root)return;const slider=document.getElementById('output-volume-slider'),value=document.getElementById('output-volume-value'),note=document.getElementById('output-volume-status'),form=document.getElementById('output-volume-form');let timer=0,writing=false;const clamp=db=>Math.max(-60,Math.min(0,Math.round(db)));const label=db=>`${{Number(db).toFixed(Number.isInteger(Number(db))?0:1)}} dB`;const paint=v=>{{const saved=Number(v.saved_db??root.dataset.savedVolume);root.dataset.savedVolume=String(saved);const actual=v.available?Number(v.actual_db):null;if(document.activeElement!==slider)slider.value=String(actual??saved);value.textContent=label(actual??saved);if(!v.available){{note.textContent=`U7 실제 볼륨을 읽을 수 없음 · 재부팅 저장값 ${{label(saved)}}${{v.error?' · '+v.error:''}}`;note.classList.add('bad');}}else if(Math.abs(actual-saved)>.05){{note.textContent=`U7 실제 ${{label(actual)}} · 재부팅 저장값 ${{label(saved)}} · 물리 노브 변경 감지`;note.classList.remove('bad');}}else{{note.textContent=`U7 실제·저장값 ${{label(actual)}} · ${{v.channels}}채널 동일 적용`;note.classList.remove('bad');}}}};const load=async()=>{{clearTimeout(timer);if(document.hidden){{timer=setTimeout(load,3000);return;}}try{{const r=await fetch('/api/volume',{{cache:'no-store'}});if(r.ok)paint(await r.json());}}catch(_e){{}}finally{{timer=setTimeout(load,3000);}}}};const write=async db=>{{if(writing)return;writing=true;const target=clamp(db);slider.value=String(target);value.textContent=label(target);note.textContent='U7에 적용 중…';try{{const r=await fetch('/api/volume',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{db:target}})}});const body=await r.json().catch(()=>({{}}));if(!r.ok)throw Error(body.error||`HTTP ${{r.status}}`);paint(body);}}catch(e){{note.textContent='볼륨 적용 실패 · '+e.message;note.classList.add('bad');}}finally{{writing=false;}}}};slider.addEventListener('input',()=>{{value.textContent=label(Number(slider.value));}});slider.addEventListener('change',()=>write(Number(slider.value)));form.addEventListener('submit',e=>{{e.preventDefault();write(Number(slider.value));}});root.querySelectorAll('[data-volume-step]').forEach(b=>b.addEventListener('click',()=>write(Number(slider.value)+Number(b.dataset.volumeStep))));root.querySelectorAll('[data-volume]').forEach(b=>b.addEventListener('click',()=>write(Number(b.dataset.volume))));document.addEventListener('visibilitychange',()=>{{if(!document.hidden)load();}});load();}})();</script>
     <script>(()=>{{/* live_u7_status_poll */
       const initial={{
@@ -2875,6 +3050,7 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
         if(effectiveNode) effectiveNode.textContent=(labels[effective]||effective)+(requested!==effective?' (대체 사용)':'');
         if(!reloading&&(requested!==initial.requested||effective!==initial.effective)){{
           reloading=true;
+          window.AudioDSPNavigation?.remember();
           setTimeout(()=>location.reload(),180);
         }}
       }};
@@ -3067,7 +3243,13 @@ const poll=async()=>{{
           window.alert(`위치 ${{completedPositions}} 측정이 완료되었습니다.\n\n마이크를 청취점 근처의 다음 위치 ${{completedPositions+1}}로 옮기고, 천장 방향 90°를 유지하세요.\n\n확인을 누르면 다음 위치 준비 화면으로 이동합니다. 소리는 자동으로 시작되지 않습니다.`);
         }}
         paintLive('결과 반영 중','refreshing');
+        const nextAnchor=postAdv||resultChanged||j.result?.front||j.result?.kind==='mimo_2x4'?'measurement-step-5':
+          Number(j.positions_completed||0)>=Number(j.positions_total||0)&&Number(j.positions_total||0)>0?'measurement-step-4':
+          j.level_check?.ok?'measurement-step-3':'measurement-step-2';
+        if(window.AudioDSPNavigation?.currentAnchor()===nextAnchor)window.AudioDSPNavigation.remember(nextAnchor);
+        else window.AudioDSPNavigation?.forget();
         const url=new URL(canonicalMeasurementUrl,location.origin);url.searchParams.set('updated',String(j.updated_unix||Date.now()));
+        url.hash=nextAnchor;
         setTimeout(()=>location.replace(url),150);
         return;
       }}
@@ -3096,7 +3278,13 @@ const poll=async()=>{{
         }}else{{
           const g=graphs;
           for(const [name,key,color] of [['Left','left','var(--curve-l)'],['Right','right','var(--curve-r)']]){{
-            if(g[key]?.frequency)curves.push({{name:name+' · 후(예상)',f:g[key].frequency,d:g[key].predicted_db,color,width:2.5}});
+            if(g[key]?.frequency){{
+              curves.push({{name:name+' · 후(예상 평균)',f:g[key].frequency,d:g[key].predicted_db,color,width:2.5}});
+              if(j.result.kind==='mimo_2x4'&&g[key].predicted_min_db&&g[key].predicted_max_db){{
+                curves.push({{name:name+' · 위치 범위 하한',f:g[key].frequency,d:g[key].predicted_min_db,color,dash:'2 5',width:1}});
+                curves.push({{name:name+' · 위치 범위 상한',f:g[key].frequency,d:g[key].predicted_max_db,color,dash:'2 5',width:1}});
+              }}
+            }}
           }}
         }}
         const targetGraph=graphs.left||graphs.right;
@@ -3118,7 +3306,57 @@ document.addEventListener('visibilitychange',()=>{{if(!document.hidden)poll();}}
 poll();
 }})();</script>
     <script>(()=>{{const paint=async()=>{{try{{const h=await fetch('/api/health',{{cache:'no-store'}}).then(r=>r.json());const e=document.getElementById('system-health');if(e)e.textContent=`CPU ${{h.load[0].toFixed(2)}} · ${{h.temperature_c??'?'}}°C · 메모리 ${{h.memory_used_percent}}% · U7 ${{h.xonar_u7?'연결':'없음'}} · UMIK ${{h.umik1?'연결':'없음'}}`;}}catch(_e){{}}}};paint();setInterval(()=>{{if(!document.hidden)paint();}},5000);}})();</script>
-    <script>(()=>{{/* non_destructive_measurement_tabs */const root=document.querySelector('.measurement');if(!root)return;const tabs=[...root.querySelectorAll('[data-measurement-tab]')],panels=[...root.querySelectorAll('.measurement-panel')];root.querySelectorAll('[data-measurement-step-content]').forEach(node=>{{const step=node.dataset.measurementStepContent,host=root.querySelector(`[data-measurement-panel-content="${{step}}"]`);if(host)host.append(node);}});panels.forEach(panel=>{{const step=panel.id.rsplit?panel.id.rsplit('-',1)[1]:panel.id.split('-').pop(),content=panel.querySelector('.measurement-panel-content'),empty=panel.querySelector('.measurement-panel-empty');if(empty)empty.hidden=!!content?.children.length;}});const activate=(step,updateHash=true,moveFocus=false)=>{{const wanted=String(step);tabs.forEach(tab=>{{const selected=tab.dataset.measurementTab===wanted;tab.classList.toggle('selected',selected);tab.setAttribute('aria-selected',String(selected));tab.tabIndex=selected?0:-1;if(selected&&moveFocus)tab.focus();}});panels.forEach(panel=>{{panel.hidden=panel.id!==`measurement-panel-${{wanted}}`;}});if(updateHash){{const url=new URL(location.href);url.hash=`measurement-step-${{wanted}}`;history.replaceState(null,'',url);}}}};tabs.forEach((tab,index)=>{{tab.addEventListener('click',()=>activate(tab.dataset.measurementTab));tab.addEventListener('keydown',event=>{{let next=null;if(event.key==='ArrowRight'||event.key==='ArrowDown')next=(index+1)%tabs.length;else if(event.key==='ArrowLeft'||event.key==='ArrowUp')next=(index-1+tabs.length)%tabs.length;else if(event.key==='Home')next=0;else if(event.key==='End')next=tabs.length-1;if(next!==null){{event.preventDefault();activate(tabs[next].dataset.measurementTab,true,true);}}}});}});root.querySelectorAll('[data-measurement-jump]').forEach(button=>button.addEventListener('click',()=>{{activate(button.dataset.measurementJump);root.querySelector(`#measurement-panel-${{button.dataset.measurementJump}}`)?.focus();}}));const hashMatch=location.hash.match(/^#measurement-step-([1-6])$/),current=root.querySelector('[data-measurement-tab][aria-current="step"]');activate(hashMatch?.[1]||current?.dataset.measurementTab||'1',false);}})();</script>
+    <script>(()=>{{/* non_destructive_measurement_tabs */
+      const root=document.querySelector('.measurement');
+      if(!root)return;
+      const tabs=[...root.querySelectorAll('[data-measurement-tab]')];
+      const panels=[...root.querySelectorAll('.measurement-panel')];
+      root.querySelectorAll('[data-measurement-step-content]').forEach(node=>{{
+        const host=root.querySelector(`[data-measurement-panel-content="${{node.dataset.measurementStepContent}}"]`);
+        if(host)host.append(node);
+      }});
+      panels.forEach(panel=>{{
+        const content=panel.querySelector('.measurement-panel-content');
+        const empty=panel.querySelector('.measurement-panel-empty');
+        if(empty)empty.hidden=Boolean(content?.children.length);
+      }});
+      const anchorFor=step=>step==='session'?'measurement-session':`measurement-step-${{step}}`;
+      const activate=(step,updateHash=true,moveFocus=false)=>{{
+        const wanted=String(step);
+        if(!tabs.some(tab=>tab.dataset.measurementTab===wanted))return;
+        tabs.forEach(tab=>{{
+          const selected=tab.dataset.measurementTab===wanted;
+          tab.classList.toggle('selected',selected);
+          tab.setAttribute('aria-selected',String(selected));
+          tab.tabIndex=selected?0:-1;
+          if(selected&&moveFocus)tab.focus({{preventScroll:true}});
+        }});
+        panels.forEach(panel=>{{panel.hidden=panel.id!==`measurement-panel-${{wanted}}`;}});
+        if(updateHash){{const url=new URL(location.href);url.hash=anchorFor(wanted);history.replaceState(null,'',url);}}
+      }};
+      tabs.forEach((tab,index)=>{{
+        tab.addEventListener('click',()=>activate(tab.dataset.measurementTab));
+        tab.addEventListener('keydown',event=>{{
+          let next=null;
+          if(event.key==='ArrowRight'||event.key==='ArrowDown')next=(index+1)%tabs.length;
+          else if(event.key==='ArrowLeft'||event.key==='ArrowUp')next=(index-1+tabs.length)%tabs.length;
+          else if(event.key==='Home')next=0;
+          else if(event.key==='End')next=tabs.length-1;
+          if(next!==null){{event.preventDefault();activate(tabs[next].dataset.measurementTab,true,true);}}
+        }});
+      }});
+      root.querySelectorAll('[data-measurement-jump]').forEach(button=>button.addEventListener('click',()=>{{
+        const target=button.dataset.measurementJump;
+        activate(target);
+        root.querySelector(`#measurement-panel-${{target}}`)?.focus({{preventScroll:true}});
+        root.querySelector('.workflow')?.scrollIntoView({{behavior:'smooth',block:'start'}});
+      }}));
+      const numericMatch=location.hash.match(/^#measurement-step-([1-6])$/);
+      const hashStep=location.hash==='#measurement-session'?'session':numericMatch?.[1];
+      const current=root.querySelector('[data-measurement-tab][aria-current="step"]');
+      activate(hashStep||current?.dataset.measurementTab||'session',false);
+      window.AudioDSPNavigation?.restore();
+    }})();</script>
     <script>(()=>{{/* prevent_accidental_double_submit */document.addEventListener('submit',e=>{{if(e.defaultPrevented)return;const f=e.target;if(f.dataset.submitting==='1'){{e.preventDefault();return;}}f.dataset.submitting='1';queueMicrotask(()=>{{if(e.defaultPrevented){{delete f.dataset.submitting;return;}}const b=e.submitter||f.querySelector('button[type=submit],button:not([type])');if(b){{b.disabled=true;b.dataset.originalText=b.textContent;b.textContent='처리 중…';}}}});}});}})();</script>
     </main></body></html>"""
     return body.encode("utf-8")
@@ -3178,8 +3416,14 @@ class Handler(BaseHTTPRequestHandler):
     def redirect(self, message: str, target: str = "/") -> None:
         if target not in ("/", "/measure", "/settings"):
             target = "/"
+        anchor = str(getattr(self, "_return_anchor", ""))
+        if not re.fullmatch(r"(?:measurement-session|measurement-step-[1-6]|settings-[a-z0-9-]+|status-[a-z0-9-]+)", anchor):
+            anchor = ""
+        location = target + "?" + urlencode({"message": message})
+        if anchor:
+            location += "#" + anchor
         self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", target + "?" + urlencode({"message": message}))
+        self.send_header("Location", location)
         self.end_headers()
 
     def read_urlencoded(self) -> dict[str, str]:
@@ -3459,6 +3703,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        return_anchor = parse_qs(parsed.query).get("_return", [""])[-1]
+        self._return_anchor = return_anchor
         try:
             if parsed.path == "/volume":
                 fields = self.read_urlencoded()
