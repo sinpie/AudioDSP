@@ -65,6 +65,8 @@ sudo journalctl -u audiodsp-profile-monitor -n 80 --no-pager
 cat /var/lib/audiodsp/u7-selector-state.json
 ```
 
+정상 상태 파일은 버튼 직후 `source=hidraw`와 `0x30`/`0xA0`, 부팅 초기 조회에서는 `source=hidio_get_input`과 `0x88`/`0xE0` 중 하나를 기록할 수 있다. 전자는 순간 버튼 report, 후자는 안정 상태 report이므로 값이 다른 것이 정상이다. 감시기는 read-only GET_REPORT만 사용해 U7 selector를 쓰지 않는다.
+
 물리 상태가 바뀌면 웹은 약 1.5초 polling으로 요청/유효 profile을 갱신하고 필요한 경우 새 화면을 한 번 reload한다.
 
 ## UMIK/측정 오류

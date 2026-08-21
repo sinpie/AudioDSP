@@ -76,6 +76,8 @@ def main() -> int:
     require('<section class="mimo-options-card">' not in siso_html, "SISO UI exposes MIMO-only controls")
     require("정밀 분리+합산" in siso_html, "SISO measurement method is not explained")
     require("L/R/우퍼/L+우퍼/R+우퍼" in siso_html, "SISO acquisition sequence is missing")
+    require("전 대역의 유일한 절대 감쇄 상한" in siso_html, "maximum room-cut semantics are not visible beside the setting")
+    require("숨은 3/6 dB 고역 제한은 없으며" in siso_html, "removed high-frequency cut caps are not documented in the algorithm panel")
     print("PASS: 7-tab measurement flow, MIMO-only controls, and SISO/MIMO explanations")
     return 0
 

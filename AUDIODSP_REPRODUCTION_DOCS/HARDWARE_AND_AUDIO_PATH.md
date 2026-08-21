@@ -55,7 +55,9 @@ amixer -D hw:U7 set 'PCM',0 117
 
 ## U7 Speaker/Headphones
 
-상단 dial 클릭의 output 선택은 U7 HID report에서 감지한다. 현재 확인된 state는 Headphones `0x30`, Speaker `0xA0`이며 button press mask가 함께 들어온다. 웹은 이를 읽어 active 카드와 실제 상태를 갱신한다.
+상단 dial 클릭의 output 선택은 U7 HID report에서 감지한다. 버튼 이벤트 report는 Headphone `0x30`, Speaker `0xA0`이며 press mask가 함께 들어온다. 부팅 후 `HIDIOCGINPUT`으로 읽는 안정 상태 report는 별도 표인 Headphone `0x88`, Speaker `0xE0`을 사용한다. 두 표를 섞지 않으며 웹은 이를 읽어 active 카드와 실제 상태를 갱신한다.
+
+상태 감시는 hidraw를 `O_RDONLY`로 열고 USB GET_REPORT만 수행한다. output/feature report는 보내지 않으므로 AudioDSP가 부팅 중 U7 물리 selector나 상단 LED를 바꾸지 않는다.
 
 U7 hardware output selector를 바꾸는 공개 ALSA command가 확인되지 않았으므로 웹에서 LED를 바꾸는 control은 제공하지 않는다. U7 물리 버튼으로 바꾼다.
 

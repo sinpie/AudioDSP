@@ -24,6 +24,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\releases\audiodsp-pi2-
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\releases\audiodsp-pi4-pi5-v1.2.0\write_final_sd_as_admin.ps1 -ValidateOnly -NoPause
 ```
 
+U7 selector 전용 무음 회귀(Pi에서 실행):
+
+```bash
+python3 /tmp/test_u7_profile_monitor.py \
+  --monitor /usr/local/bin/audiodsp-profile-monitor.py
+```
+
+버튼 이벤트와 부팅 안정 report의 서로 다른 byte 표, `O_RDONLY` HID open,
+HID output/feature report 쓰기 부재를 짧게 검증한다.
+
 ## 2. Profile matrix
 
 이 시험은 임시 디렉터리와 fake ALSA/systemd helper를 사용해 실제 profile/settings를 변경하지 않는다.
@@ -36,7 +46,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\releases\audiodsp-pi4-
 - 생성된 모든 고유 YAML을 실제 CamillaDSP `--check`
 - WAV format·rate·channel·NaN·size·tap 경계
 - profile fallback, bypass, copy/separate, woofer trim, chunksize
-- U7 HID 0x30/0xA0와 안내음
+- U7 버튼 이벤트 `0x30/0xA0`, 부팅 안정 상태 `0x88/0xE0`, read-only
+  `HIDIOCGINPUT`, 안내음
 - 세 화면 UI, 반응형 signal-flow/measurement path-lock SVG marker, staged upload, A/B, apply, backup/restore/latest rollback
 - 소리 없는 session 생성/재설정, 보고서 MD/JSON/ZIP download, 측정한 U7 경로 외 Preview/Apply HTTP 400 및 무변경
 - session 주석 저장 전후 level/측정/FIR checkpoint 불변, A→B 생성 뒤 A 주석 포함 목록 표시·불러오기, active session 삭제 후 idle 복귀·정식 FIR 불변·중복 삭제 거부, 완료 artifact 누락 session 거부
@@ -112,7 +123,7 @@ python source/common/tests/test_web_measurement_flow.py `
 
 `test_target_option_matrix.py`는 6 target×3 preset 18개 조합과 Web에 노출된 target/crossover/trim/억제/phase/보정 범위/최대 상대 보상/cut/취향 값의 one-axis 및 대표 상호작용 95개를 실제 32768탭으로 계산한다. `Flat + 추가 억제 없음 + trim 0 dB + 최대 상대 보상 10 dB` 기준 조합은 반드시 PASS하고, 비기준 조합은 안전 제한에 따라 FAIL할 수 있으나 형식·유한값·headroom 검사는 항상 통과해야 한다.
 
-같은 회귀는 L/R 500~2,000 Hz에서 얻은 하나의 측정·타깃 기준이 Woofer까지 전달되는지, 완성 4채널 bank에 common gain 한 번만 적용되는지, branch 간 상대 dB가 부동소수점 허용오차 안에서 유지되는지를 검사한다. 양쪽 Front의 넓은 10 kHz 이상 roll-off fixture는 16 kHz에서 4 dB를 넘게 상대 보상하되 선택 상한 10 dB를 넘지 않아야 하고, 한 채널의 좁은 15 dB null은 3 dB를 넘게 boost하거나 common attenuation을 결정해서는 안 된다. 실측 저장 session 회귀는 10/15/20 kHz의 요청 correction·FIR 실제 correction·예상 음압과 전체 common attenuation을 함께 기록한다.
+같은 회귀는 L/R 500~2,000 Hz에서 얻은 하나의 측정·타깃 기준이 Woofer까지 전달되는지, 완성 4채널 bank에 common gain 한 번만 적용되는지, branch 간 상대 dB가 부동소수점 허용오차 안에서 유지되는지를 검사한다. 양쪽 Front의 넓은 10 kHz 이상 roll-off fixture는 16 kHz에서 4 dB를 넘게 상대 보상하되 선택 상한 10 dB를 넘지 않아야 하고, 한 채널의 좁은 15 dB null은 3 dB를 넘게 boost하거나 common attenuation을 결정해서는 안 된다. 고역 감쇄 회귀는 양쪽의 넓은 8 kHz peak가 과거 숨은 −3 dB 상한을 넘어 보정되는지, 좁은 한쪽 peak는 신뢰도에 따라 완화되는지, UI의 `최대 룸 감쇄`만 최종 절대 상한으로 동작하는지를 별도로 확인한다. 실측 저장 session 회귀는 10/15/20 kHz의 요청 correction·FIR 실제 correction·예상 음압과 전체 common attenuation을 함께 기록한다.
 
 실측 session의 UI SISO 값 전체를 확인할 때는 `diagnostics/run_full_option_matrix.py`로 Flat/추가 억제 없음/trim 0 dB/최대 상대 보상 10 dB 기준에서 한 축씩 바꾼 68개 32768탭 Front/Woofer FIR 쌍을 생성한다. `diagnostics/build_option_validation_sequence.py`는 같은 FIR을 정확히 offline convolution한 4채널 저음량 시퀀스와 감쇄한 무필터 전/후 기준을 만들고, `diagnostics/capture_option_validation.py`는 production DSP-bypass/U7-input-off 경로에서 상태를 보존하며 UMIK로 녹음한다. `diagnostics/analyze_option_validation.py`는 모든 L/R 합산 sweep의 SNR·peak·target-fit·생활소음 transient와 Woofer/Bass/Treble 단조성을 분석한다. 이 검사는 조합 폭발을 피하기 위한 one-factor-at-a-time 기능 검증이며 모든 값의 Cartesian product를 의미하지 않는다.
 
@@ -222,6 +233,8 @@ Invoke-RestMethod -Uri 'http://<PI-IP>:8080/api/volume' -Method Put -ContentType
 v22 재계산 결과를 -30 dBFS/28초로 검증했을 때 R은 target MAE/P90 1.541/3.626 dB로 정상이나 첫 L은 4.034/13.914 dB로 실패했다. 입력 WAV와 FIR FFT는 좌우 대칭이었지만 L 녹음의 첫 0.4초는 약 -47 dBFS에서 감쇠했고 sweep 전/후 noise 추정치가 -50.0/-75.93 dBFS로 25.93 dB 벌어졌다. 이 stream-start 오염이 30/40/50/60/80/100/130 Hz를 예상보다 각각 약 +18.3/+16.3/+14.6/+14.7/+10.1/+7.5/+5.1 dB 올린 원인이므로 v23은 2초 무음 lead와 판정 보류를 적용한다. 이 시험 뒤에도 기존 Speaker FIR SHA와 -10 dB 볼륨, 입력 복귀를 확인했다.
 
 v23을 -25 dBFS/28초와 2초 무음 lead로 검증한 결과 최소 SNR은 18.54 dB였다. target MAE/P90은 L 1.388/3.337 dB, R 1.340/2.953 dB, crossover MAE/P90은 L 1.748/3.978 dB, R 1.990/4.409 dB, 예상↔실측 MAE/P90은 L 1.318/2.885 dB, R 1.278/2.706 dB로 전부 PASS했다. L sweep 전/후 noise 차이는 1.50 dB, R은 5.19 dB였으나 두 active sweep transient 검출은 false였고 R 음향 지표도 모두 PASS였다. 따라서 전·후 stationary floor 차이만으로 유효 응답을 폐기하지 않는 판정식이 필요함을 실제 데이터로 확인했다. 시험 뒤 기존 Speaker FIR SHA, -10 dB 볼륨, U7 입력과 세 service를 복원했다.
+
+2026-08-22 감쇄 신뢰도 v24는 같은 Pi5 Fast 저장 세션 `20260821_195955`의 격리 복사본을 소리 없이 재계산했다. Flat/추가 억제 없음/우퍼 트림 0 dB/최대 상대 보상 10 dB/최대 룸 감쇄 18 dB/100 Hz crossover에서 7.65 kHz L/R 요청 감쇄는 이전의 고정 −3/−3 dB에서 −6.718/−5.805 dB로 바뀌고 예상 타깃 잔차는 +4.002/+2.910 dB에서 +0.278/+0.099 dB로 줄었다. 전체 Front target MAE/P90은 L 0.639/1.637 dB, R 0.790/2.109 dB로 모두 PASS했다. 95개 옵션 행렬, 엔진 E2E와 Web 측정 흐름도 무음 PASS했으며 운영 Speaker FIR SHA `1ae8126b…d890c`/`21d31525…1e99e`는 변경하지 않았다.
 
 ## 8. 장시간 성능
 

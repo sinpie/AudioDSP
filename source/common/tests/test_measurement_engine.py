@@ -572,6 +572,57 @@ def main() -> int:
         require(left_confidence[upper_index] >= 0.50 and right_confidence[upper_index] >= 0.50, "independent L/R broad roll-off did not raise confidence enough to use the selected relative ceiling")
         require(left_rolloff_floor[upper_index] >= 0.50 and right_rolloff_floor[upper_index] >= 0.50, "broad roll-off evidence was not separated from raw SNR confidence")
         require(rolloff_summary["narrow_null_guard_remains_enabled"], "stereo roll-off inference disabled the null guard")
+
+        broad_peak_left = [
+            9.0 * math.exp(-0.5 * (math.log2(frequency / 8_000.0) / 0.75) ** 2)
+            for frequency in reliability_f
+        ]
+        broad_peak_right = [value - 0.5 for value in broad_peak_left]
+        left_cut_reliability, right_cut_reliability, cut_summary = engine.stereo_peak_cut_reliability(
+            reliability_f, broad_peak_left,
+            reliability_f, broad_peak_right,
+            [20.0, 20_000.0], [0.0, 0.0], 0.0, 0.0,
+        )
+        peak_index = min(range(len(reliability_f)), key=lambda index: abs(reliability_f[index] - 8_000.0))
+        require(left_cut_reliability[peak_index] > 0.90 and right_cut_reliability[peak_index] > 0.90, "broad common L/R peak did not retain cut authority")
+        require(not cut_summary["frequency_dependent_hard_cut_cap"], "hidden frequency-dependent cut cap was reported enabled")
+
+        narrow_peak_left = [0.0] * len(reliability_f)
+        narrow_peak_left[peak_index] = 12.0
+        narrow_cut_left, _narrow_cut_right, _narrow_cut_summary = engine.stereo_peak_cut_reliability(
+            reliability_f, narrow_peak_left,
+            reliability_f, [0.0] * len(reliability_f),
+            [20.0, 20_000.0], [0.0, 0.0], 0.0, 0.0,
+        )
+        require(narrow_cut_left[peak_index] < 0.10, "narrow unilateral peak retained excessive cut authority")
+
+        _broad_cut_ir, broad_cut_graph = engine.design_channel(
+            reliability_f, broad_peak_left, [0.0] * len(reliability_f), [0.0] * len(reliability_f),
+            "flat", "none", woofer=False, woofer_trim_db=0,
+            phase_mode="magnitude", phase_cutoff=200,
+            frequency_confidence=[1.0] * len(reliability_f),
+            cut_peak_reliability=left_cut_reliability,
+            shared_reference_measure_db=0.0, shared_reference_target_db=0.0,
+            max_cut_db=18, fft=fft_backend,
+        )
+        broad_cut_graph_index = min(range(len(broad_cut_graph["frequency"])), key=lambda index: abs(broad_cut_graph["frequency"][index] - 8_000.0))
+        broad_cut = broad_cut_graph["requested_correction_db"][broad_cut_graph_index]
+        require(-18.01 <= broad_cut < -6.0, "broad trusted high-frequency peak was still limited by the removed 3 dB cap")
+        require(broad_cut_graph["cut_peak_reliability"][broad_cut_graph_index] > 0.90, "cut reliability was not recorded in the FIR graph")
+
+        _limited_cut_ir, limited_cut_graph = engine.design_channel(
+            reliability_f, [18.0] * len(reliability_f), [0.0] * len(reliability_f), [0.0] * len(reliability_f),
+            "flat", "none", woofer=False, woofer_trim_db=0,
+            phase_mode="magnitude", phase_cutoff=200,
+            frequency_confidence=[1.0] * len(reliability_f),
+            cut_peak_reliability=[1.0] * len(reliability_f),
+            shared_reference_measure_db=0.0, shared_reference_target_db=0.0,
+            max_cut_db=6, fft=fft_backend,
+        )
+        limited_cut_graph_index = min(range(len(limited_cut_graph["frequency"])), key=lambda index: abs(limited_cut_graph["frequency"][index] - 8_000.0))
+        limited_cut = limited_cut_graph["requested_correction_db"][limited_cut_graph_index]
+        require(-6.01 <= limited_cut <= -5.90, "user-selected maximum room cut was not the absolute high-frequency ceiling")
+
         rolloff_ir, rolloff_graph = engine.design_channel(
             reliability_f, broad_left, [0.2] * len(reliability_f), [0.0] * len(reliability_f),
             "flat", "none", woofer=False, woofer_trim_db=0,

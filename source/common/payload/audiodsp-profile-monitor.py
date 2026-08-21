@@ -16,9 +16,17 @@ U7_HID_ID = "0003:00001043:0000857C"
 PRESS_MASK = 0x20
 PRESS_BYTE = 7
 STATE_BYTE = 10
-STATE_TO_PROFILE = {
+# The U7 uses different byte values for the momentary button event and for the
+# steady input report returned by HIDIOCGINPUT.  Mixing these two encodings was
+# the reason boot-time detection stayed at "unknown" even though button presses
+# were decoded correctly.
+BUTTON_STATE_TO_PROFILE = {
     0x30: "headphone",
     0xA0: "speaker",
+}
+CURRENT_STATE_TO_PROFILE = {
+    0x88: "headphone",
+    0xE0: "speaker",
 }
 SELECTOR_STATE_PATH = Path(os.environ.get(
     "AUDIODSP_SELECTOR_STATE_PATH",
@@ -52,11 +60,15 @@ def decode_pressed_profile(report: bytes) -> str | None:
         return None
     if not (report[PRESS_BYTE] & PRESS_MASK):
         return None
-    return STATE_TO_PROFILE.get(report[STATE_BYTE])
+    return BUTTON_STATE_TO_PROFILE.get(report[STATE_BYTE])
 
 
 def read_current_report(device: str) -> bytes:
-    descriptor = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+    # HIDIOCGINPUT is a USB GET_REPORT request.  Opening the node read-only is
+    # sufficient on Linux and makes the important boundary explicit: this
+    # monitor must never send an output/feature report that could change the
+    # U7's physical Speaker/Headphone selector.
+    descriptor = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
     try:
         data = bytearray(HID_INPUT_REPORT_SIZE)
         returned = fcntl.ioctl(descriptor, HIDIOCGINPUT, data, True)
@@ -74,7 +86,7 @@ def current_profile(device: str) -> tuple[str, int]:
     if len(report) <= STATE_BYTE:
         raise OSError(f"U7 HID input report is too short: {len(report)}")
     state = report[STATE_BYTE]
-    profile = STATE_TO_PROFILE.get(state)
+    profile = CURRENT_STATE_TO_PROFILE.get(state)
     if profile is None:
         raise OSError(f"Unknown U7 selector state 0x{state:02x}; report={report.hex(' ')}")
     return profile, state

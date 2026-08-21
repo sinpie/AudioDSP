@@ -74,7 +74,7 @@ POST_VALIDATION_SWEEP_SECONDS = 28
 POST_VALIDATION_SILENT_LEAD_SECONDS = 2.0
 FIR_IMPLEMENTATION_MAE_LIMIT_DB = 0.25
 FIR_IMPLEMENTATION_P95_LIMIT_DB = 0.80
-RESULT_ALGORITHM_REVISION = "2026-08-21-post-validation-settle-v23"
+RESULT_ALGORITHM_REVISION = "2026-08-22-confidence-weighted-cut-v24"
 RESPONSE_ALGORITHM_REVISION = "2026-08-21-power-domain-smoothing-v1"
 SMOOTHING_NAME = "power-domain variable 1/12 octave <200 Hz; 1/6 octave 200-2000 Hz; 1/3 octave >2 kHz"
 LEGACY_SMOOTHING_NAMES = frozenset((
@@ -5848,6 +5848,122 @@ def narrow_notch_reliability(frequencies: list[float], levels_db: list[float]) -
     return result
 
 
+def narrow_peak_reliability(frequencies: list[float], levels_db: list[float]) -> list[float]:
+    """Down-weight narrow local peaks without imposing a hidden dB ceiling.
+
+    A broad excess is a useful cut target, while a narrow in-room peak can move
+    or invert with a small microphone displacement. The returned continuous
+    confidence is therefore multiplied into the requested cut; ``max_cut_db``
+    remains the only absolute cut limit.
+    """
+    if len(frequencies) != len(levels_db) or not frequencies:
+        raise MeasurementError("peak 보호용 주파수 응답 길이가 일치하지 않습니다.")
+    ratio = 2.0 ** (1.0 / 6.0)
+    result: list[float] = []
+    for frequency, level in zip(frequencies, levels_db):
+        lower_frequency = frequency / ratio
+        upper_frequency = frequency * ratio
+        if lower_frequency < frequencies[0] or upper_frequency > frequencies[-1]:
+            result.append(1.0)
+            continue
+        lower = interpolate_log(frequencies, levels_db, lower_frequency)
+        upper = interpolate_log(frequencies, levels_db, upper_frequency)
+        local_trend = 0.5 * (lower + upper)
+        peak_height = max(0.0, level - local_trend)
+        result.append(1.0 / (1.0 + (peak_height / 3.0) ** 2))
+    return result
+
+
+def stereo_peak_cut_reliability(
+    left_f: list[float],
+    left_db: list[float],
+    right_f: list[float],
+    right_db: list[float],
+    target_f: list[float],
+    target_db: list[float],
+    shared_measure_reference_db: float,
+    shared_target_reference_db: float,
+) -> tuple[list[float], list[float], dict[str, Any]]:
+    """Weight high-band cuts by local shape and independent L/R agreement.
+
+    Common broad excess receives nearly full authority. A narrow or unilateral
+    peak is attenuated continuously, never by a second frequency-dependent hard
+    limit. The 0.60 unilateral floor still permits correction of a real
+    speaker-specific broad excess.
+    """
+    left_shape = narrow_peak_reliability(left_f, left_db)
+    right_shape = narrow_peak_reliability(right_f, right_db)
+
+    def channel_values(
+        frequencies: list[float],
+        levels_db: list[float],
+        shape_values: list[float],
+        other_f: list[float],
+        other_db: list[float],
+    ) -> tuple[list[float], int, float, int]:
+        values: list[float] = []
+        guarded = 0
+        minimum = 1.0
+        broad_common = 0
+        broad_ratio = 2.0 ** (1.0 / 3.0)
+        for frequency, level, shape in zip(frequencies, levels_db, shape_values):
+            if frequency < 500.0:
+                values.append(1.0)
+                continue
+            target_level = interpolate_log(target_f, target_db, frequency) - shared_target_reference_db
+            own_excess = (level - shared_measure_reference_db) - target_level
+            if own_excess <= 0.0:
+                values.append(1.0)
+                continue
+            other_level = interpolate_log(other_f, other_db, frequency)
+            other_excess = (other_level - shared_measure_reference_db) - target_level
+            support_ratio = max(0.0, min(1.0, other_excess / max(own_excess, 1.0e-9)))
+            disagreement = abs(own_excess - other_excess)
+            agreement = 1.0 / (1.0 + (disagreement / 4.0) ** 2)
+            stereo_support = support_ratio * agreement
+            common_band_excess: list[float] = []
+            for candidate_frequency, candidate_level in zip(frequencies, levels_db):
+                if not frequency / broad_ratio <= candidate_frequency <= frequency * broad_ratio:
+                    continue
+                candidate_target = interpolate_log(target_f, target_db, candidate_frequency) - shared_target_reference_db
+                candidate_own_excess = (candidate_level - shared_measure_reference_db) - candidate_target
+                candidate_other_level = interpolate_log(other_f, other_db, candidate_frequency)
+                candidate_other_excess = (candidate_other_level - shared_measure_reference_db) - candidate_target
+                common_band_excess.append(max(0.0, min(candidate_own_excess, candidate_other_excess)))
+            broad_evidence = statistics.median(common_band_excess) if common_band_excess else 0.0
+            # A common excess sustained across a two-thirds-octave window is
+            # strong evidence of a real broad tonal imbalance. It may override
+            # a low point-shape score without granting the same authority to a
+            # one-bin spike that merely appears in both channels.
+            broad_common_support = min(1.0, broad_evidence / 3.0) * agreement
+            shape_base = max(0.0, min(1.0, float(shape))) * (0.60 + 0.40 * stereo_support)
+            reliability = shape_base + (1.0 - shape_base) * broad_common_support
+            if broad_common_support >= 0.50:
+                broad_common += 1
+            if reliability < 0.999:
+                guarded += 1
+                minimum = min(minimum, reliability)
+            values.append(reliability)
+        return values, guarded, minimum, broad_common
+
+    left_values, left_guarded, left_minimum, left_broad_common = channel_values(
+        left_f, left_db, left_shape, right_f, right_db
+    )
+    right_values, right_guarded, right_minimum, right_broad_common = channel_values(
+        right_f, right_db, right_shape, left_f, left_db
+    )
+    return left_values, right_values, {
+        "method": "continuous local-peak shape, two-thirds-octave common excess and independent L/R agreement weighting above 500 Hz",
+        "left_guarded_bins": left_guarded,
+        "right_guarded_bins": right_guarded,
+        "left_broad_common_bins": left_broad_common,
+        "right_broad_common_bins": right_broad_common,
+        "minimum_reliability": round(min(left_minimum, right_minimum), 4),
+        "unilateral_broad_peak_floor": 0.60,
+        "frequency_dependent_hard_cut_cap": False,
+    }
+
+
 def stereo_broad_rolloff_confidence(
     left_f: list[float],
     left_db: list[float],
@@ -6703,7 +6819,7 @@ def summarize_high_frequency_compensation(
     }
 
 
-def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_db: list[float], measured_phase: list[float] | None, target_name: str, preset: str, *, woofer: bool, woofer_trim_db: int, phase_mode: str, phase_cutoff: int, spatial_mode: str = "equal", bass_tilt_db: int = 0, treble_tilt_db: int = 0, correction_low_hz: int = 20, correction_high_hz: int = 20_000, max_boost_db: int = 10, max_cut_db: int = 18, crossover_role: str | None = None, crossover_frequency_hz: int = 100, decay_frequency_hz: list[float] | None = None, decay_t20_rt60_s: list[float] | None = None, shared_reference_measure_db: float | None = None, shared_reference_target_db: float | None = None, frequency_confidence: list[float] | None = None, corroborated_rolloff_confidence: list[float] | None = None, fft: FFTBackend) -> tuple[list[float], dict[str, Any]]:
+def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_db: list[float], measured_phase: list[float] | None, target_name: str, preset: str, *, woofer: bool, woofer_trim_db: int, phase_mode: str, phase_cutoff: int, spatial_mode: str = "equal", bass_tilt_db: int = 0, treble_tilt_db: int = 0, correction_low_hz: int = 20, correction_high_hz: int = 20_000, max_boost_db: int = 10, max_cut_db: int = 18, crossover_role: str | None = None, crossover_frequency_hz: int = 100, decay_frequency_hz: list[float] | None = None, decay_t20_rt60_s: list[float] | None = None, shared_reference_measure_db: float | None = None, shared_reference_target_db: float | None = None, frequency_confidence: list[float] | None = None, corroborated_rolloff_confidence: list[float] | None = None, cut_peak_reliability: list[float] | None = None, fft: FFTBackend) -> tuple[list[float], dict[str, Any]]:
     target_f, target_db = target_curve(target_name)
     reference_band = (50, 120) if woofer else (500, 2000)
     target_reference_band = (500, 2000) if shared_reference_target_db is not None else reference_band
@@ -6735,6 +6851,7 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
     graph_confidence: list[float] = []
     graph_rolloff_confidence: list[float] = []
     graph_notch_reliability: list[float] = []
+    graph_cut_peak_reliability: list[float] = []
     graph_target: list[float] = []
     graph_effective_target: list[float] = []
     graph_correction: list[float] = []
@@ -6759,6 +6876,8 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         rolloff_confidence = max(0.0, min(1.0, rolloff_confidence))
         notch_reliability = interpolate_log(measure_f, notch_reliability_values, max(measure_f[0], min(measure_f[-1], safe_frequency)))
         notch_reliability = max(0.0, min(1.0, notch_reliability))
+        peak_cut_reliability = interpolate_log(measure_f, cut_peak_reliability, max(measure_f[0], min(measure_f[-1], safe_frequency))) if cut_peak_reliability else 1.0
+        peak_cut_reliability = max(0.0, min(1.0, peak_cut_reliability))
         target_without_preference = interpolate_log(target_f, target_db, max(target_f[0], min(target_f[-1], safe_frequency))) - reference_target_without_preference
         window = correction_window(safe_frequency, correction_low_hz, correction_high_hz)
         # Keep explicit user tone controls outside the automatic room-EQ
@@ -6808,18 +6927,13 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
                     guarded_boost_bins += 1
             else:
                 # Above the room-dominated bass region, small head movements can
-                # turn narrow peaks into dips. Apply spatial confidence to cuts as
-                # well as boosts and never carve deep high-frequency notches from
-                # an in-room microphone response.
+                # turn narrow peaks into dips. Apply spatial, local-shape and
+                # independent L/R confidence continuously. The selected
+                # max_cut_db is the only absolute cut ceiling; there is no hidden
+                # 500 Hz/2 kHz frequency-dependent dB cap.
                 if frequency >= 500.0:
-                    raw_correction *= spatial_reliability
-                if frequency >= 2_000.0:
-                    cut_limit = min(float(max_cut_db), 3.0)
-                elif frequency >= 500.0:
-                    cut_limit = min(float(max_cut_db), 6.0)
-                else:
-                    cut_limit = float(max_cut_db)
-                correction = max(-cut_limit, raw_correction)
+                    raw_correction *= spatial_reliability * peak_cut_reliability
+                correction = max(-float(max_cut_db), raw_correction)
             audible_guard_high = 22_000.0 if correction_high_hz >= 20_000 else 20_000.0
             if not 20.0 <= frequency <= audible_guard_high:
                 correction = 0.0
@@ -6855,6 +6969,7 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
             graph_confidence.append(round(noise_confidence, 4))
             graph_rolloff_confidence.append(round(rolloff_confidence, 4))
             graph_notch_reliability.append(round(notch_reliability, 4))
+            graph_cut_peak_reliability.append(round(peak_cut_reliability, 4))
             graph_target.append(round(target_value, 3))
             graph_effective_target.append(round(target_value + (modifier if woofer or frequency <= 350.0 else 0.0) - decay_cut + (woofer_trim_db if woofer else 0), 3))
             graph_decay.append(round(decay_value, 3) if decay_value is not None else None)
@@ -6875,6 +6990,7 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         "measurement_confidence": graph_confidence,
         "stereo_rolloff_confidence": graph_rolloff_confidence,
         "narrow_notch_reliability": graph_notch_reliability,
+        "cut_peak_reliability": graph_cut_peak_reliability,
         "target_db": graph_target,
         "effective_target_db": graph_effective_target,
         "automatic_room_correction_db": graph_automatic_room_correction,
@@ -6884,7 +7000,7 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         "decay_t20_rt60_s": graph_decay,
         "decay_control_db": graph_decay_cut,
         "phase": phase_details,
-        "regularization": "noise-confidence weighted mean-square spatial prototype; power-domain variable perceptual smoothing; weighted spatial variance plus narrow-notch soft boost guard; L/R-corroborated broad roll-off confidence; explicit broad tone preference independent of the automatic room-EQ band",
+        "regularization": "noise-confidence weighted mean-square spatial prototype; power-domain variable perceptual smoothing; weighted spatial variance plus narrow-notch soft boost guard; L/R-corroborated broad roll-off confidence; confidence-weighted peak cuts with no frequency-dependent hard cap; explicit broad tone preference independent of the automatic room-EQ band",
         "reference_band_hz": list(reference_band),
         "level_reference": "shared Front L/R 500-2000 Hz" if shared_reference_measure_db is not None else f"local {reference_band[0]}-{reference_band[1]} Hz",
         "reference_measure_db": round(reference_measure, 3),
@@ -6900,6 +7016,7 @@ def design_channel(measure_f: list[float], measure_db: list[float], spatial_std_
         "max_room_boost_db": max_boost_db,
         "max_relative_compensation_db": max_boost_db,
         "max_room_cut_db": max_cut_db,
+        "cut_limit_semantics": "user-selected max_room_cut_db is the only absolute cut ceiling; >=500 Hz cuts are continuously weighted by noise, spatial, local-peak and L/R agreement confidence",
         "preference": {"bass_db_at_20_hz": bass_tilt_db, "treble_db_at_20_khz": treble_tilt_db},
         "woofer": woofer,
         "woofer_trim_db": woofer_trim_db if woofer else 0,
@@ -7919,13 +8036,23 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         shared_front_reference_db,
         shared_target_reference_db,
     )
+    left_cut_reliability, right_cut_reliability, stereo_peak_cut_summary = stereo_peak_cut_reliability(
+        left_f,
+        left_db,
+        right_f,
+        right_db,
+        target_f,
+        preferred_target_db,
+        shared_front_reference_db,
+        shared_target_reference_db,
+    )
     update_current(stage="Left 32768탭 최소위상 FIR 계산", progress=22.0, eta_seconds=round(build_eta * 0.80))
     common = {"spatial_mode": spatial_mode, "bass_tilt_db": bass_tilt_db, "treble_tilt_db": treble_tilt_db, "correction_low_hz": correction_low_hz, "correction_high_hz": correction_high_hz, "max_boost_db": max_boost_db, "max_cut_db": max_cut_db, "fft": fft}
     front_design_phase_mode = "magnitude" if phase_mode == "bass" else phase_mode
     crossover_role = "highpass" if state.get("mode") in SEPARATE_WOOFER_MODES and crossover_enabled else None
-    left_ir, left_graph = design_channel(left_f, left_db, left_response["spatial_std_db"], left_response["center_phase_rad"], target_name, preset, woofer=False, woofer_trim_db=0, phase_mode=front_design_phase_mode, phase_cutoff=phase_cutoff, crossover_role=crossover_role, crossover_frequency_hz=crossover_frequency_hz, decay_frequency_hz=left_response["decay_frequency_hz"], decay_t20_rt60_s=left_response["decay_t20_rt60_s"], frequency_confidence=left_confidence, corroborated_rolloff_confidence=left_rolloff_floor, shared_reference_measure_db=shared_front_reference_db, shared_reference_target_db=shared_target_reference_db, **common)
+    left_ir, left_graph = design_channel(left_f, left_db, left_response["spatial_std_db"], left_response["center_phase_rad"], target_name, preset, woofer=False, woofer_trim_db=0, phase_mode=front_design_phase_mode, phase_cutoff=phase_cutoff, crossover_role=crossover_role, crossover_frequency_hz=crossover_frequency_hz, decay_frequency_hz=left_response["decay_frequency_hz"], decay_t20_rt60_s=left_response["decay_t20_rt60_s"], frequency_confidence=left_confidence, corroborated_rolloff_confidence=left_rolloff_floor, cut_peak_reliability=left_cut_reliability, shared_reference_measure_db=shared_front_reference_db, shared_reference_target_db=shared_target_reference_db, **common)
     update_current(stage="Right 32768탭 최소위상 FIR 계산", progress=50.0, eta_seconds=round(build_eta * 0.52))
-    right_ir, right_graph = design_channel(right_f, right_db, right_response["spatial_std_db"], right_response["center_phase_rad"], target_name, preset, woofer=False, woofer_trim_db=0, phase_mode=front_design_phase_mode, phase_cutoff=phase_cutoff, crossover_role=crossover_role, crossover_frequency_hz=crossover_frequency_hz, decay_frequency_hz=right_response["decay_frequency_hz"], decay_t20_rt60_s=right_response["decay_t20_rt60_s"], frequency_confidence=right_confidence, corroborated_rolloff_confidence=right_rolloff_floor, shared_reference_measure_db=shared_front_reference_db, shared_reference_target_db=shared_target_reference_db, **common)
+    right_ir, right_graph = design_channel(right_f, right_db, right_response["spatial_std_db"], right_response["center_phase_rad"], target_name, preset, woofer=False, woofer_trim_db=0, phase_mode=front_design_phase_mode, phase_cutoff=phase_cutoff, crossover_role=crossover_role, crossover_frequency_hz=crossover_frequency_hz, decay_frequency_hz=right_response["decay_frequency_hz"], decay_t20_rt60_s=right_response["decay_t20_rt60_s"], frequency_confidence=right_confidence, corroborated_rolloff_confidence=right_rolloff_floor, cut_peak_reliability=right_cut_reliability, shared_reference_measure_db=shared_front_reference_db, shared_reference_target_db=shared_target_reference_db, **common)
     front_phase_reliable = bool(
         left_response.get("center_bulk_delay_reliable", True)
         and right_response.get("center_bulk_delay_reliable", True)
@@ -8480,7 +8607,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
             "max_room_boost_db": max_boost_db,
             "max_relative_compensation_db": max_boost_db,
             "max_room_cut_db": max_cut_db,
-            "semantics": "highest trusted correction becomes 0 dB; one common attenuation is applied to the complete L/R/Woofer bank",
+            "semantics": "highest trusted correction becomes 0 dB; one common attenuation is applied to the complete L/R/Woofer bank; max_room_cut_db is the only absolute cut ceiling and there is no hidden frequency-dependent 3/6 dB cap",
         },
         "front": front.name,
         "rear": rear.name if rear else None,
@@ -8496,6 +8623,7 @@ def build_worker(target_name: str, preset: str, woofer_trim_db: int, phase_mode:
         "common_level_reference": common_level_reference,
         "high_frequency_compensation": high_frequency_compensation,
         "stereo_broad_rolloff_corroboration": stereo_rolloff_summary,
+        "stereo_peak_cut_reliability": stereo_peak_cut_summary,
         "integration": premeasured_sum_model or integration_summary(
             directory,
             state.get("validation"),

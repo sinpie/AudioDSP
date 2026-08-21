@@ -1,5 +1,12 @@
 # 변경 이력
 
+## 2026-08-22 · 감쇄 상한 의미 통일
+
+- Front 감쇄에 숨어 있던 500 Hz 이상 −6 dB/2 kHz 이상 −3 dB 고정 상한을 제거하고 `최대 룸 감쇄`를 전 대역의 유일한 절대 상한으로 통일
+- 500 Hz 이상 peak 감쇄는 SNR·위치 편차·국소 peak 폭·독립 L/R 타깃 초과 일치도를 연속 신뢰도로 곱해 넓은 공통 peak는 충분히 줄이고 좁은/한쪽 peak만 완화하도록 변경; 결과 JSON과 Web 도움말에 정책을 기록
+- U7 상단 버튼 이벤트 값 Headphone `0x30`/Speaker `0xA0`와 부팅 안정 `HIDIOCGINPUT` 값 Headphone `0x88`/Speaker `0xE0`를 분리 해석해 첫 부팅의 실제 출력 경로가 `unknown`으로 남던 문제를 수정
+- U7 현재 상태 조회는 hidraw를 `O_RDONLY`로 열고 GET_REPORT만 사용하며 output/feature report를 쓰지 않는 전용 무음 회귀를 추가
+
 ## 2026-08-21 · v24 MIMO 수학 안정화·측정 UI 연속성
 
 - MIMO 정규화 행렬의 피벗 비율을 condition처럼 표시하던 진단을 실제 induced 1-norm condition number `||A||₁||A⁻¹||₁`로 교체

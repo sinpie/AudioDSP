@@ -625,28 +625,50 @@ def main() -> int:
         fake_hidraw = root / "hidraw-test"
         fake_hidraw.write_bytes(b"")
         original_ioctl = monitor.fcntl.ioctl
+        original_open = monitor.os.open
+        observed_open_flags: list[int] = []
+
+        def fake_open(path: str, flags: int) -> int:
+            observed_open_flags.append(flags)
+            return original_open(path, flags)
+
+        current_payload = bytearray(16)
 
         def fake_ioctl(_descriptor: int, _request: int, data: bytearray, _mutate: bool) -> int:
             payload = bytearray(16)
-            payload[monitor.STATE_BYTE] = 0xA0
+            payload[:] = current_payload
             data[0] = 0
             data[1:17] = payload
             return 17
 
         monitor.fcntl.ioctl = fake_ioctl
+        monitor.os.open = fake_open
         try:
-            initial_profile, initial_state = monitor.current_profile(str(fake_hidraw))
+            for state_byte, expected_profile in ((0x88, "headphone"), (0xE0, "speaker")):
+                current_payload[monitor.STATE_BYTE] = state_byte
+                initial_profile, initial_state = monitor.current_profile(str(fake_hidraw))
+                require(
+                    (initial_profile, initial_state) == (expected_profile, state_byte),
+                    "steady HIDIOCGINPUT state parsing mismatch",
+                )
         finally:
             monitor.fcntl.ioctl = original_ioctl
-        require((initial_profile, initial_state) == ("speaker", 0xA0), "initial HIDIOCGINPUT parsing mismatch")
-        monitor.save_selector_state(None, 0x88, "hidio_get_input_unknown")
+            monitor.os.open = original_open
+        require(
+            observed_open_flags
+            and not (observed_open_flags[-1] & os.O_RDWR)
+            and not (observed_open_flags[-1] & os.O_WRONLY),
+            "initial U7 selector query did not open hidraw read-only",
+        )
+        monitor.save_selector_state(None, 0x55, "hidio_get_input_unknown")
         unknown_selector = manager.selector_status()
         require(
             unknown_selector["profile"] is None
-            and unknown_selector["state_byte"] == "0x88"
+            and unknown_selector["state_byte"] == "0x55"
             and not unknown_selector["stale"],
             "unknown boot-time HID observation was not preserved safely",
         )
+        initial_profile, initial_state = "speaker", 0xE0
         monitor.save_selector_state(initial_profile, initial_state, "matrix")
         selector = manager.selector_status()
         require(selector["profile"] == "speaker" and not selector["stale"], "selector state persistence mismatch")
@@ -708,7 +730,7 @@ def main() -> int:
             require(b"measurement card-wide" not in status_page and b"Front WAV" not in status_page, "status page contains another screen")
             require("<title>현황 · AudioDSP</title>".encode("utf-8") in status_page, "status page title is not contextual")
             measure_page, _ = get_bytes(base + "/measure")
-            for marker in (b"32768", b"UMIK-1", b"target-graph", b"job-progress", b"workflow", b"cal-card", b"session-overview", b"session-library", b'measurement-tab-session', b'measurement-panel-session', b'data-measurement-step-content="session"', b'name="woofer_measurement_attenuation_db"', b'value="-42"', b"measurement-path-lock", b'data-measurement-path="unbound"', "세션 생성".encode("utf-8"), "빠른 검사와 본 측정의 스윕 출력은 2단계".encode("utf-8"), "L+우퍼 / R+우퍼".encode("utf-8"), "정밀 분리+합산".encode("utf-8"), "L/R/우퍼/L+우퍼/R+우퍼".encode("utf-8"), "프런트 L → 프런트 R → 우퍼 → L+우퍼 → R+우퍼 → L+R+우퍼 동시 위상".encode("utf-8"), "90° · 천장 방향".encode("utf-8"), "0° · 마이크 정면".encode("utf-8"), "빠른 측정 · 기준점 1위치".encode("utf-8"), "표준 측정 · 중앙+좌우 3위치".encode("utf-8"), "활성 세션 없음".encode("utf-8"), "MIMO 공동제어".encode("utf-8")):
+            for marker in (b"32768", b"UMIK-1", b"target-graph", b"job-progress", b"workflow", b"cal-card", b"session-overview", b"session-library", b'measurement-tab-session', b'measurement-panel-session', b'data-measurement-step-content="session"', b'name="woofer_measurement_attenuation_db"', b'value="-42"', b"measurement-path-lock", b'data-measurement-path="unbound"', "세션 생성".encode("utf-8"), "스윕 출력은 2단계에서 설정합니다".encode("utf-8"), "L+우퍼 / R+우퍼".encode("utf-8"), "정밀 분리+합산".encode("utf-8"), "L/R/우퍼/L+우퍼/R+우퍼".encode("utf-8"), "프런트 L → 프런트 R → 우퍼 → L+우퍼 → R+우퍼 → L+R+우퍼 동시 위상".encode("utf-8"), "90° · 천장 방향".encode("utf-8"), "0° · 마이크 정면".encode("utf-8"), "빠른 측정 · 기준점 1위치".encode("utf-8"), "표준 측정 · 중앙+좌우 3위치".encode("utf-8"), "활성 세션 없음".encode("utf-8"), "MIMO 공동제어".encode("utf-8")):
                 require(marker in measure_page, f"Measurement-page marker missing: {marker!r}")
             web_source = args.web.read_text(encoding="utf-8")
             for marker in ("본 측정과 같은 15 Hz–22 kHz 스윕·라우팅·SNR 계산", "빠른 검사 저장 원본", "/measurement/reprocess-level", "저역 late/early", "저역 기준 레벨 고정", "L/R 동일 기준", "1.5 dB 넘게 악화", "실제 RT60/잔향 예측이 아니며", "디지털 크로스오버", "LR4 HPF", "additional_block_latency_samples", "set-session-note", "load-session", "build-fieldset", "validation-checklist", "음색 시작점", "타깃 그대로", "맑은 고음", "따뜻한 균형", "야간 균형", "최대 상대 보상", "상대 보상의 음량 비용", "15–20 kHz 잔여 오차", "공통 0 dB 기준", "공간 통합 계산", "가중 평균 파워", "상쇄 P90", "현재 지연·극성 유지", "needs_algorithm_reprocess", "one_common_level_reference", "premeasured_sum_validation", "필터 전 합산 교차항 확인", "합산 안전 상한", "sum_guard_enabled&&j.result.crossover?.channels", "mergeLowSystemResponse", "사후 검증 후에는 실측과 계산 예상값을 같은 공통 기준으로 비교", "predicted_sum_db", "inconclusive_low_snr", "검증 스윕 입력", "28초 ESS", "canonicalMeasurementUrl='/measure'", "소리는 자동으로 시작되지 않습니다", "--step-accent", "summary::after", "details[open]>summary::after", "navigation_continuity", "history.scrollRestoration='manual'", ".page-message.failure", "predicted_min_db", "predicted_max_db", "실제 1-노름 조건수", "MIMO 각 측정 위치 비악화", "MIMO 전달행렬 수치 안정성"):
