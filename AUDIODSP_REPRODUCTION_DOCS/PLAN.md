@@ -12,21 +12,23 @@
 - 현황/측정·보정/프로필·설정 화면 분리, 반응형 light/dark/auto 테마
 - 브라우저 계산 SVG FIR 응답, 업로드 전/후 비교, 임시 A/B, 명시적 정식 적용
 - UMIK-1 0°/90° calibration 보관, 실제 측정은 90°만 허용
-- 5초 무음 + 5초 백색소음 레벨 사전 평가
-- L/R 합산, 표준 L/R/Woofer, 권장 L/R/W/L+W/R+W 정밀 closure를 Fast 1위치 또는 Standard 3위치로 측정하고 32768-tap FIR 생성
+- 본 측정과 같은 출력별 2초 ESS로 레벨·SNR·클리핑 사전 평가
+- L/R 합산, 표준 L/R/우퍼, 권장 L/R/우퍼/L+우퍼/R+우퍼와 동일 녹음 L+R+우퍼 Walsh 위상 기준을 빠른 측정 1위치 또는 표준 측정 3위치로 측정하고 32768-tap FIR 생성
 - target, bass-control preset, 음색 tilt, 보정 대역, boost/cut, phase 옵션
 - 측정 중 DSP direct bypass와 U7 입력 mute, 완료/오류 시 원상 복구
 - 버전형 전체 백업 ZIP, staging 검증, 적용 직전 자동 rollback ZIP
 - 4,096개 상태 진리표와 모든 설정 전이·웹·동시 쓰기 회귀 시험
-- Pi4/5 전용 MIMO Stereo/2.1/2.2 측정, robust 2×4 weighted pressure matching, 8-path 32768탭 bank
+- Pi4/5와 공통 timing reference가 모두 있을 때의 MIMO Stereo/2.1/2.2 측정, robust 2×4 weighted pressure matching, 8-path 32768탭 bank
 - 주파수별 물리 출력 headroom 투영, 공통 인과 지연, 자연 roll-off/지원 제어원 regularization, SISO 전이대역
 - 결과마다 FIR/MIMO 가능·부분 가능·물리 처리·미측정·미인증을 구분한 영구 JSON/Markdown 보고서와 브라우저 다운로드
 - MIMO bank Preview/Apply/rollback, schema v2 전체 백업, Pi2 하드 차단과 Pi4/5 chunksize 1024 하한
 - `source/common` 단일 공통 원본, Pi2/3/4/5 플랫폼 overlay와 deterministic build materializer
-- Fast 1위치/Standard 3위치 session 복구·주석·삭제, 동일-clock 복소합 및 선택형 정밀 선측정 검증, neutral target/0 dB 기준선
+- 빠른 측정 1위치/표준 측정 3위치 세션 복구·주석·삭제, 독립-clock 합산 안전 상한 및 선택형 정밀 선측정 검증, Flat/0 dB 기준선
 - 정밀 측정의 필터 전 복소합 closure와 최종 합산 예측이 PASS하면 FIR 생성 후 중복 사후 sweep 없이 적용 가능
-- Flat/추가 억제 없음/trim 0 dB 기준 및 SISO 94개·MIMO 19개 UI 옵션 조합 무음 회귀, 실제 메뉴·버튼명을 사용하는 FAIL/PENDING/N/A 조치 안내
+- Flat/추가 억제 없음/trim 0 dB/최대 상대 보상 10 dB 기준 및 SISO 95개·MIMO 19개 UI 옵션 조합 무음 회귀, 실제 메뉴·버튼명을 사용하는 FAIL/PENDING/N/A 조치 안내
+- L/R 500~2,000 Hz 하나의 0 dB 기준과 완성 L/R/Woofer bank 한 번의 common gain, 양쪽 광대역 roll-off 보상, narrow-null 3 dB guard를 자동 검증
 - Pi 5 2 GB 메모리 worst-case 계획 및 5.1+dual-sub 42경로 64-bit allocation 검증
+- Pi 2 실제 Fast 1위치 정밀 5경로 측정, 저장 원본 무음 재계산, Flat/없음/0 dB/100 Hz 필수 기준과 Harman/없음/0 dB/120 Hz 대안 PASS, Profile/Web/CamillaDSP 전체 matrix 및 정식 FIR 불변 확인
 
 ## 변하지 않아야 하는 핵심 조건
 
@@ -44,7 +46,7 @@
 ## 남은 실기 검증과 다음 릴리스 후보
 
 - HTTP 인증 또는 reverse proxy 옵션. 현재 UI는 신뢰된 LAN 전용이다.
-- WebSocket/SSE를 이용한 상태 push. 현재 1초 상태, 3초 볼륨 polling은 Pi 2에서 충분히 가볍다.
+- WebSocket/SSE를 이용한 상태 push. 현재 약 1.5초 상태, 3초 볼륨 polling은 Pi 2에서 충분히 가볍다.
 - 실제 U7 볼륨 변경 이벤트 감지 시 저장 여부를 사용자가 고르는 옵션.
 - Pi 5 2 GB 실기 장시간 부하와 USB 복구 시험. 메모리 계획은 통과했지만 실제 8경로 CPU/XRUN/온도는 새 장치에서 확인해야 한다.
 - 향후 5.1은 먼저 6채널 diagonal FIR과 150 Hz 이하 저역 MIMO group으로 설계한다. 6×7 완전 dense 42경로는 Pi5 CPU/XRUN 수락 전 지원으로 표시하지 않는다.

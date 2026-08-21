@@ -55,7 +55,7 @@ normalized and unknown settings are ignored safely.
 - Rear FIR present and selected: independent Front/Rear processing (four).
 - Missing selected profile: use the other profile unchanged, then Factory.
 - Per-profile bypass and woofer trim 0 to -18 dB.
-- MIMO source/report/backup formats are included for safe migration, but the Pi 2 UI and CLI reject MIMO measurement or 8-path activation. Real-time MIMO requires the Pi 4/Pi 5 release; all SISO features remain available.
+- MIMO source/report/backup formats are included for safe migration, but the Pi 2 UI and CLI reject MIMO measurement or 8-path activation. Real-time MIMO requires both the Pi 4/Pi 5 release and a verified common timing reference; all SISO features remain available.
 - Global Xonar U7 output volume is readable and writable in the Status UI and
   `GET`/`PUT /api/volume`. The safe application range is -60 to 0 dB; the
   saved default is -10 dB. A volume-only change never restarts CamillaDSP.
@@ -76,6 +76,10 @@ measurement uses the 90° file with the microphone pointing upward. A five-
 second silence and five-second low-level white-noise check reports background,
 signal, SNR, peak, and clipping before measurements are enabled. Measurement
 temporarily bypasses CamillaDSP and disables the U7 Mic/Line capture switches.
+Every quick, full, combined and post-FIR sweep then verifies U7 PCM at 0 dB, so
+the selected dBFS is the DAC reference rather than `dBFS + listening volume`.
+The exact prior listening volume is restored and verified before Line input or
+CamillaDSP is allowed to resume; restore failure stays muted and fail-closed.
 Each generated SISO result saves browser-downloadable `Room_Tuning_Report.json`
 and `.md`, explicitly separating FIR-correctable, limited, physical-treatment,
 not-measured and not-certified room factors.

@@ -27,9 +27,9 @@ from typing import Any
 
 
 BASELINE: dict[str, Any] = {
-    "target": "harman",
-    "preset": "strong",
-    "woofer_trim_db": -9,
+    "target": "flat",
+    "preset": "none",
+    "woofer_trim_db": 0,
     "phase_mode": "bass",
     "phase_cutoff": 200,
     "spatial_mode": "equal",
@@ -37,7 +37,7 @@ BASELINE: dict[str, Any] = {
     "treble_tilt_db": 0,
     "correction_low_hz": 20,
     "correction_high_hz": 20_000,
-    "max_boost_db": 6,
+    "max_boost_db": 10,
     "max_cut_db": 18,
     "mimo_high_hz": 150,
     "mimo_strength": "balanced",
@@ -55,7 +55,7 @@ DIMENSIONS: tuple[tuple[str, tuple[Any, ...]], ...] = (
     ("treble_tilt_db", tuple(range(-6, 3))),
     ("correction_low_hz", (20, 30, 40, 60, 80)),
     ("correction_high_hz", (300, 500, 1_000, 5_000, 20_000)),
-    ("max_boost_db", (0, 3, 6, 9)),
+    ("max_boost_db", (0, 3, 6, 9, 10)),
     ("max_cut_db", (6, 9, 12, 18, 24)),
 )
 
@@ -113,8 +113,8 @@ def variants() -> list[dict[str, Any]]:
                 "value": value,
                 "options": options,
             })
-    if len(result) != 67:
-        raise RuntimeError(f"option coverage changed: expected 67 variants, found {len(result)}")
+    if len(result) != 68:
+        raise RuntimeError(f"option coverage changed: expected 68 variants, found {len(result)}")
     if len({item["id"] for item in result}) != len(result):
         raise RuntimeError("variant identifiers are not unique")
     return result
@@ -193,7 +193,7 @@ def restore_baseline(session: Path, current: Path, output: Path, initial: dict[s
     state["measurements"] = initial.get("measurements", [])
     state["measurement_protocol"] = initial.get("measurement_protocol")
     state["level_check"] = initial.get("level_check")
-    state["stage"] = f"옵션 FIR {variants_count}개 생성 완료 · 기준 Harman/Strong 결과 선택"
+    state["stage"] = f"옵션 FIR {variants_count}개 생성 완료 · 기준 Flat/추가 억제 없음/trim 0 dB/상대 보상 10 dB 결과 선택"
     state["option_matrix"] = {
         "output_dir": str(output),
         "variants": variants_count,
@@ -307,7 +307,7 @@ def main() -> int:
     parser.add_argument("--manager", type=Path, default=Path("/usr/local/bin/audiodsp-profile-manager.py"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--jobs", type=int, choices=range(1, 5), default=2)
-    parser.add_argument("--limit", type=int, choices=range(1, 68), default=None, help="preflight only: run the first N variants")
+    parser.add_argument("--limit", type=int, choices=range(1, 69), default=None, help="preflight only: run the first N variants")
     parser.add_argument("--variant-id", action="append", default=[], help="run only this variant ID; may be repeated for a selective regression")
     args = parser.parse_args()
 

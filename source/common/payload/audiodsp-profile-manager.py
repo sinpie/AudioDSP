@@ -41,6 +41,7 @@ SETTINGS_PATH = STATE_DIR / "profile-settings.json"
 LEGACY_STATE_PATH = STATE_DIR / "output-profile"
 BACKUP_DIR = STATE_DIR / "profile-backups"
 LOCK_PATH = Path(environment("LOCK_PATH", "/run/audiodsp-profile-manager.lock"))
+AUDIO_LOCK = Path(environment("AUDIO_LOCK", "/run/audiodsp-audio-exclusive.lock"))
 SELECTOR_STATE_PATH = Path(environment("SELECTOR_STATE_PATH", "/var/lib/audiodsp/u7-selector-state.json"))
 PREVIEW_STATE_PATH = Path(environment("PREVIEW_STATE_PATH", "/var/lib/audiodsp/fir-preview.json"))
 MAX_WAV_BYTES = 32 * 1024 * 1024
@@ -785,6 +786,12 @@ def selector_status() -> dict[str, Any]:
         result["source"] = "invalid_state_file"
         return result
     profile = saved.get("profile")
+    source = str(saved.get("source", ""))
+    if profile is None and source == "hidio_get_input_unknown":
+        result.update(saved)
+        current_boot = current_boot_id()
+        result["stale"] = not current_boot or saved.get("boot_id") != current_boot
+        return result
     if profile not in PROFILE_FILES:
         result["source"] = "invalid_profile"
         return result
@@ -1467,44 +1474,60 @@ def main() -> int:
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOCK_PATH.open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if args.command == "status":
-            result = status()
-        elif args.command == "activate":
-            result = activate(args.profile, restart=not args.no_restart)
-        elif args.command == "set-rear-mode":
-            result = set_rear_mode(args.profile, args.mode, restart=not args.no_restart)
-        elif args.command == "set-bypass":
-            result = set_bypass(args.profile, args.enabled == "on", restart=not args.no_restart)
-        elif args.command == "set-mimo-enabled":
-            result = set_mimo_enabled(args.profile, args.enabled == "on", restart=not args.no_restart)
-        elif args.command == "set-woofer-trim":
-            result = set_woofer_trim(args.profile, args.trim_db, restart=not args.no_restart)
-        elif args.command == "set-chunksize":
-            result = set_chunksize(args.chunksize, restart=not args.no_restart)
-        elif args.command == "set-output-volume":
-            result = set_output_volume(args.volume_db)
-        elif args.command == "validate-wav":
-            result = validate_wav(args.source)
-        elif args.command == "validate-mimo":
-            result = serializable(validate_mimo_bank(args.manifest))
-        elif args.command == "validate-settings":
-            result = validate_settings_file(args.source)
-        elif args.command == "install-pair":
-            result = install_pair(args.profile, args.front_source, args.rear_source, args.woofer_trim)
-        elif args.command == "preview-pair":
-            result = preview_pair(args.profile, args.front_source, args.rear_source, args.woofer_trim)
-        elif args.command == "install-mimo":
-            result = install_mimo(args.profile, args.manifest)
-        elif args.command == "preview-mimo":
-            result = preview_mimo(args.profile, args.manifest)
-        elif args.command == "restore-profile":
-            result = restore_profile(restart=not args.no_restart)
-        elif args.command == "restore-snapshot":
-            result = restore_snapshot(args.source_dir)
-        elif args.command == "clear-stale-preview":
-            result = clear_stale_preview()
-        else:
-            result = upload(args.profile, args.band, args.source, args.original_name)
+        read_only_commands = {"status", "validate-wav", "validate-mimo", "validate-settings"}
+        audio_handle = None
+        try:
+            if args.command not in read_only_commands:
+                AUDIO_LOCK.parent.mkdir(parents=True, exist_ok=True)
+                audio_handle = AUDIO_LOCK.open("w")
+                try:
+                    fcntl.flock(audio_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise ProfileError(
+                        "측정/검증 sweep 중에는 출력 볼륨·프로필·DSP 설정을 변경할 수 없습니다. "
+                        "sweep 종료와 원래 볼륨 복원을 기다린 뒤 다시 시도하세요."
+                    ) from exc
+            if args.command == "status":
+                result = status()
+            elif args.command == "activate":
+                result = activate(args.profile, restart=not args.no_restart)
+            elif args.command == "set-rear-mode":
+                result = set_rear_mode(args.profile, args.mode, restart=not args.no_restart)
+            elif args.command == "set-bypass":
+                result = set_bypass(args.profile, args.enabled == "on", restart=not args.no_restart)
+            elif args.command == "set-mimo-enabled":
+                result = set_mimo_enabled(args.profile, args.enabled == "on", restart=not args.no_restart)
+            elif args.command == "set-woofer-trim":
+                result = set_woofer_trim(args.profile, args.trim_db, restart=not args.no_restart)
+            elif args.command == "set-chunksize":
+                result = set_chunksize(args.chunksize, restart=not args.no_restart)
+            elif args.command == "set-output-volume":
+                result = set_output_volume(args.volume_db)
+            elif args.command == "validate-wav":
+                result = validate_wav(args.source)
+            elif args.command == "validate-mimo":
+                result = serializable(validate_mimo_bank(args.manifest))
+            elif args.command == "validate-settings":
+                result = validate_settings_file(args.source)
+            elif args.command == "install-pair":
+                result = install_pair(args.profile, args.front_source, args.rear_source, args.woofer_trim)
+            elif args.command == "preview-pair":
+                result = preview_pair(args.profile, args.front_source, args.rear_source, args.woofer_trim)
+            elif args.command == "install-mimo":
+                result = install_mimo(args.profile, args.manifest)
+            elif args.command == "preview-mimo":
+                result = preview_mimo(args.profile, args.manifest)
+            elif args.command == "restore-profile":
+                result = restore_profile(restart=not args.no_restart)
+            elif args.command == "restore-snapshot":
+                result = restore_snapshot(args.source_dir)
+            elif args.command == "clear-stale-preview":
+                result = clear_stale_preview()
+            else:
+                result = upload(args.profile, args.band, args.source, args.original_name)
+        finally:
+            if audio_handle is not None:
+                audio_handle.close()
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 

@@ -21,8 +21,9 @@
 7. 볼륨 변경은 CamillaDSP restart, YAML 재생성, FIR mutation을 유발하지 않는다.
 8. 고정/비상 IP를 만들지 않는다. DHCP 실패는 명확한 오류로 남긴다.
 9. 측정음은 사용자가 시작할 때만 재생한다. 야간 기본값은 -42 dBFS이며 레벨 검사를 선행한다.
+   모든 sweep dBFS는 평상시 청취 볼륨과 독립된 U7 DAC 기준이다. 반드시 입력 OFF → PCM 0 dB 확인 → 재생 종료 → 원래 볼륨 확인 → 입력 ON 순서를 지키며, 복원 실패 시 입력을 켜지 않는다.
 10. 단계 링크 이동, 그래프 보기, WAV/ZIP 다운로드만으로 저장 상태를 바꾸지 않는다.
-11. MIMO는 Pi4/5만 활성화한다. Pi2 UI/engine/manager 우회를 모두 차단하고 SISO fallback을 보존한다.
+11. MIMO는 Pi4/5 계산 능력과 검증된 공통 timing reference가 모두 있을 때만 활성화한다. Pi2와 독립-clock U7+UMIK 측정의 UI/engine/manager 우회를 모두 차단하고 SISO fallback을 보존한다.
 12. 한 물리 우퍼의 stereo 입력을 두 독립 제어원으로 세지 않는다. MIMO 2.2는 서로 다른 위치·배선의 두 우퍼가 있어야 한다.
 13. MIMO bank는 4 stereo float32 WAV × 32768 taps, 2×4=8 convolution, manifest SHA/self-validation PASS, physical-output row sum ≤1을 유지한다.
 14. FIR/MIMO 가능, 부분 개선, 물리 처리, 미측정, 미인증을 결과 JSON/Markdown에 구분한다. 합성 예측을 실기 성공으로 기록하지 않는다.

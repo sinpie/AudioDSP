@@ -72,8 +72,8 @@ def main() -> int:
     base_by_id = {entry["id"]: entry for entry in base["variants"]}
     overlay_by_id = {entry["id"]: entry for entry in overlay["variants"]}
     proof_by_id = {entry["id"]: entry for entry in baseline_proof["variants"]}
-    if len(base_by_id) != 67 or base.get("passed") != 67 or base.get("failed") != 0:
-        raise RuntimeError("base is not a complete passing 67-variant matrix")
+    if len(base_by_id) != 68 or base.get("passed") != 68 or base.get("failed") != 0:
+        raise RuntimeError("base is not a complete passing 68-variant matrix")
     if not overlay_by_id or not set(overlay_by_id) <= set(base_by_id):
         raise RuntimeError("overlay contains no variants or unknown variant IDs")
     if "baseline" not in proof_by_id:
@@ -116,11 +116,11 @@ def main() -> int:
         "finished_unix": finished,
         "updated_unix": finished,
         "variants": merged_entries,
-        "completed": 67,
-        "passed": 67,
+        "completed": 68,
+        "passed": 68,
         "failed": 0,
-        "total": 67,
-        "full_matrix_total": 67,
+        "total": 68,
+        "full_matrix_total": 68,
         "engine_sha256": sha256(args.engine),
         "merge": {
             "base": str(args.base),

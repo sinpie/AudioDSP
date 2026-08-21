@@ -14,7 +14,7 @@
 
 - 첫 카드는 측정 session 상태에 따라 하나의 `지금 할 일`을 제안한다.
 - 그 다음 `오디오 신호 흐름` console은 U7 Line input → CamillaDSP → Front/Rear routing → U7 물리 selector → 실제 스피커 체인을 SVG 아이콘 박스와 연결선으로 보여준다. PC에서는 가로, 980 px 이하에서는 같은 순서를 세로로 배치한다.
-- 신호 console의 U7 경로명과 설정 카드 강조는 `/api/status`를 1초 polling해 실제 상단 버튼 전환을 반영한다. 웹은 하드웨어 selector를 쓰지 않는다.
+- 신호 console의 U7 경로명과 설정 카드 강조는 `/api/status`를 약 1.5초 간격으로 polling해 실제 상단 버튼 전환을 반영한다. 웹은 하드웨어 selector를 쓰지 않는다.
 - 출력 볼륨 카드는 큰 dB 숫자, -60~0 slider, ±1 dB, -40/-30/-20/-10 preset, 저장·적용 버튼을 가진다.
 - Slider 이동 중 예상값을 즉시 표시하고 release 시 PUT한다. 명시적 버튼은 키보드/비-JS fallback이다.
 - U7 실제값과 재부팅 저장값이 다르면 `물리 노브 변경 감지`를 표시한다.
@@ -31,25 +31,30 @@
 - step click은 navigation뿐이며 데이터 mutation을 하지 않는다.
 - 편집한 설정은 `변경 적용` 전까지 기존 결과에 영향을 주지 않는다.
 - 재검사/재측정/재계산 버튼은 초기화 범위를 confirm 문구로 정확히 말한다.
-- 진행 중에는 progress, percent, 단계명, ETA를 1초 polling한다. Polling은 DOM 수치만 바꾸며 페이지 전체를 새로고침하지 않는다. 작업 완료·위치 증가·물리 출력 변경처럼 화면 구조가 실제로 달라질 때만 한 번 reload한다.
-- Level 결과는 OK/NOT OK, background, white-noise RMS, 추정 signal, SNR, peak를 카드로 보여준다.
+- 진행 중에는 progress, percent, 단계명, ETA를 0.5~1.5초 간격으로 polling한다. Polling은 DOM 수치만 바꾸며 페이지 전체를 새로고침하지 않는다. 작업 완료·위치 증가·물리 출력 변경처럼 화면 구조가 실제로 달라질 때만 한 번 reload한다.
+- 레벨 결과는 PASS/FAIL, 출력 조합별 SNR, 평가 대역, peak와 올릴 수 있는 안전 dBFS를 카드로 보여준다. 본 측정 결과는 원신호 SNR, 긴 ESS의 coherent integration 이득, 최종 유효 SNR을 한 문장 안에서 구분한다.
 - 활성 session의 ID, 생성 시각, 상태, 완료 위치, 이어갈 단계, FIR 결과 유무와 주석 편집은 1–6 단계 탭 바로 위에 항상 표시한다. 주석 저장은 별도 metadata만 바꾸며 어떤 측정·FIR 단계도 초기화하지 않는다.
 - session은 생성 즉시 자동 저장한다. 1단계의 저장 session 목록은 최신순으로 ID·시각·측정 구성·완료 단계·위치·FIR 유무·주석을 함께 보여주고, `이어하기`는 파일 무결성을 확인한 뒤 저장된 1–6 완료 지점 전체를 복원한다. `삭제`는 복구 불가 범위와 현재 정식 FIR 불변을 confirm에 표시하고 정확한 session 하나만 지운다. 작업 중 session 전환·삭제는 차단한다.
 - 저장 session 목록은 ID·날짜·주석 client-side 검색을 제공한다. 활성 주석을 편집하면 즉시 `저장되지 않은 주석` 상태를 표시하고, 저장 전에 페이지를 떠날 때만 확인한다.
 - 레벨 검사를 누르는 순간 현재 U7 물리 출력을 session의 `measurement_profile`로 고정한다. 화면은 현재/고정 경로의 일치 여부를 별도 lock 카드로 보여주고, 불일치하면 위치 측정과 A/B를 비활성화한다.
 - 생성 결과의 Preview/Apply 버튼은 고정된 한 출력 체인만 제공한다. 경로 정보가 없는 schema-1 이전 session에만 수동 확인 경고와 두 버튼을 보이는 호환 모드를 쓴다.
-- 백색소음과 sweep 출력은 별도 slider이며 fresh session은 둘 다 -42 dBFS다. 현재 Woofer 실효값을 계산하고 높은 조합을 색+문구로 경고하며 실제 위치 sweep 전 confirm에 수치를 다시 표시한다.
-- 새 session의 권장 측정 구성은 `정밀 분리+합산 · L/R/W/L+W/R+W · 위치당 5회`다. L/R/W만 설계하고 L+W/R+W는 같은 위치의 복소합 closure에만 쓰며, FIR 생성 뒤 다시 측정하라고 요구하지 않는다. 더 빠른 `표준 분리 SISO · L/R/W`도 동일-clock 복소 합산 모델로 3단계 측정만 사용한다. 정밀 구성은 물리 합산 closure까지 검증해 배선·극성·상대레벨 오류를 더 잘 찾는 권장 품질 옵션이다.
+- 2단계에는 본 측정과 빠른 검사에 공통인 스윕 출력 slider 하나만 둔다. 현재 우퍼 실효값을 계산하고 높은 조합을 색+문구로 경고하며 실제 위치 스윕 전 confirm에 수치를 다시 표시한다. 백색소음 제어는 완전히 숨긴다.
+- 새 세션의 권장 측정 구성은 `정밀 분리+합산 · L/R/우퍼/L+우퍼/R+우퍼 · 위치당 5회`다. L/R/우퍼만 설계하고 합산 두 응답은 절대 레벨 closure에만 쓰며 FIR 생성 뒤 다시 측정하라고 요구하지 않는다. 독립-clock에서는 위상 정밀도를 제한으로 표시하고 보수적 합산 상한을 사용한다.
 - Target을 바꾸면 1 kHz 기준 곡선과 bass/treble preference를 즉시 SVG에 반영한다.
 - L/R/Woofer와 sub MIMO에서는 디지털 crossover를 주요 옵션으로 표시하고 기본 ON/100 Hz로 둔다. 설명은 Front LR4 HPF, Woofer LR4 LPF, 32768탭 WAV 내장, 추가 block latency 0을 함께 말한다. 합산 L/R 모드에서는 숨은 OFF 값과 독립 branch가 없다는 이유를 표시한다.
 - 결과 그래프는 각 채널의 측정 전 ±공간 편차, 적용 후 예상, target을 구분한다.
+- `최대 상대 보상`은 0/3/6/9/10 dB로 표시하고 기본 10 dB다. 도움말은 “신뢰되는 최고 보상을 0 dB로 두고 L/R/Woofer 전체를 같은 값만큼 낮춤”과 “좁은 deep은 최대 3 dB”를 함께 설명한다. 결과 카드에는 실제 `상대 보상의 음량 비용`과 `15–20 kHz 잔여 오차`를 표시하고, 상한을 모두 써도 남는 slope는 amber 경고와 실제 메뉴명 기반 가이드로 설명한다. `최대 부스트`나 채널별 0 dB처럼 실제 동작과 다른 용어를 사용하지 않는다.
+- 결과 요약은 `L/R/Woofer 공통 0 dB 기준`, 공통 FIR gain, 채널별 독립 정규화 없음, branch 상대레벨 보존을 한 카드에서 보여준다. 그래프도 L/R 500~2,000 Hz 하나의 기준을 사용했다는 설명을 legend 가까이에 둔다.
 - 결과의 `Woofer 최종 trim`은 FIR 계산 옵션을, `측정 시 Woofer 감쇄`는 sweep SNR 확보용 측정 조건을 별도 항목으로 표시한다.
 - 결과에 기록된 `algorithm_revision`이 현재 엔진과 다르면 측정 원본은 보존하되 이전 계산임을 경고하고 4단계 FIR 재계산 전 Preview/Apply를 차단한다.
 - 최신 결과라도 `self_validation.overall_pass=false`이면 다운로드와 A/B Preview는 허용하지만 정식 Apply는 UI와 엔진 양쪽에서 차단한다.
 - 자동 검증 체크리스트는 모든 core/FIR, 독립 3위치, L/R/Woofer target-fit, crossover 합산, SNR 판정을 `PASS`, `FAIL`, `대기`, `해당 없음`으로 표시한다. FAIL 행은 빨간색과 함께 실제 화면의 `1 · 연결·Cal`, `2 · 레벨 확인`, `3 · 위치 측정`, `4 · FIR 계산`, `5 · 검토·A/B` 단계명과 실제 select/button 문구를 사용한 직접 행동 지침을 제공한다. 안내에 언급된 단계는 바로 여는 버튼도 함께 만들며, 탭 이동만으로 측정값은 바뀌지 않는다. 실행할 수 없는 사후 측정을 해결 방법으로 쓰지 않는다.
 - 체크리스트 바로 위에서 MAE를 판정 대역 평균 절대오차, P90을 주파수 지점 90%가 그 값 이내인 오차로 설명한다. 합산 FAIL은 signed median error를 사용해 Target보다 높은지/낮은지와 dB를 밝히고, `Woofer 최종 trim`, `우퍼 과잉 억제`, `Phase 방식`, `Crossover 주파수`의 실제 표시명으로 변경 방향을 안내한다.
-- 결과 카드는 crossover 상태를 `pass`, `limited_unverified_phase`, `fail_target`, `fail_upper_guard`로 구분하고, WAV 형식 검증만 통과한 결과를 acoustic PASS로 표시하지 않는다.
-- Pi4/5는 SISO와 MIMO Stereo/2.1/2.2를 구분한다. Pi2는 MIMO 항목과 차단 이유를 보이되 선택할 수 없다.
+- 결과 카드는 `pass`, `pass_safe_upper_phase_limited`, `pass_safe_sum_phase_limited`, `fail_target`, `fail_upper_guard`를 구분하고, 위상 제한 PASS를 정확한 복소 위상 검증으로 표현하지 않는다.
+- 선택형 사후 검증 뒤 결과 그래프는 20 Hz~20 kHz의 실제 FIR 통과 실측, 계산 예상, 선택 target을 동시에 표시한다. 실측/예상 L/R은 각각 하나의 공통 기준만 사용한다. SNR 6~15 dB에서 경계값을 조금 넘으면 빨간 FAIL 대신 `판정 보류 · SNR 부족`과 실제 메뉴 `검증 초기화`, `검증 sweep 입력 -25 dBFS`를 표시한다. FIR 입력값과 공통 FIR 감쇄 뒤 실제 출력이 다를 수 있음을 control 바로 아래에서 설명한다.
+- 사후 검증 PASS 뒤에는 내부 코드 `pass_measured` 대신 `사후 합산 실측 PASS`, SNR 6~15 dB는 `사용 PASS · 권장 미달`로 표시한다. 완료된 카드에서는 더 이상 Preview 선행을 요구하지 않고 `검증 초기화 → 이번 튜닝` 재실행 순서를 안내한다. 보정 가능성 표의 개발자용 classification/status 코드는 한국어 사용자 용어로 바꾸고, 차트의 범위와 표시 곡선을 SVG 접근성 설명에도 반영한다.
+- 결과의 `최대 상대 보상`과 `최대 룸 감쇄`는 목표 음압이 아니라 FIR 계산의 상한임을 결과 카드 바로 아래에 설명한다. 실제 예상 곡선은 딥 보호·crossover·전체 공통 gain까지 반영한 값이며, 사후 결과는 예상↔실측 MAE/P90으로 비교한다.
+- Pi4/5는 SISO와 MIMO Stereo/2.1/2.2를 구분하되 공통 timing reference가 없으면 MIMO 차단 이유를 표시한다. Pi2는 조건과 무관하게 선택할 수 없다.
 - MIMO 결과는 타깃 MAE, 좌석 편차, 평활 전달함수 기반 impulse-tail proxy, 기존 SISO 저역 레벨 기준 offset, 해 혼합 강도, 제어원 coherence, crossover, 실제 output별 headroom과 전체 보정 가능성 분류표를 보인다. impulse-tail proxy는 RT60/잔향 예측이 아니며 1.5 dB 초과 악화 시 적용을 차단한다.
 - 다운로드와 A/B는 비파괴라고 명시하고, 정식 적용 버튼만 덮어쓰기 경고를 낸다.
 - 모든 펼침 영역은 일반 카드와 구분되는 테두리·배경, 최소 48 px 제목 행과 오른쪽 vector chevron을 사용한다. 닫힘/열림에 따라 chevron 방향과 제목 accent가 바뀌며 브라우저 기본 marker는 중복 표시하지 않는다.
@@ -89,8 +94,8 @@
 
 ## 성능 예산
 
-- `/api/status`: 보이는 화면에서 1초 polling, file signature cache 사용
+- `/api/status`: 보이는 화면에서 약 1.5초 polling, file signature cache 사용
 - `/api/volume`: 보이는 현황 화면에서 3초 polling, server cache 2.5초
 - `/api/health`: 5초 polling
-- 측정 상태: 측정 화면에서 1초 polling
+- 측정 상태: 측정 화면에서 0.5~1.5초 polling
 - FIR FFT/그래프: 브라우저에서 한 번 계산하며 Pi 2 서버가 FFT를 반복하지 않는다.

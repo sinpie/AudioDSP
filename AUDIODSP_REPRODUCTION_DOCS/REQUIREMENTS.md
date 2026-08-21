@@ -43,13 +43,14 @@
 
 - 0°와 90° UMIK-1 calibration 파일을 별도로 업로드·검증·보관한다.
 - 최종 룸 측정은 UMIK를 천장으로 향한 90° calibration만 허용한다.
-- 먼저 5초 무음과 5초 저레벨 백색소음을 측정해 background, signal, SNR, peak, clipping을 평가한다.
-- NOT OK이면 사용자가 기기 볼륨을 수동 조절하고 다시 검사한다.
-- 측정 재생 중 CamillaDSP를 direct bypass하고 U7 Mic/Line capture switch를 끈다. 종료·실패·취소 때 원상 복구한다.
-- Fast 1위치 또는 Standard 3위치에서 합산 L/R, 표준 L/R/Woofer, 권장 정밀 L/R/W/L+Woofer/R+Woofer 구성을 제공한다.
-- 정밀 모드는 L/R/W만 설계하고 같은 위치의 L+Woofer/R+Woofer를 절대 복소합 closure에만 사용한다. 이를 별도 normalize·평균·재보정하지 않으며 PASS 후 불필요한 사후 sweep을 요구하지 않는다.
-- L/R/Woofer 모드는 소스를 따로 측정하며 중앙 bulk delay, FIR energy delay, 세 위치 robust 복소합으로 Front/Woofer 공통 극성·상대 지연을 계산한다.
-- Woofer 단독/합산 측정 감쇄 기본은 Front보다 9 dB 낮고 -18~0 dB에서 조절한다. 분리 측정은 reference도 같은 비율로 낮춰 응답 크기를 보존하고, 합산 응답은 같은 Woofer scale을 실제 복소합에 유지한다.
+- 먼저 현재 측정 구성의 모든 출력을 본 측정과 같은 2초 ESS로 검사해 background, signal, SNR, peak, clipping을 평가한다. 백색소음 설정은 UI에 노출하지 않는다.
+- NOT OK이면 사용자가 인티앰프/우퍼의 물리 볼륨 또는 측정 dBFS를 조절하고 다시 검사한다. U7의 평상시 청취 볼륨은 sweep dBFS에 더하지 않는다.
+- 빠른 검사, 본 측정, 합산 측정, Preview FIR 사후 검증의 모든 sweep은 `입력 OFF → U7 PCM 0 dB 적용·확인 → 선택 dBFS 재생 → 재생 프로세스 종료 → 원래 U7 볼륨 복원·확인 → 입력 복귀` 순서를 공통으로 사용한다.
+- 원래 U7 볼륨 복원 확인이 실패하면 CamillaDSP/Line 입력을 다시 연결하지 않고 안전 오류로 중단한다. 측정 오디오 전용 잠금 동안 Web/API의 볼륨·프로필·DSP 변경도 거부한다.
+- 빠른 측정 1위치 또는 표준 측정 3위치에서 합산 L/R, 표준 L/R/우퍼, 권장 정밀 L/R/우퍼/L+우퍼/R+우퍼 구성을 제공한다.
+- 정밀 모드는 L/R/우퍼만 설계하고 같은 위치의 L+우퍼/R+우퍼를 절대 레벨 합산 closure에만 사용한다. 이를 별도 normalize·평균·재보정하지 않으며 PASS 후 불필요한 사후 스윕을 요구하지 않는다.
+- 독립-clock U7+UMIK 구성은 위상 비의존 에너지 타깃과 동상 합산 안전 상한을 사용한다. 프런트/우퍼 공통 극성·상대 지연과 MIMO 복소행렬은 검증된 공통 timing reference가 있을 때만 계산한다.
+- 우퍼 단독/합산 측정 감쇄 기본은 프런트보다 9 dB 낮고 -18~0 dB에서 조절한다. 분리 측정은 reference도 같은 비율로 낮춰 응답 크기를 보존하고, 합산 응답은 같은 우퍼 scale을 유지한다.
 - 각 sweep의 무음 pre-roll과 활성 구간으로 개별 SNR을 검증하며 6 dB 미만은 거부하고 15 dB 미만은 경고한다.
 - 옥타브별 noise-compensated Schroeder EDT/T20 잔향을 산출한다. 신뢰 가능한 300 Hz 이하 장시간 공진만 최대 3 dB cut-only로 더 감쇄하고 late reverb는 역보정하지 않는다.
 - 출력은 48 kHz stereo float32, 32768 taps의 Front WAV와 필요할 때 Rear WAV다.

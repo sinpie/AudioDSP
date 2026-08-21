@@ -76,11 +76,25 @@ def current_profile(device: str) -> tuple[str, int]:
     state = report[STATE_BYTE]
     profile = STATE_TO_PROFILE.get(state)
     if profile is None:
-        raise OSError(f"Unknown U7 selector state 0x{state:02x}")
+        raise OSError(f"Unknown U7 selector state 0x{state:02x}; report={report.hex(' ')}")
     return profile, state
 
 
-def save_selector_state(profile: str, state: int, source: str) -> None:
+def query_initial_profile(device: str, attempts: int = 8, delay_seconds: float = 0.25) -> tuple[str, int]:
+    """Read a stable selector state without guessing during USB start-up."""
+    last_error: OSError | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return current_profile(device)
+        except OSError as exc:
+            last_error = exc
+            if attempt + 1 < max(1, attempts):
+                time.sleep(max(0.0, delay_seconds))
+    assert last_error is not None
+    raise last_error
+
+
+def save_selector_state(profile: str | None, state: int, source: str) -> None:
     SELECTOR_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
         boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
@@ -138,12 +152,19 @@ def apply_profile(profile: str, announce: bool = True) -> None:
 def monitor(device: str) -> None:
     log(f"Monitoring Xonar U7 output selector on {device}")
     try:
-        profile, state = current_profile(device)
+        profile, state = query_initial_profile(device)
         log(f"Initial U7 selector state 0x{state:02x} -> {profile}")
         save_selector_state(profile, state, "hidio_get_input")
         apply_profile(profile, announce=False)
     except OSError as exc:
         log(f"Could not query initial U7 selector state: {exc}")
+        try:
+            report = read_current_report(device)
+            state = report[STATE_BYTE] if len(report) > STATE_BYTE else -1
+            if state >= 0:
+                save_selector_state(None, state, "hidio_get_input_unknown")
+        except OSError as observation_error:
+            log(f"Could not save initial U7 selector observation: {observation_error}")
     last_press = 0.0
     with open(device, "rb", buffering=0) as handle:
         while True:

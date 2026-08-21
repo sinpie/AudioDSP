@@ -5,17 +5,18 @@
 - UMIK-1과 Xonar U7을 모두 연결한다.
 - calibration serial은 7200660이며 0°와 90° 파일을 별도 보관한다.
 - 실제 룸 측정은 UMIK를 위로 세운 90° 방식만 허용한다. 0° 파일은 별도 활용·검증을 위해 저장하지만 최종 session orientation으로 고를 수 없다.
-- 백색소음과 sweep 출력은 서로 독립이며 둘 다 기본 -42 dBFS다. 야간에는 -48 또는 -42 dBFS에서 시작한다. UI는 높은 출력 조합을 즉시 경고하고 실제 sweep 시작 전 현재 Front/Woofer 실효값을 다시 확인한다.
+- UI에는 하나의 DAC 기준 스윕 출력만 노출한다. 빠른 검사는 본 측정과 같은 ESS·라우팅·채널별 유효대역 SNR 계산을 사용하고 출력 조합마다 2초씩 재생한다. 기본값은 -42 dBFS이며 평상시 U7 청취 볼륨은 이 값에 더해지지 않는다.
 - 모든 측정 재생은 CamillaDSP를 중지한 상태에서 검증된 `audiodsp_announce` 4채널 ALSA 경로를 사용하므로 프로필 FIR을 거치지 않는다.
 - 측정 동안 U7 Mic와 Line capture switch를 nocap으로 두며, arecord는 UMIK 장치를 직접 사용한다.
+- 빠른 검사·위치 측정·합산 측정·사후 검증은 한 공통 transaction을 사용한다: 오디오 lock → Camilla/입력 OFF → 8채널 U7 PCM 0 dB read-back → sweep → 모든 재생 프로세스 종료 → 기존 PCM raw 복원 read-back → 입력/Camilla 복귀. 복원 read-back이 실패하면 입력은 계속 차단된다.
 
 ## 레벨 사전 평가
 
-1. UMIK로 5초 무음을 기록한다.
-2. U7로 낮은 백색소음을 재생하면서 약 5초를 기록한다.
-3. background RMS, white-noise RMS, background를 제거한 signal RMS, SNR, peak를 계산한다.
-4. clipping 또는 SNR 부족이면 NOT OK로 위치 측정을 막는다.
-5. 사용자가 preamp/amp/U7 볼륨을 조절한 뒤 다시 실행한다.
+1. 현재 측정 구성의 모든 출력 조합을 본 측정과 같은 ESS로 각 2초씩 재생·녹음한다.
+2. 각 조합의 실제 통과대역에서 배경 RMS, 신호 RMS, SNR, peak를 계산한다. 우퍼는 지속 -3 dB 유효대역을 사용한다.
+3. 최저 SNR 6 dB 미만 또는 peak -1 dBFS 이상이면 FAIL로 위치 측정을 막는다.
+4. 6–15 dB는 사용 가능한 PASS이면서 권장 품질 미달 경고다. 15 dB 이상은 권장 PASS다.
+5. UI는 -6 dBFS peak 여유 안에서 몇 dBFS까지 올릴 수 있는지 계산해 실제 2단계 메뉴값으로 안내한다.
 
 레벨 검사를 실제 재실행하면 이전 위치 측정과 그로부터 나온 검증/FIR만 무효화한다. 화면 이동이나 dropdown 편집만으로는 지우지 않는다.
 
@@ -27,20 +28,20 @@
 |---|---:|---|---|---|
 | `L+Woofer / R+Woofer · 합산 SISO` | 2 | L+W, R+W | 측정 자체가 전체 시스템 | 없음. 하나의 Front FIR을 처리한 뒤 Rear로 복사한다. |
 | `정밀 분리+합산 · L/R/W/L+W/R+W · 위치당 5회 · 권장` | 5 | L, R, W만 | 같은 위치의 L+W/R+W로 복소 전달 모델·극성·상대레벨을 FIR 계산 전에 검증 | 모델과 최종 예측이 PASS면 없음 |
-| `표준 분리 SISO · L/R/W · 위치당 3회` | 3 | L, R, W | 같은 clock의 절대 복소응답 합산 예측 | 없음. 물리 합산 closure가 필요하면 처음부터 정밀 구성을 선택한다. |
-| MIMO | 2/3/4 | 각 독립 물리 제어원 | 같은 clock의 복소 전달행렬 모델 | FIR 생성 뒤 필수 측정은 없음. Pi4/5 실기 성능 수락은 별도다. |
+| `표준 분리 SISO · L/R/W · 위치당 3회` | 3 | L, R, W | 위상 비의존 에너지 타깃 적합도와 최악 동상 합산 상한 | 없음. 물리 합산 closure가 필요하면 처음부터 정밀 구성을 선택한다. |
+| MIMO | 2/3/4 | 각 독립 물리 제어원 | 공통 timing reference가 있는 복소 전달행렬 모델 | Pi4/5 계산 능력과 별개로 공통 timing reference가 없으면 생성 차단 |
 
 - 정밀 모드의 L+W/R+W는 validation constraint일 뿐 다시 보정하거나 L/R/W 평균에 섞지 않는다. 다섯 응답을 독립 normalize하지 않고 같은 sweep reference의 절대 전달비를 유지하므로 이중 보정·레벨 왜곡이 없다.
 - 분리 SISO/MIMO의 Woofer 측정 감쇄는 기본 -9 dB이며 -18~0 dB에서 조절한다. reference도 같은 scale을 사용하므로 deconvolution 응답 레벨은 복원되고 SNR/headroom만 달라진다. 합산 SISO에서는 이 값이 측정 조건이자 최종 Woofer trim이므로 임의 복원하지 않는다. 정밀 모드의 L+W/R+W에는 동일한 Woofer scale을 그대로 넣어 `H_front + scale·H_woofer`와 실제 합산을 비교한다.
 - positions: 청취 위치 주변 3곳
 - rate: 48,000 Hz
-- sweep 길이: UI 4/8/12초, engine 허용값 2~14초 짝수
+- sweep 길이: UI 4/8/12/14초, engine 허용값 2~14초 짝수
 - 각 녹음과 알려진 reference를 FFT하고 `Y·conj(X)/(abs(X)^2 + λ)` 형태로 deconvolution한다.
 - `λ`는 reference 최대 power의 `1e-9`로 설정한다.
 - bulk acoustic/device delay는 impulse peak에서 구하되 인과적인 0~250 ms 구간 안의 peak만 direct 응답으로 인정한다. 대역 제한 Woofer의 ESS 고조파·잡음 peak가 이 범위를 벗어나면 magnitude는 별도 SNR/통과대역 gate로 계속 사용하고 phase·decay·group delay·Front/Woofer 시간 정렬은 비활성화한다.
 - UMIK calibration magnitude를 log-frequency 보간해 적용한다.
 - ALSA/USB cold-start가 nominal 400 ms 준비 시간을 소비해도 50 ms AC-RMS envelope에서 실제 sweep 길이의 최대에너지 구간을 찾는다. 최대값의 0.5% 안에서는 nominal timing을 우선해 대역 제한 Woofer의 무음 고역 때문에 시작점이 밀리지 않게 하며, 검출한 capture delay를 deconvolution과 noise window에 함께 사용한다.
-- 각 녹음의 검출된 sweep 전/후 noise PSD와 sweep 활성 구간으로 주파수별 SNR·신뢰도를 계산한다. Woofer는 chirp-time 에너지의 지속 -3 dB 통과대역을 자동 검출하고 실패할 때만 15~300 Hz로 되돌아간다. 6 dB 미만은 필터 생성을 막고, 15 dB 미만은 결과에 경고한다. 100 ms envelope 이상치는 생활소음 가능성으로 표시하지만 원본 impulse와 잔향을 잘라내지 않는다.
+- 각 녹음의 검출된 sweep 전/후 noise PSD와 sweep 활성 구간으로 주파수별 SNR·신뢰도를 계산한다. Woofer는 chirp-time 에너지의 지속 -3 dB 통과대역을 자동 검출하고 실패할 때만 15~300 Hz로 되돌아간다. 빠른 검사는 2초를 기준으로 하고, 긴 본 스윕은 matched-filter coherent integration 이득 `10·log10(T/2초)`를 원신호 SNR에 더해 같은 역컨볼루션 품질로 비교한다. 예를 들어 14초 이득은 +8.451 dB다. UI와 결과 JSON은 원신호, 적분 이득, 유효 SNR을 모두 보존한다. 유효 SNR 6 dB 미만은 필터 생성을 막고, 15 dB 미만은 결과에 경고한다. 100 ms envelope 이상치는 생활소음 가능성으로 표시하지만 원본 impulse와 잔향을 잘라내지 않는다.
 
 ## 잔향과 장시간 공진
 
@@ -83,35 +84,36 @@ Preset은 boost를 만들지 않으며 Front에는 350 Hz 이하, Woofer에는 �
 
 ## 정규화와 안전 제한
 
-- 타깃 레벨 정규화의 Front 기준 대역은 500~2,000 Hz, Woofer 기준 대역은 50~120 Hz median이다. 이는 위의 적응형 Woofer SNR 판정 대역과 별개다.
+- L/R의 500~2,000 Hz 측정·타깃 median으로 **하나의 공통 0 dB 기준**을 만든다. 이 기준을 L/R/Woofer의 설계, 결과 그래프, 자동 판정에 그대로 사용하며 Woofer나 좌우를 따로 0 dB로 맞추지 않는다. Woofer SNR의 50~120 Hz 계열 적응형 판정 대역은 측정 품질용일 뿐 레벨 정규화 기준이 아니다.
 - 반 octave median 응답이 기준보다 10 dB 내려간 지점으로 자연 usable band를 추정한다.
-- 자연 roll-off 밖에서는 positive correction을 금지한다.
+- 두 Front가 2~20 kHz에서 같은 방향으로 감쇄되고 서로 4 dB 안에서 일치하면 스피커/마이크의 공통 광대역 roll-off로 간주한다. 이 경우 edge SNR 신뢰도를 다시 correction 크기에 곱하지 않고 공간편차·local-shape regularization 뒤 사용자가 선택한 상대 보상 상한까지 허용한다. 한 채널만의 딥이나 약 1/3 octave보다 좁은 null은 이 예외를 받지 않는다.
 - 공간 표준편차가 3 dB면 boost 신뢰도를 절반 수준으로 낮추는 soft regularization을 쓴다.
-- positive correction은 tanh soft limit와 사용자 최대 boost 0/3/6/9 dB를 적용한다. 500 Hz 이상은 최대 3 dB로 더 제한한다.
+- `최대 상대 보상`은 0/3/6/9/10 dB이며 기본 10 dB다. 신뢰되는 가장 큰 positive correction을 0 dB로 만들기 위해 전체 L/R/Woofer bank를 같은 값만큼 낮춘다. 따라서 디지털 preamp나 양의 FIR 전달 이득 없이 넓은 고역 roll-off도 상대 보상할 수 있다. 원 응답 감쇄가 선택 상한보다 크면 남은 slope를 억지로 숨기지 않으며, 15/20 kHz 잔여 오차와 공통 음량 감쇄를 결과/UI/보고서에 명시한다.
+- 좁고 깊은 null은 공간 평균과 양쪽 ±1/6 octave 이웃으로 판별하며 최대 3 dB만 허용한다. 한 deep을 채우려고 나머지 전 대역을 과도하게 낮추지 않는다.
 - cut은 사용자 최대 6/9/12/18/24 dB에서 제한한다.
 - Woofer correction은 20~180 Hz에서 cut-only다.
 - 보정 범위는 사용자가 20/30/40/60/80 Hz 하한과 300/500/1k/5k/20k Hz 상한을 선택한다.
-- 최종 FIR의 최대 전달 이득은 0 dB 이하가 되도록 정규화한다.
+- 완성된 Front L/R + Woofer L/R FIR bank의 최대 전달 이득을 한 번만 구하고 모든 branch에 동일한 common gain을 적용한다. 자동 검증은 공통 기준, 공통 gain, branch 간 상대레벨 보존, 최대 상대 보상, narrow-null guard를 각각 검사한다.
 
 ## 디지털 crossover와 실제 합산
 
 분리 SISO에서는 디지털 crossover가 기본 `ON`, 기본 주파수는 100 Hz다. 선택 범위는 60/70/80/90/100/120 Hz다. Front WAV에는 Linkwitz–Riley 4차 HPF, Rear/Woofer WAV에는 같은 주파수의 LR4 LPF magnitude와 그 minimum-phase 전달함수를 넣는다. 별도의 CamillaDSP biquad/filter stage를 추가하지 않고 기존 32768탭 WAV에 곱해 합치므로 convolution 수, chunksize, block latency는 늘지 않는다. FIR 자체의 group delay/phase는 결과에 계속 기록한다. `OFF`는 합산 검증을 끄는 뜻이 아니라 full-range 중첩을 선택하는 것이므로 합산 cut-only guard는 계속 동작한다.
 
-두 branch를 따로 target에 맞추는 것으로 끝내지 않는다. 먼저 생성 FIR energy delay와 측정 bulk delay를 합치고, `Phase 방식=저역 음량 + excess phase`이며 직접음 phase가 신뢰 가능하면 crossover 주변에서 Woofer 극성 ±1과 Front/Woofer 상대 지연 후보를 실제 세 위치 복소합으로 탐색한다. 가장 낮은 robust MAE/P90을 만드는 하나의 공통 극성·지연만 FIR bank에 반영한다. 신뢰 가능한 복소 phase가 있을 때 합산 guard는 세 위치에서 실제로 예측한 복소합의 최대값을 기준으로 한다. phase가 신뢰 불가능할 때만 보수적인 `|Front|+|Woofer|` 상한으로 되돌아가며, 이 경우 acoustic PASS를 추정하지 않는다. target을 넘는 대역에는 두 branch에 같은 minimum-phase cut-only guard를 내장하고 null/cancellation은 boost로 메우지 않는다.
+두 branch를 따로 target에 맞추는 것으로 끝내지 않는다. 위치마다 한 녹음 안에서 L/R/W를 네 개의 직교 Walsh 상태로 동시에 재생해 같은 주파수의 세 전달함수를 분리한다. 이 동일 녹음 상대위상으로 생성 FIR energy delay, Woofer 극성 ±1, 프런트/우퍼 상대 지연을 복소합 탐색한다. 별도 ESS끼리의 절대 위상은 U7 출력과 UMIK-1 입력의 독립 clock 때문에 사용하지 않는다. Walsh 기준이 불신이면 위상 비의존 에너지 합산과 최악 `|Front|+|Woofer|` 동상 상한에 공통 cut-only guard를 적용하고, clock drift가 만든 가짜 복소 딥은 boost로 메우지 않는다.
 
-정밀 모드는 필터 전 L/R/W 복소합이 같은 위치의 L+W/R+W 실측과 맞는지 먼저 확인한다. 이 closure가 PASS이고 최종 FIR을 곱한 합산 예측도 target MAE/P90과 상한 guard를 통과하면 `pass_premeasured_model`로 판정한다. 표준 분리 SISO도 모든 sweep이 같은 capture/playback clock과 절대 impulse reference를 사용하므로 신뢰 가능한 phase·target·상한을 통과하면 `pass_independent_complex_model`로 판정한다. 정밀 구성의 두 추가 응답은 이 모델의 물리 합산 closure를 검증해 오배선·극성·상대레벨 오류를 더 일찍 잡는 품질 옵션이다. 어떤 구성도 4단계 FIR 생성 뒤 필수 재측정을 만들지 않는다.
+정밀 모드는 같은 위치의 L/R/W와 L+W/R+W 실측 크기가 삼각 부등식 합산 범위 안에 있는지, 독립 정규화 없이 절대 전달비로 먼저 확인한다. 여기에 동일 녹음 Walsh L+R+W 기준이 신뢰되면 L+W/R+W의 dense cross-term과 결합한 복소 모델을 사용한다. Walsh 기준이 없거나 불신이면 `limited`를 숨기지 않고 크기 closure·SNR·위상 비의존 타깃·상한 guard로 안전 판정한다. 어떤 구성도 4단계 FIR 생성 뒤 필수 재측정을 새로 요구하지 않는다.
 
 MAE는 판정 대역의 log-frequency 지점마다 계산한 절대 Target 오차의 평균이다. P90은 오차의 90 percentile로, 지점 90%가 그 dB 이내라는 뜻이다. MAE가 낮아도 좁은 대역의 큰 봉우리/null이 남을 수 있으므로 P90을 함께 제한한다. 독립 Woofer LPF branch는 full-range Target과 직접 비교하지 않고 공통 Front 기준 저역 상대레벨만 진단하며, 최종 Target 판정은 L+Woofer/R+Woofer 전체 합산에 적용한다.
 
 `L+Woofer/R+Woofer 합산` 모드는 이미 하나의 FIR 뒤에서 Front/Rear를 복사하므로 두 출력을 독립 HPF/LPF로 분리할 수 없다. 이 모드에서는 crossover를 강제로 OFF하며, 사용자가 ON을 요청하면 조용히 무시하지 않고 계산을 거부한다. 독립 crossover가 필요하면 L/R/Woofer 개별 측정을 새로 해야 한다.
 
-Woofer trim과 Strong/Primus 억제는 의도적인 target 이탈을 만들 수 있다. 구조적으로 유효한 WAV라는 사실, 동일-clock 복소 모델 PASS, 실제 방에서의 적용 후 acoustic audit를 구분해서 표시한다. 생성·정식 적용의 필수 게이트는 사전 측정 모델이며, 적용 후 작은 레벨 sweep은 선택 검증이다.
+우퍼 트림과 Strong/Primus 억제는 의도적인 타깃 이탈을 만들 수 있다. 구조적으로 유효한 WAV, 위상 제한 합산 안전 PASS, 공통 timing reference가 있을 때의 복소 모델 PASS, 실제 방의 선택형 적용 후 audit를 구분해서 표시한다.
 
 ## Phase와 시간 정렬
 
 기본 magnitude 설계는 minimum phase다. `bass` 모드는 중앙 위치의 측정 phase에서 minimum-phase 성분을 빼 excess phase를 구하고 지정 cutoff 80/120/160/200/250 Hz 아래에서만 보정한다. cutoff 전이는 cosine window이며 causality를 위한 shift는 최대 2048 samples로 제한한다. impulse 끝 10%는 fade한다.
 
-L/R/Woofer 모드에서는 신뢰 가능한 중앙 위치 Front L/R 음향 bulk delay뿐 아니라 생성된 Front/Rear FIR의 에너지 중앙 지연까지 더한 전체 재생 지연을 비교한다. 필요한 상대 지연이 최대 3008 samples(약 62.7 ms) 안일 때만 더 빠른 쪽을 완전히 맞춘다. 그 뒤 위 crossover 복소합 탐색이 세 위치에 더 나은 공통 극성·미세 지연을 찾으면 이를 사용한다. direct peak가 신뢰 불가하거나 필요한 지연이 한계를 넘으면 임의의 부분 지연을 넣지 않고 이유를 결과에 기록한다. L/R은 같은 phase·강도·상대 지연을 사용하며, dense FFT에서 magnitude 잔차가 0.75 dB를 넘으면 phase 강도를 축소하고 10% 미만이면 자동 해제한다. Woofer 한 개를 Rear L/R 두 채널에 같은 FIR로 복사하므로 T5S의 stereo 입력 케이블을 그대로 쓸 수 있다.
+L/R/우퍼 모드의 프런트/우퍼 branch 상대 지연·극성은 위치별 동일 녹음 Walsh L+R+W 기준이 신뢰될 때만 최적화한다. 이 방식은 별도 sweep의 clock drift를 거리로 오인하지 않으며, UI에는 주파수별 상대위상과 ms/degree 요약, 반복오차를 함께 표시한다. 하나의 delay로 위상곡선을 잘 설명하지 못하면 그 개발자용 요약값은 수동 거리 설정에 쓰지 않지만, 신뢰되는 주파수별 복소 데이터와 L+W/R+W cross-term은 계속 제한적으로 사용한다. 우퍼 한 개는 우퍼 L/R 두 채널에 같은 FIR로 복사하므로 T5S의 stereo 입력 케이블을 그대로 쓸 수 있다.
 
 Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니다. 위치별로 달라지는 고역 phase는 보정하지 않고, 시간적으로 비교적 일관된 저역과 source 정렬에만 제한한다.
 
@@ -119,9 +121,11 @@ Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니�
 
 ### U7 물리 출력 경로 고정
 
-새 session은 아직 특정 프로필에 묶이지 않는다. `5초 무음 + 5초 백색소음`을 시작하기 직전에 HID monitor가 기록한 현재 boot의 U7 selector 상태를 읽고 `measurement_profile=speaker|headphone`과 state byte를 session에 저장한다. 오래된 boot ID, 없는 state 파일, 알 수 없는 profile이면 소리를 시작하지 않는다. MIMO는 실제 4채널 Speaker output에서만 고정할 수 있다.
+새 세션은 아직 특정 프로필에 묶이지 않는다. 빠른 ESS 검사를 시작하기 직전에 HID monitor가 기록한 현재 boot의 U7 selector 상태를 읽고 `measurement_profile=speaker|headphone`과 state byte를 세션에 저장한다. 오래된 boot ID, 없는 state 파일, 알 수 없는 profile이면 소리를 시작하지 않는다. MIMO는 실제 4채널 Speaker output과 공통 timing reference가 모두 확인되어야 한다.
 
 모든 sweep/validation은 DSP를 멈추기 전, 각 재생 직전, 재생 polling 중, 재생 직후에 selector를 다시 확인한다. 상단 버튼을 눌러 경로가 달라지면 재생·녹음 프로세스를 종료하고 저장된 이전 측정값은 유지한 채 worker를 오류로 끝낸다. Preview도 현재 물리 경로가 원래 측정 경로와 같아야 한다. Apply는 생성 FIR을 측정한 프로필에만 허용하므로 한 출력 체인의 룸 응답을 다른 스피커 체인에 잘못 덮어쓸 수 없다.
+
+같은 polling에서 U7 PCM이 0 dB/8채널 동일값인지와 Camilla service가 계속 정지했는지도 확인한다. 오디오 lock을 가진 동안 profile manager의 볼륨·프로필·DSP mutation은 실패하므로 다른 Web/API 요청이 안전 순서를 끼어들 수 없다.
 
 - `Generated_Front_LR_32768.wav`: L/R 독립 stereo float32
 - `Generated_Rear_LR_32768.wav`: Woofer FIR을 L/R 동일 복사하거나, L/R 모드에서 Front 복사본에 woofer trim을 bake한 stereo float32
@@ -131,6 +135,8 @@ Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니�
 - crossover 결과는 `result.crossover`에 내장 여부, 주파수, 추가 runtime filter/block latency(모두 0), 상한 guard, 복소합 target, phase 신뢰도와 상태를 저장한다.
 
 브라우저 다운로드와 그래프 확인은 playback을 바꾸지 않는다. Preview는 runtime config만 임시 교체하며 profile WAV/settings는 그대로다. Apply에서 기존 파일을 백업한 뒤 정식 WAV를 교체한다.
+
+선택형 사후 검증은 실제 Preview FIR을 통과한 L+Woofer/R+Woofer를 다시 측정한다. 실측과 계산 예상은 각각 L/R을 합친 500~2,000 Hz 기준 한 번만 적용하며 좌우를 따로 0 dB로 맞추지 않는다. 전체 target MAE/P90, 50~200 Hz crossover MAE/P90뿐 아니라 **계산 예상↔실측** MAE/P90도 별도 저장한다. 신뢰 가능한 복소 합산 모델의 예상 오차는 PASS gate에 포함한다. SNR 6~15 dB에서도 모든 엄격 오차 기준을 만족하면 품질 권고를 남기고 PASS한다. 이 구간에서 기준을 근소하게 넘은 결과는 확정 FAIL이 아니라 `inconclusive_low_snr`로 표시하고, 큰 오차만 즉시 차단한다. 사후 sweep은 FIR 입력 기준이며 현재 bank의 공통 감쇄 뒤 실제 출력은 더 작아질 수 있으므로 28초 ESS와 -25 dBFS 재검증을 안내한다. `검증 초기화`는 사후 실측 상태만 지우고, component check에서 원래 합산 모델 판정·보고서·UI 상태를 다시 구성하므로 이전 `fail_measured` 문자열이 남지 않는다.
 
 현황/설정에서 표시하는 FIR FFT는 목표 음압 자체가 아니라 측정 응답에 곱하는 보정 전달함수다. 따라서 Harman target의 저역 상승·고역 하강과 같은 모양일 필요가 없다. 목표 달성 여부는 측정·보정 결과의 `effective_target_db`와 실제 FIR FFT 기반 `predicted_db`, 그리고 crossover 사용 시 Front+Woofer 합산 검증으로 판단한다.
 

@@ -39,6 +39,7 @@ def load_module(name: str, path: Path):
     if os.name == "nt" and "fcntl" not in sys.modules:
         fcntl_stub = types.ModuleType("fcntl")
         fcntl_stub.LOCK_EX = 2
+        fcntl_stub.LOCK_NB = 4
         fcntl_stub.flock = lambda _handle, _operation: None
         sys.modules["fcntl"] = fcntl_stub
     spec = importlib.util.spec_from_file_location(name, path)
@@ -348,6 +349,17 @@ def main() -> int:
         })
         os.environ.update({key: value for key, value in environment.items() if key.startswith("AUDIODSP_")})
         manager = load_module("audiodsp_profile_manager_matrix", args.manager)
+        web_module = load_module("audiodsp_profile_web_matrix", args.web)
+        web_module.measurement_status = lambda: {
+            "correction_preferences": dict(
+                web_module.DEFAULT_CORRECTION_PREFERENCES,
+                correction_low_hz=30,
+                max_cut_db=18,
+            )
+        }
+        partial_build = web_module.correction_build_arguments({"target": "flat", "max_boost_db": "10"})
+        require(partial_build[8] == "30" and partial_build[11] == "18", "partial/stale FIR form did not preserve missing advanced settings")
+        report["partial_build_form"] = {"missing_max_cut_fallback": True, "arguments": len(partial_build)}
 
         sources = {
             "speaker_front": assets / "speaker-front.wav",
@@ -627,6 +639,14 @@ def main() -> int:
         finally:
             monitor.fcntl.ioctl = original_ioctl
         require((initial_profile, initial_state) == ("speaker", 0xA0), "initial HIDIOCGINPUT parsing mismatch")
+        monitor.save_selector_state(None, 0x88, "hidio_get_input_unknown")
+        unknown_selector = manager.selector_status()
+        require(
+            unknown_selector["profile"] is None
+            and unknown_selector["state_byte"] == "0x88"
+            and not unknown_selector["stale"],
+            "unknown boot-time HID observation was not preserved safely",
+        )
         monitor.save_selector_state(initial_profile, initial_state, "matrix")
         selector = manager.selector_status()
         require(selector["profile"] == "speaker" and not selector["stale"], "selector state persistence mismatch")
@@ -683,23 +703,24 @@ def main() -> int:
                 raise AssertionError("Web server did not listen")
 
             status_page, _ = get_bytes(base + "/?woofer=1")
-            for marker in ("현황", "측정 · 보정", "프로필 · 설정", "현재 설정", "현재 FIR 보정 전달함수", "목표 청취 음압 그래프가 아닙니다", "시스템 상태", "지금 할 일", "출력 볼륨", "output-volume-control", "오디오 신호 흐름", "signal-flow", "U7 PHYSICAL SELECTOR", "두 U7 경로 모두 스피커에 연결됨"):
+            for marker in ("현황", "측정·보정", "프로필·설정", "현재 설정", "현재 FIR 보정 전달함수", "목표 청취 음압 그래프가 아닙니다", "시스템 상태", "지금 할 일", "출력 볼륨", "output-volume-control", "오디오 신호 흐름", "signal-flow", "U7 물리 출력 선택", "두 U7 경로 모두 스피커에 연결됨"):
                 require(marker.encode("utf-8") in status_page, f"Status-page marker missing: {marker}")
             require(b"measurement card-wide" not in status_page and b"Front WAV" not in status_page, "status page contains another screen")
             require("<title>현황 · AudioDSP</title>".encode("utf-8") in status_page, "status page title is not contextual")
             measure_page, _ = get_bytes(base + "/measure")
-            for marker in (b"32768", b"UMIK-1", b"target-graph", b"job-progress", b"workflow", b"cal-card", b"session-overview", b"session-library", b'name="noise_level_dbfs"', b'name="woofer_measurement_attenuation_db"', b'value="-42"', b"measurement-path-lock", b'data-measurement-path="unbound"', "Session 생성 · 2단계 출력 설정으로".encode("utf-8"), "실제 White noise·Sweep 출력은 다음 2단계".encode("utf-8"), "L+Woofer / R+Woofer".encode("utf-8"), "정밀 분리+합산".encode("utf-8"), "L/R/W/L+W/R+W".encode("utf-8"), "Front L, Front R, Woofer".encode("utf-8"), "90° · 천장 방향".encode("utf-8"), "0° · 마이크 정면".encode("utf-8"), "Fast · 1위치".encode("utf-8"), "Standard · 3위치".encode("utf-8"), "활성 Session 없음".encode("utf-8")):
+            for marker in (b"32768", b"UMIK-1", b"target-graph", b"job-progress", b"workflow", b"cal-card", b"session-overview", b"session-library", b'name="woofer_measurement_attenuation_db"', b'value="-42"', b"measurement-path-lock", b'data-measurement-path="unbound"', "세션 생성".encode("utf-8"), "빠른 검사와 본 측정의 스윕 출력은 2단계".encode("utf-8"), "L+우퍼 / R+우퍼".encode("utf-8"), "정밀 분리+합산".encode("utf-8"), "L/R/우퍼/L+우퍼/R+우퍼".encode("utf-8"), "프런트 L → 프런트 R → 우퍼 → L+우퍼 → R+우퍼 → L+R+우퍼 동시 위상".encode("utf-8"), "90° · 천장 방향".encode("utf-8"), "0° · 마이크 정면".encode("utf-8"), "빠른 측정 · 기준점 1위치".encode("utf-8"), "표준 측정 · 중앙+좌우 3위치".encode("utf-8"), "활성 세션 없음".encode("utf-8")):
                 require(marker in measure_page, f"Measurement-page marker missing: {marker!r}")
             web_source = args.web.read_text(encoding="utf-8")
-            for marker in ("실제 측정음을 재생합니다", "저역 late/early", "기존 SISO 저역 레벨", "1.5 dB 넘게 악화", "실제 RT60/잔향 예측이 아니며", "디지털 Crossover", "LR4 HPF", "additional_block_latency_samples", "set-session-note", "load-session", "build-fieldset", "validation-checklist", "음색 시작점", "Target 그대로", "맑은 고음", "따뜻한 균형", "야간 균형", "사후 실측 대기", "premeasured_sum_validation", "필터 전 L/R/W 복소 합산 모델", "Woofer 복소합 정렬", "sum_guard_enabled&&j.result.crossover?.channels", "--step-accent", "summary::after", "details[open]>summary::after"):
+            for marker in ("본 측정과 같은 15 Hz–22 kHz 스윕·라우팅·SNR 계산", "빠른 검사 저장 원본", "/measurement/reprocess-level", "저역 late/early", "저역 기준 레벨 고정", "L/R 동일 기준", "1.5 dB 넘게 악화", "실제 RT60/잔향 예측이 아니며", "디지털 크로스오버", "LR4 HPF", "additional_block_latency_samples", "set-session-note", "load-session", "build-fieldset", "validation-checklist", "음색 시작점", "타깃 그대로", "맑은 고음", "따뜻한 균형", "야간 균형", "최대 상대 보상", "상대 보상의 음량 비용", "15–20 kHz 잔여 오차", "공통 0 dB 기준", "one_common_level_reference", "premeasured_sum_validation", "필터 전 합산 교차항 확인", "합산 안전 상한", "sum_guard_enabled&&j.result.crossover?.channels", "mergeLowSystemResponse", "사후 검증 후에는 실측과 계산 예상값을 같은 공통 기준으로 비교", "predicted_sum_db", "inconclusive_low_snr", "검증 sweep 입력", "28초 ESS", "canonicalMeasurementUrl='/measure'", "소리는 자동으로 시작되지 않습니다", "--step-accent", "summary::after", "details[open]>summary::after"):
                 require(marker in web_source, f"Measurement/MIMO safety UI source marker missing: {marker}")
+            require("new URL(location.href);url.searchParams.set('updated'" not in web_source, "measurement completion still reloads a POST-only route")
             require(b'role="tab" class="flow-step current"' in measure_page, "current measurement step is not an accessible non-destructive tab")
             require(b'aria-current="step"' in measure_page, "current measurement step lacks accessible state")
             require("<title>측정 · 보정 · AudioDSP</title>".encode("utf-8") in measure_page, "measurement page title is not contextual")
             require(b"/measurement/rewind" not in measure_page, "step navigation unexpectedly discards data")
             require(b"current FIR" not in measure_page and b"data-profile=" not in measure_page, "measurement page contains another screen")
             settings_page, _ = get_bytes(base + "/settings")
-            for marker in (b"DSP Bypass", b"MIMO 2", b"Front WAV", b"Rear WAV", b"chunksize", b"live_u7_status_poll", b"profile-mini-flow", "Speaker 출력 체인".encode("utf-8"), "Headphone 잭 출력 체인".encode("utf-8"), "전체 백업 · 안전 복원".encode("utf-8"), b"schema v2"):
+            for marker in ("DSP 바이패스".encode("utf-8"), b"MIMO 2", "프런트 WAV".encode("utf-8"), "우퍼 WAV".encode("utf-8"), b"chunksize", b"live_u7_status_poll", b"profile-mini-flow", "스피커 출력 체인".encode("utf-8"), "헤드폰 잭 출력 체인".encode("utf-8"), "전체 백업 · 안전 복원".encode("utf-8"), b"schema v2"):
                 require(marker in settings_page, f"Settings-page marker missing: {marker!r}")
             for marker in (b'id="speaker-front-wav-input"', b'id="speaker-rear-wav-input"', b'id="headphone-front-wav-input"', b'id="headphone-rear-wav-input"', b'id="backup-zip-input"', b'class="file-picker-label"'):
                 require(marker in settings_page, f"Accessible file-input marker missing: {marker!r}")
@@ -713,7 +734,7 @@ def main() -> int:
                 require(marker in web_source.encode("utf-8"), f"Accessibility source marker missing: {marker!r}")
             measurement_status = json.loads(get_bytes(base + "/api/measurement/status")[0])
             require(measurement_status["state"] == "idle", "measurement status is not idle")
-            require(measurement_status["correction_preferences"]["preset"] == "none" and measurement_status["correction_preferences"]["woofer_trim_db"] == 0, "baseline correction defaults are not target-only / 0 dB trim")
+            require(measurement_status["correction_preferences"]["target"] == "flat" and measurement_status["correction_preferences"]["preset"] == "none" and measurement_status["correction_preferences"]["woofer_trim_db"] == 0, "baseline correction defaults are not Flat / target-only / 0 dB trim")
             require(measurement_status["installed_calibrations"]["90"]["available"], "90-degree calibration is not reported as installed")
             legacy_preferences = {key: value for key, value in measurement_status["correction_preferences"].items() if not key.startswith("crossover_")}
             (state / "correction-preferences.json").write_text(json.dumps(legacy_preferences), encoding="utf-8")
@@ -741,14 +762,21 @@ def main() -> int:
             created_session = json.loads(get_bytes(base + "/api/measurement/status")[0])
             require(created_session["version"] == 2 and created_session.get("measurement_profile") is None, "new session did not start with an unbound physical output")
             active_measure_page = get_bytes(base + "/measure")[0].decode("utf-8")
-            require('action="/measurement/configure-level"' in active_measure_page and 'class="measure-form measurement-output-form level-check-form" data-measurement-step-content="2"' in active_measure_page, "measurement output controls are not owned by level-check step 2")
-            require('name="level_dbfs" type="range"' in active_measure_page and 'name="noise_level_dbfs" type="range"' in active_measure_page and 'name="woofer_measurement_attenuation_db" type="range"' in active_measure_page, "step-2 output sliders are incomplete")
+            require(
+                'data-measurement-step-content="2"' in active_measure_page
+                and 'action="/measurement/configure-level"' in active_measure_page
+                and "measurement-output-form" in active_measure_page
+                and "level-check-form" in active_measure_page,
+                "measurement output controls are not owned by level-check step 2",
+            )
+            require('name="level_dbfs" type="range"' in active_measure_page and 'name="woofer_measurement_attenuation_db" type="range"' in active_measure_page, "step-2 output sliders are incomplete")
+            require('name="noise_level_dbfs" type="range"' not in active_measure_page and "백색소음" not in active_measure_page and "화이트 노이즈" not in active_measure_page, "retired white-noise control is still visible")
             step1_form = active_measure_page.split('action="/measurement/configure"', 1)[1].split("</form>", 1)[0]
-            require('type="range"' not in step1_form and "측정 구성 변경 적용" in step1_form, "step 1 still duplicates the step-2 output controls")
-            reconfigured_fields = dict(session_fields, noise_level_dbfs="-43", sweep_seconds="4")
+            require('type="range"' not in step1_form and "구성 적용" in step1_form, "step 1 still duplicates the step-2 output controls")
+            reconfigured_fields = dict(session_fields, sweep_seconds="4")
             post_form(base + "/measurement/configure", reconfigured_fields)
             configured_session = json.loads(get_bytes(base + "/api/measurement/status")[0])
-            require(configured_session["noise_level_dbfs"] == -43 and configured_session["sweep_seconds"] == 4, "silent measurement reconfiguration failed")
+            require(configured_session["noise_level_dbfs"] == configured_session["level_dbfs"] == -42 and configured_session["sweep_seconds"] == 4, "silent measurement reconfiguration failed")
             first_session_id = configured_session["session_id"]
             checkpoint = {key: configured_session.get(key) for key in ("state", "positions_completed", "level_check", "measurements", "result")}
             post_form(base + "/measurement/session-note", {"note": "소파 중앙 · Woofer 노브 11시"})
@@ -807,7 +835,7 @@ def main() -> int:
             post_backup(base + "/backup/stage", invalid_memory.getvalue(), "invalid-settings.zip", expected=400)
             require(set((state / "restore-staging").iterdir()) == valid_staging_directories, "failed restore validation leaked files or removed the prior valid staging")
             restore_page, _ = get_bytes(base + "/settings")
-            require("검증 완료 · 전체 복원".encode("utf-8") in restore_page and "현재 설정은 아직 바뀌지 않았습니다".encode("utf-8") in restore_page, "restore review UI missing")
+            require(b'action="/backup/apply"' in restore_page and ">전체 복원</button>".encode("utf-8") in restore_page and "현재 설정은 아직 바뀌지 않았습니다".encode("utf-8") in restore_page, "restore review UI missing")
             post_form(base + "/chunksize", {"chunksize": "512"})
             require(manager.load_settings()["chunksize"] == 512, "pre-restore mutation failed")
             post_form(base + "/backup/apply", {})
@@ -890,19 +918,96 @@ def main() -> int:
                     "report_md": browser_report_md.name,
                     "report_json": browser_report_json.name,
                 },
+                "nonfinite_diagnostic_fixture": {
+                    "positive": float("inf"),
+                    "negative": float("-inf"),
+                    "nan": float("nan"),
+                },
             }
             (measurements / "current.json").write_text(json.dumps(browser_job), encoding="utf-8")
+            strict_status_body, _ = get_bytes(base + "/api/measurement/status")
+            strict_status = json.loads(strict_status_body)
+            require(
+                b"Infinity" not in strict_status_body
+                and b"NaN" not in strict_status_body
+                and all(value is None for value in strict_status["nonfinite_diagnostic_fixture"].values()),
+                "measurement status is not strict browser-compatible JSON",
+            )
             result_page, _ = get_bytes(base + "/measure")
-            for marker in (b"Front WAV", b"Rear WAV", "WAV + 보고서 ZIP".encode("utf-8"), b"measurement-result-graph", "A/B 청취 비교".encode("utf-8"), "자동 백업".encode("utf-8"), "덮어쓰기".encode("utf-8"), b'data-measurement-path="speaker"', "이 결과의 전용 경로".encode("utf-8"), b"Speaker output", b'role="tablist"', b'role="tabpanel"', b"non_destructive_measurement_tabs", "Woofer 최종 trim".encode("utf-8"), "측정 시 Woofer 감쇄".encode("utf-8"), "자동 검증 체크리스트".encode("utf-8"), "MAE는 판정 주파수 전체의 평균 절대오차".encode("utf-8"), b"status-badge na"):
+            for marker in ("프런트 WAV".encode("utf-8"), "우퍼 WAV".encode("utf-8"), "전체 ZIP".encode("utf-8"), b"measurement-result-graph", b'data-result-range="full"', b'data-result-range="bass"', "A/B 청취 비교".encode("utf-8"), "자동 백업".encode("utf-8"), b'action="/measurement/apply"', "정식 적용".encode("utf-8"), b'data-measurement-path="speaker"', "이 결과의 전용 경로".encode("utf-8"), "U7 스피커 출력".encode("utf-8"), b'role="tablist"', b'role="tabpanel"', b"non_destructive_measurement_tabs", "우퍼 최종 트림".encode("utf-8"), "측정 시 우퍼 감쇄".encode("utf-8"), "상대 보상의 음량 비용".encode("utf-8"), "자동 검증".encode("utf-8"), "MAE는 평균 절대오차".encode("utf-8"), b"status-badge na", b"resultToken"):
                 require(marker in result_page, f"generated-result Web marker missing: {marker!r}")
             require(result_page.count(b'role="tab"') == 6 and result_page.count(b'role="tabpanel"') == 6, "measurement workflow is not a six-tab/six-panel interface")
             require(b'value="headphone"' not in result_page, "speaker-bound result offered the Headphone-jack profile")
-            require("Preview FIR 적용 후 합산 실측".encode("utf-8") not in result_page, "standard SISO still asks for a mandatory post-build acoustic sweep")
+            require("Preview FIR 적용 후 합산 실측".encode("utf-8") in result_page and "선택 사항".encode("utf-8") in result_page, "optional post-build acoustic verification is missing or looks mandatory")
+            post_pass_job = copy.deepcopy(browser_job)
+            post_channels = {
+                side: {
+                    "frequency": [20.0, 100.0, 1000.0, 20_000.0],
+                    "measured_sum_db": [0.0, 0.2, -0.1, -3.0],
+                    "predicted_sum_db": [-0.2, 0.0, 0.0, -3.2],
+                    "effective_target_db": [0.0, 0.0, 0.0, 0.0],
+                    "target_mae_db": 1.4,
+                    "target_p90_abs_error_db": 3.1,
+                    "target_pass": True,
+                    "crossover_mae_db": 1.6,
+                    "physical_extension_limit_hz": 20.0,
+                    "prediction_mae_db": 1.3,
+                    "prediction_p90_abs_error_db": 3.0,
+                    "prediction_pass": True,
+                    "crossover_prediction_mae_db": 1.4,
+                }
+                for side in ("left", "right")
+            }
+            post_evaluation = {
+                "channels": post_channels,
+                "overall_pass": True,
+                "inconclusive_low_snr": False,
+                "sweep_seconds": 28,
+                "lr_match": {"median_shape_difference_db": 1.4},
+                "prediction_consistency": {"status": "pass", "pass": True},
+                "snr": {"minimum_db": 14.29, "pass": True, "recommended": False},
+            }
+            post_pass_job["post_filter_validation"] = {
+                "positions_completed": 3,
+                "positions_total": 3,
+                "level_dbfs": -25,
+                "evaluation": post_evaluation,
+            }
+            post_pass_job["result"]["self_validation"]["post_filter_sum"] = post_evaluation
+            post_pass_job["result"]["self_validation"]["crossover_sum"] = {"required": True, "pass": True, "status": "pass_measured"}
+            post_pass_job["result"]["crossover"]["status"] = "pass_measured"
+            post_pass_job["result"]["room_tuning_audit"] = [{
+                "id": "crossover_integration", "label": "메인–우퍼 크로스오버 합산",
+                "classification": "measurement_gate", "status": "pass_premeasured_complex_model",
+                "action": "검증 결과를 확인하세요.",
+            }]
+            (measurements / "current.json").write_text(json.dumps(post_pass_job), encoding="utf-8")
+            post_pass_page = get_bytes(base + "/measure")[0].decode("utf-8")
+            for marker in ("사후 합산 실측 PASS", "사용 PASS · 14.29 dB", "검증을 완료했습니다", "측정 품질", "표시 곡선", "설정 상한과 예상 음압은 다릅니다"):
+                require(marker in post_pass_page, f"post-validation PASS UX marker missing: {marker}")
+            require("pass_measured" not in post_pass_page and "measurement_gate" not in post_pass_page, "developer-only post/audit status leaked into the user UI")
+
+            post_advisory_job = copy.deepcopy(post_pass_job)
+            advisory = post_advisory_job["post_filter_validation"]["evaluation"]
+            advisory.update({"overall_pass": False, "inconclusive_low_snr": True})
+            advisory["prediction_consistency"] = {"status": "inconclusive_low_snr", "pass": False}
+            for values in advisory["channels"].values():
+                values["target_pass"] = False
+                values["prediction_pass"] = False
+            post_advisory_job["result"]["self_validation"]["post_filter_sum"] = advisory
+            post_advisory_job["result"]["self_validation"]["crossover_sum"] = {"required": True, "pass": True, "status": "warning_post_measurement_low_snr"}
+            post_advisory_job["result"]["crossover"]["status"] = "warning_post_measurement_low_snr"
+            (measurements / "current.json").write_text(json.dumps(post_advisory_job), encoding="utf-8")
+            advisory_page = get_bytes(base + "/measure")[0].decode("utf-8")
+            advisory_section = advisory_page.split('class="post-validation-card"', 1)[1].split("</section>", 1)[0]
+            require("판정 보류 · SNR 부족" in advisory_section and 'pill neutral' in advisory_section and 'diagnostic-warning' in advisory_section, "low-SNR post validation is not presented as an advisory")
+            require('pill error' not in advisory_section and 'validation-fail' not in advisory_section, "low-SNR advisory is still styled as a conclusive failure")
+            (measurements / "current.json").write_text(json.dumps(browser_job), encoding="utf-8")
             stale_job = copy.deepcopy(browser_job)
             stale_job["result"].pop("algorithm_revision")
             (measurements / "current.json").write_text(json.dumps(stale_job), encoding="utf-8")
             stale_page, _ = get_bytes(base + "/measure")
-            require("이전 알고리즘으로 계산된 결과".encode("utf-8") in stale_page and "재계산 후 정식 적용 가능".encode("utf-8") in stale_page, "stale-result UI did not block audition/apply")
+            require("이전 알고리즘으로 계산된 결과".encode("utf-8") in stale_page and "4단계에서 FIR 계산만 다시 실행".encode("utf-8") in stale_page and "적용 대기".encode("utf-8") in stale_page, "stale-result UI did not block audition/apply")
             post_form(base + "/measurement/preview", {"profile": "speaker"}, expected=400)
             post_form(base + "/measurement/apply", {"profile": "speaker"}, expected=400)
             failed_job = copy.deepcopy(browser_job)
@@ -915,10 +1020,24 @@ def main() -> int:
             })
             (measurements / "current.json").write_text(json.dumps(failed_job), encoding="utf-8")
             failed_page, _ = get_bytes(base + "/measure")
-            require("타겟/합산 셀프검증 미통과".encode("utf-8") in failed_page and "셀프검증 통과 후 정식 적용 가능".encode("utf-8") in failed_page, "failed target-fit UI did not block permanent apply")
-            for marker in (b"validation-error", b"status-badge fail", b"data-measurement-jump", "해결 방법".encode("utf-8"), "서로 다른 3위치".encode("utf-8"), "Woofer 타겟 달성".encode("utf-8"), "4 · FIR 계산".encode("utf-8"), "3 · 위치 측정".encode("utf-8"), "측정 구성 변경 적용".encode("utf-8"), b"status-badge pass"):
+            require("타겟/합산 셀프검증 미통과".encode("utf-8") in failed_page and "WAV 다운로드와 A/B 확인은 가능하지만 정식 적용은 차단됩니다".encode("utf-8") in failed_page, "failed target-fit UI did not block permanent apply")
+            for marker in (b"validation-error", b"status-badge fail", b"data-measurement-jump", "해결 방법".encode("utf-8"), "서로 다른 3위치".encode("utf-8"), "우퍼 타깃 달성".encode("utf-8"), "4 · FIR 계산".encode("utf-8"), "3 · 위치 측정".encode("utf-8"), "구성 적용".encode("utf-8"), b"status-badge pass"):
                 require(marker in failed_page, f"failed validation guidance marker missing: {marker!r}")
             post_form(base + "/measurement/apply", {"profile": "speaker"}, expected=400)
+            recovery_job = copy.deepcopy(browser_job)
+            recovery_job.update({
+                "state": "error", "error": "saved response processing failed", "result": None,
+                "positions_completed": 0, "positions_total": 1,
+                "sources": ["left", "right", "woofer", "left_woofer", "right_woofer"],
+                "measurements": [],
+            })
+            for source in recovery_job["sources"]:
+                (browser_session / f"p1_{source}_recorded.wav").write_bytes(b"saved raw fixture")
+            (measurements / "current.json").write_text(json.dumps(recovery_job), encoding="utf-8")
+            recovery_page, _ = get_bytes(base + "/measure")
+            for marker in ("녹음 5/5 · 응답 0/5", "원본 재계산", "소리를 재생하지 않습니다."):
+                require(marker.encode("utf-8") in recovery_page, f"saved-recording recovery UI missing: {marker}")
+            (measurements / "current.json").write_text(json.dumps(browser_job), encoding="utf-8")
             directional_failed_job = copy.deepcopy(browser_job)
             directional_failed_job["result"]["self_validation"].update({
                 "overall_pass": False,
@@ -933,7 +1052,7 @@ def main() -> int:
             })
             (measurements / "current.json").write_text(json.dumps(directional_failed_job), encoding="utf-8")
             directional_failed_page, _ = get_bytes(base + "/measure")
-            for marker in ("Target보다 +4.0 dB 높습니다.", "Woofer 최종 trim", "한 단계 더 음수", "설정으로 32768탭 FIR 생성"):
+            for marker in ("타깃보다 +4.0 dB 높습니다.", "우퍼 최종 트림", "한 단계 더 음수", "FIR 계산"):
                 require(marker.encode("utf-8") in directional_failed_page, f"directional target-failure guidance missing: {marker}")
             mimo_failed_job = copy.deepcopy(browser_job)
             mimo_failed_job["mode"] = "mimo_one_sub"
@@ -962,7 +1081,7 @@ def main() -> int:
             })
             (measurements / "current.json").write_text(json.dumps(mimo_failed_job), encoding="utf-8")
             mimo_failed_page, _ = get_bytes(base + "/measure")
-            for marker in ("MIMO 타겟·좌석 편차 비악화", "MIMO 저역 impulse-tail 비악화", "Safe · 높은 안정성", "Balanced · 권장", "MIMO 공동제어 상한", "지원 제어원 제한", "Crossover 주파수", "설정으로 32768탭 FIR 생성"):
+            for marker in ("MIMO 타겟·좌석 편차 비악화", "MIMO 저역 임펄스 꼬리 비악화", "Safe · 높은 안정성", "Balanced · 권장", "MIMO 공동제어 상한", "지원 제어원 제한", "크로스오버 주파수", "FIR 계산"):
                 require(marker.encode("utf-8") in mimo_failed_page, f"MIMO failure guidance marker missing: {marker}")
             post_form(base + "/measurement/apply", {"profile": "speaker"}, expected=400)
             (measurements / "current.json").write_text(json.dumps(browser_job), encoding="utf-8")
@@ -1141,7 +1260,7 @@ def main() -> int:
                     web_uploads += 1
                     require(manager.PROFILE_FILES[profile][band].read_bytes() == before_stage[band], "staged upload changed a managed FIR")
                 settings_page, _ = get_bytes(base + "/settings")
-                for marker in ("적용 대기 중", "기존 / 업로드 FIR 응답 비교", "업로드값 테스트", "검토 완료 · 정식 적용"):
+                for marker in ("적용 대기 중", "기존 / 업로드 FIR 응답 비교", "업로드값 테스트", "4 · 확인 후 정식 적용"):
                     require(marker.encode("utf-8") in settings_page, f"staged-upload marker missing: {marker}")
                 require(b"stage-workflow" in settings_page and f"stage-graph-{profile}".encode() in settings_page, "staged workflow/graph missing")
                 candidate_front, _ = get_bytes(base + f"/api/staging/{profile}/candidate/front")
@@ -1277,6 +1396,7 @@ def main() -> int:
                 "latest_rollback_download": True,
                 "session_resume_note_delete": True,
                 "mimo_failure_menu_guidance": True,
+                "post_validation_status_ux": True,
             }
         finally:
             server.terminate()

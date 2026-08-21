@@ -26,6 +26,7 @@ test -f "$PAYLOAD_DIR/audiodsp-profile-manager.py"
 test -f "$PAYLOAD_DIR/audiodsp-profile-web.py"
 test -f "$PAYLOAD_DIR/audiodsp-web.service"
 test -f "$PAYLOAD_DIR/audiodsp-measurement.py"
+test -f "$PAYLOAD_DIR/audiodsp-import-session.py"
 test -f "$PAYLOAD_DIR/audiodsp-mimo.py"
 test -f "$PAYLOAD_DIR/7200660.txt"
 test -f "$PAYLOAD_DIR/7200660_90deg.txt"
@@ -116,6 +117,7 @@ install -m 0755 "$PAYLOAD_DIR/audiodsp-output-profile" /usr/local/bin/audiodsp-o
 install -m 0755 "$PAYLOAD_DIR/audiodsp-profile-manager.py" /usr/local/bin/audiodsp-profile-manager.py
 install -m 0755 "$PAYLOAD_DIR/audiodsp-profile-web.py" /usr/local/bin/audiodsp-profile-web.py
 install -m 0755 "$PAYLOAD_DIR/audiodsp-measurement.py" /usr/local/bin/audiodsp-measurement.py
+install -m 0755 "$PAYLOAD_DIR/audiodsp-import-session.py" /usr/local/bin/audiodsp-import-session.py
 install -m 0755 "$PAYLOAD_DIR/audiodsp-mimo.py" /usr/local/bin/audiodsp-mimo.py
 install -m 0755 "$PAYLOAD_DIR/audiodsp-profile-monitor.py" /usr/local/bin/audiodsp-profile-monitor.py
 install -m 0755 "$PAYLOAD_DIR/audiodsp-dsp-ready" /usr/local/bin/audiodsp-dsp-ready
@@ -145,6 +147,12 @@ install -m 0644 "$PAYLOAD_DIR/audiodsp-ready.service" /etc/systemd/system/audiod
 /usr/local/bin/audiodsp-profile-manager.py activate speaker --no-restart >/var/log/audiodsp-profile-initial.json
 /usr/local/bin/audiodsp-profile-manager.py set-chunksize 1024 --no-restart >/var/log/audiodsp-chunksize-initial.json
 /usr/local/bin/audiodsp-measurement.py self-test >/var/log/audiodsp-measurement-selftest.json
+
+SESSION_MIGRATION="$BOOT_ROOT/audiodsp-session-migration.tar.gz"
+if [ -f "$SESSION_MIGRATION" ]; then
+    /usr/local/bin/audiodsp-import-session.py "$SESSION_MIGRATION" >/var/log/audiodsp-session-migration.json
+    rm -f "$SESSION_MIGRATION"
+fi
 
 /usr/local/bin/camilladsp --version
 systemctl daemon-reload
@@ -199,6 +207,11 @@ rm -f "$PAYLOAD_DIR/audiodsp-network-apply"
     echo 'profile_web_ui=http_port_8080'
     echo 'u7_output_db=-10'
     echo 'chunksize_default=1024,web_adjustable=512|1024|2048|4096'
+    if [ -f /var/lib/audiodsp/session-migration.json ]; then
+        echo 'session_migration=success'
+    else
+        echo 'session_migration=none'
+    fi
 } > "$BOOT_ROOT/audiodsp-firstboot-success.txt"
 
 rm -f /boot/firstrun.sh /boot/firmware/firstrun.sh

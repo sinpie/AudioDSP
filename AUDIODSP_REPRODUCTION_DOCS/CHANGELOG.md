@@ -1,5 +1,47 @@
 # 변경 이력
 
+## 2026-08-21 · 공통 레벨 기준·광대역 roll-off·Walsh 위상
+
+- L/R 각각과 Woofer를 따로 0 dB로 맞추지 않고 L/R 500~2,000 Hz median으로 하나의 측정·타깃 기준을 만든 뒤 L/R/Woofer 전체 결과와 판정에 동일 적용
+- 완성된 4채널 FIR bank의 최대 전달값으로 common gain 한 번만 적용하고, branch별 적용 전/후 peak와 상대레벨 보존 오차를 영구 metadata 및 자동 core check로 추가
+- `최대 룸 부스트`를 실제 동작에 맞는 `최대 상대 보상`으로 바꾸고 0/3/6/9/10 dB, 기본 10 dB를 제공; 가장 큰 신뢰 보상을 0 dB로 두고 전체 bank를 같은 값만큼 감쇄해 양의 FIR 이득과 preamp를 만들지 않음
+- 양쪽 Front에 공통인 완만한 10–20 kHz roll-off는 edge SNR을 두 번 곱하지 않고 선택한 상대 보상 상한을 실제 ceiling으로 사용; 저장 실측 session에서 15 kHz는 L −0.51/R +0.01 dB까지 개선되고 20 kHz 잔여 L −3.38/R −4.54 dB는 10 dB 상한 한계로 명시
+- 결과 UI와 보고 데이터에 전체 bank 공통 감쇄(`상대 보상의 음량 비용`)와 15–20 kHz 잔여 오차를 추가해, 더 평탄한 응답과 전체 재생 레벨 손실의 trade-off를 숨기지 않음
+- 사후 FIR 검증이 L/R을 각각 0 dB로 재정규화하고 계산 예상과 직접 비교하지 않던 오류를 수정; 측정/예상 각각 하나의 공통 L/R 기준, 전체·crossover 예상↔실측 MAE/P90과 20 Hz~20 kHz 세 곡선 비교를 추가
+- Pi5 실제 v21 사후 검증에서 전체 Flat target과 예상 일치는 PASS였으나 낮은 SNR의 L 50~200 Hz만 경계 초과함을 분리 확인; FIR 공통 감쇄 뒤 실제 검증음이 낮아지는 점을 UI에 명시하고 28초 ESS/-25 dBFS 재검증과 `inconclusive_low_snr` 상태를 추가
+- 같은 Pi5/마이크 위치에서 -25 dBFS·28초 ESS 재검증을 실행해 최소 SNR 14.29 dB, 전체 예상↔실측 MAE/P90 L 1.373/3.000 dB·R 1.494/3.049 dB와 50~200 Hz L 1.389/2.660 dB·R 1.569/3.400 dB로 target/crossover/prediction 전체 PASS 확인; 기존 정식 FIR SHA와 입력·볼륨 복원 확인
+- `검증 초기화`가 사후 상태가 덮어쓴 `fail_measured`를 모델 판정으로 재사용하던 오류를 component check 기반 복원으로 수정하고 session/report/UI를 함께 갱신; 사후 PASS·SNR 권장 미달·audit 분류를 사용자 용어로 통일하고 완료 후 재실행 순서를 바로 표시
+- 오래 열린/부분 폼이 `max_cut_db`를 누락해 400을 내던 문제를 마지막 저장 설정 fallback으로 수정하고, 작업 완료 후 POST 경로를 GET해 404가 되던 자동 갱신을 항상 `/measure`로 복귀하도록 수정
+- 양쪽 Front에서 공통으로 나타나는 2~20 kHz 광대역 감쇄만 제한적으로 보상하고, 한 채널의 좁은 deep/null은 양쪽 ±1/6 octave 형상과 공간 신뢰도로 억제해 최대 3 dB를 넘지 않도록 수정
+- 새 결과의 자동 검증에 `하나의 L/R/우퍼 레벨 기준`, `완성 bank common gain`, `branch 상대레벨 보존`, `최대 상대 보상`, `좁은 null boost 보호`를 추가하고 UI 오류 안내를 `4 · FIR 계산`의 실제 메뉴명과 조치 순서로 통일
+- L/R/W를 한 녹음에서 같은 주파수로 분리하는 4상태 Walsh 기준을 추가하고 각 상태의 시작·끝 guard를 제외한 4회 반복만 평균; 별도 ESS clock drift를 거리로 쓰지 않으면서 L/R/W 상대위상·극성·지연과 L+W/R+W cross-term을 결합
+- MIMO 비교 기준이 Front-only였던 오류를 찾아, 실제 배포되는 LR4 Front+sub SISO 경로를 baseline으로 사용하도록 수정; 한 우퍼 해의 안전 blend도 보수적으로 제한
+- 무음 회귀에서 target/preset 18조합, SISO 설정 95시나리오, MIMO 19시나리오, 4096 Web/Profile 상태, Pi5 FFTW·8-path Camilla parser·5.1 dual-sub 42경로 메모리 계획을 검증
+
+## 2026-08-20 · 빠른 ESS·독립-clock 합산 안전성·UI 반응성
+
+- 모든 빠른 검사·본 측정·합산·사후 검증 sweep의 dBFS를 평상시 U7 볼륨과 독립된 DAC 기준으로 변경; 입력 OFF 후 PCM 0 dB read-back, sweep 프로세스 종료 후 원래 볼륨 read-back, 그 뒤에만 입력 복귀
+- 측정 오디오 lock과 profile manager mutation을 연결해 sweep 중 Web/API 볼륨·프로필·DSP 변경을 거부하고, 볼륨 복원 실패 시 입력을 계속 차단하는 fail-closed 회귀시험 추가
+- 백색소음 UI와 독립 레벨 값을 제거하고 현재 측정 구성의 모든 출력을 본 측정과 같은 ESS·라우팅·유효대역 SNR 계산으로 각 2초 검사하도록 통일
+- 빠른 검사와 본 측정의 사용 가능 하한을 모두 6 dB로 통일하고 6–15 dB는 적용 가능한 권장 경고, 15 dB 이상은 권장 PASS로 분리; 입력 peak -6 dBFS 여유 안에서 올릴 수 있는 정확한 dBFS를 안내
+- 저장된 원본 5종 녹음 재계산과 응답 계산 batch 경로를 추가하고 우퍼의 무음 고역이 전체 SNR을 낮추지 않도록 지속 -3 dB 통과대역만 평가
+- 빠른 2초 ESS와 긴 본 스윕의 판정 물리량을 일치시키고, 본 스윕에는 2초 기준 matched-filter coherent integration 이득을 반영; 14초는 +8.451 dB이며 원신호/적분/유효 SNR을 UI에 분리 표시
+- 좁은 T5S 통과대역의 유효 chirp가 약 0.16초뿐인 실측을 반영해 Woofer 최소 검출 구간을 50 ms로 조정하고, 프런트 timing은 예상 ALSA 범위 안의 고정 1초 중역 signature FFT correlation으로 transient 오검출을 차단
+- 저장된 빠른/본 스윕을 소리 없이 다시 판정하는 경로, worker 권한 안전 상태 확인, source 전환 시 stale 품질 카드 제거를 추가
+- U7 재생과 UMIK-1 캡처가 기본적으로 하드웨어 clock을 공유하지 않는 점을 반영해 서로 다른 sweep의 절대 복소 위상·상대 delay를 사용하지 않도록 수정
+- 독립-clock SISO는 위상 비의존 에너지 타깃 MAE/P90과 최악 동상 `|Front|+|Woofer|` 감쇄 전용 상한을 모두 통과해야 적용 가능; clock drift가 만든 약 150 Hz 가짜 복소 딥은 그래프·딥 진단에서 제외
+- 정밀 L/R/우퍼/L+우퍼/R+우퍼 측정은 독립 정규화 없이 절대 전달 크기 closure를 FIR 전에 검증하고, 위상 제한은 FAIL이 아닌 명시적 권장 경고로 분리
+- Pi4/5 MIMO 계산 능력과 측정 위상 유효성을 분리하고, 검증된 공통 timing reference가 없으면 production MIMO 생성·활성화를 차단; 합성 MIMO 회귀는 shared-clock fixture로만 실행
+- FIR 완료·위치 완료·오류·결과 SHA 변경을 `result_token`으로 감지해 측정 화면을 한 번만 즉시 갱신하고 1초 전체 새로고침을 제거
+- 결과 그래프 기본 범위를 20 Hz–20 kHz로 복원하고 20–250 Hz 저역 확대를 별도 버튼으로 제공; 합산 실측은 5단계의 선택 검증으로 노출하되 정식 적용 필수 조건으로 만들지 않음
+- 우퍼 독립 LPF branch를 전체 타깃과 비교하던 false FAIL을 N/A로 고정하고 최종 L+우퍼/R+우퍼 합산만 타깃 판정; `fail_target`은 실제 합산 signed median 방향과 메뉴의 트림·억제·크로스오버 조치를 안내
+- 자동 검증의 PASS/FAIL/권장/대기/해당 없음, MAE/P90 설명, 1–6단계 바로가기, 오류 빨간색, 스텝 탭, 세션 주석·이어하기·삭제를 한 화면 흐름으로 정리
+- 합성 측정 엔진 PASS, 6 target×3 preset 및 94개 SISO 옵션 PASS, shared-clock MIMO 19개 수치 시나리오 PASS, 5.1+dual-sub 42경로 메모리 계획 530 MiB와 실제 배열 peak 138.64 MiB PASS
+- Pi2 실제 Fast 1위치 5경로 수락 시험에서 -29 dBFS 빠른 SNR 7.12/8.80/7.67/14.32/12.30 dB와 14초 유효 SNR 11.45/7.42/25.98/20.93/24.45 dB PASS; Flat/없음/0 dB/100 Hz와 Harman/없음/0 dB/120 Hz FIR PASS, 정식 FIR SHA 불변
+- 비유한 Python `Infinity`/`NaN` 때문에 브라우저가 측정 status 전체를 폐기해 결과 그래프가 비던 문제를 수정하고, 모든 API JSON을 RFC 호환 `null`로 강제; Pi2 실제 브라우저에서 20 Hz–20 kHz SVG graph 갱신 확인
+- 현재 session 한 개만 size/SHA-256 manifest와 함께 export/import하는 Pi4/5 migration 경로를 추가하고 경로 traversal·symlink·중복 ID·불완전 archive를 차단
+- Pi4/5 writer가 Windows 저장 WLAN profile을 key 비노출 상태로 읽는 옵션과 migration archive의 기록 후 hash 검증을 지원
+
 ## 2026-08-19 · 구조·보정·Pi 5 2 GB 검증
 
 - 공통 runtime/assets/tests를 `source/common` 한 사본으로 통합하고 Pi2/3/4/5 overlay manifest와 deterministic `build/<platform>` materializer를 추가; release의 중복 payload/docs/tests/legacy tree 제거
@@ -9,7 +51,7 @@
 - magnitude/phase/crossover 각 단계의 채널별 peak 정규화가 Front/Woofer 상대레벨과 LR4 합산을 바꾸던 문제를 제거하고 전체 FIR bank에 공통 normalization 한 번만 적용
 - 측정 출력 dBFS와 임시 Woofer 감쇄가 전달함수 크기를 바꾸지 않는 scale-relative regularized deconvolution 회귀 추가
 - 권장 정밀 측정 `L/R/W/L+W/R+W`를 추가해 FIR 계산 전에 절대 복소합 closure를 검증하고, L+W/R+W를 보정·평균·독립 normalize하지 않도록 고정; 통과 시 사후 sweep 제거
-- 표준 L/R/W와 MIMO도 동일 capture/playback clock의 절대 복소 전달함수 PASS를 적용 게이트로 사용해 FIR 생성 뒤 필수 재측정을 제거하고, 적용 후 acoustic sweep은 선택 audit로 분리
+- 표준 L/R/W와 MIMO의 복소 전달함수 적용 게이트를 도입했으며, 2026-08-20에 U7+UMIK 독립-clock 현실을 반영해 SISO 안전 상한과 MIMO 공통 timing reference 조건으로 보강
 - 실제 FIR 사후 L+Woofer/R+Woofer 합산, Fast 1위치 N/A semantics, Standard 3위치 안정성, 18 target/preset 조합과 94개 SISO UI 옵션 시나리오를 실제 32768탭 무음 합성 fixture로 검증
 - phase 신뢰 시 crossover guard를 이론적 `|Front|+|Woofer|` 상한이 아니라 세 위치 실제 복소합 최대값으로 변경하고, 저역 극성 ±/상대 지연 robust 탐색 추가; phase 불신뢰 때만 보수적 상한 fallback
 - MIMO가 미정규화 SISO 중간값과 headroom 제한 후 bank를 비교해 false FAIL을 만들던 오류를 수정; deployable SISO bank 공통 정규화, 한 reference-band target-shape 평가, 실제 global 감쇄 분리 보고 추가
