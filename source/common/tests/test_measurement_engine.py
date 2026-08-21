@@ -936,6 +936,59 @@ def main() -> int:
         require(advisory_evaluation["inconclusive_low_snr"] and not advisory_evaluation["application_blocking"] and not advisory_evaluation["overall_pass"], "marginal low-SNR post-FIR mismatch was mislabeled PASS or conclusive FAIL")
         for (position, side), content in advisory_original.items():
             (session / f"post_p{position}_{side}_sum_response.json").write_bytes(content)
+
+        # Resetting a post-FIR failure must restore the premeasurement model
+        # verdict.  The old implementation read the overwritten fail_measured
+        # status back into the UI and left report.json stale after Reset.
+        reset_state = json.loads(json.dumps(phase_state))
+        reset_result = reset_state["result"]
+        original_front_sha = reset_result["front_sha256"]
+        original_rear_sha = reset_result["rear_sha256"]
+        reset_result["self_validation"]["post_filter_sum"] = advisory_evaluation
+        reset_result["self_validation"]["crossover_sum"] = {
+            "required": True,
+            "pass": False,
+            "status": "fail_measured",
+            "premeasurement_status": "pass_premeasured_complex_model",
+        }
+        reset_result["self_validation"]["overall_pass"] = False
+        reset_result["crossover"]["post_filter_measurement"] = advisory_evaluation
+        reset_result["crossover"]["status"] = "fail_measured"
+        reset_result["crossover"]["overall_acoustic_prediction_pass"] = False
+        reset_state["post_filter_validation"] = {"evaluation": advisory_evaluation}
+        engine.save_current(reset_state)
+        reset_result_state = engine.reset_post_filter_validation()
+        reset_validation = reset_result_state["result"]["self_validation"]
+        reset_crossover = reset_result_state["result"]["crossover"]
+        require(reset_result_state["post_filter_validation"] is None, "post-FIR Reset retained the old measurement state")
+        require("post_filter_sum" not in reset_validation and "post_filter_measurement" not in reset_crossover, "post-FIR Reset retained stale measured diagnostics")
+        require(reset_validation["overall_pass"] and reset_validation["crossover_sum"]["pass"], "post-FIR Reset did not restore the passing premeasurement model")
+        require(reset_validation["crossover_sum"]["status"] == "pass_independent_complex_model", "post-FIR Reset restored the wrong independent-model validation status")
+        require(reset_validation["crossover_sum"]["prediction_status"] == "pass" and reset_crossover["status"] == "pass", "post-FIR Reset retained fail_measured in model status")
+        require(reset_crossover["overall_acoustic_prediction_pass"] is True, "post-FIR Reset did not restore the model acoustic pass")
+        require(reset_result_state["result"]["front_sha256"] == original_front_sha and reset_result_state["result"]["rear_sha256"] == original_rear_sha, "post-FIR Reset changed generated FIR artifacts")
+        persisted_report = json.loads((session / reset_result_state["result"]["report_json"]).read_text(encoding="utf-8"))
+        require(persisted_report["crossover"]["status"] == "pass" and "post_filter_measurement" not in persisted_report["crossover"], "post-FIR Reset left report JSON stale")
+
+        precise_reset_state = json.loads(json.dumps(precise_built))
+        precise_reset_result = precise_reset_state["result"]
+        precise_reset_result["self_validation"]["post_filter_sum"] = advisory_evaluation
+        precise_reset_result["self_validation"]["crossover_sum"] = {
+            "required": True,
+            "pass": False,
+            "status": "fail_measured",
+            "premeasurement_status": "pass_premeasured_complex_model",
+        }
+        precise_reset_result["self_validation"]["overall_pass"] = False
+        precise_reset_result["crossover"]["post_filter_measurement"] = advisory_evaluation
+        precise_reset_result["crossover"]["status"] = "fail_measured"
+        precise_reset_result["crossover"]["overall_acoustic_prediction_pass"] = False
+        precise_reset_state["post_filter_validation"] = {"evaluation": advisory_evaluation}
+        engine.save_current(precise_reset_state)
+        precise_reset = engine.reset_post_filter_validation()
+        require(precise_reset["result"]["self_validation"]["crossover_sum"]["status"] == "pass_premeasured_complex_model", "post-FIR Reset did not restore the six-capture model status")
+        require(precise_reset["result"]["self_validation"]["crossover_sum"]["prediction_status"] == "pass" and precise_reset["result"]["crossover"]["status"] == "pass", "six-capture Reset retained fail_measured")
+        engine.save_current(phase_state)
         phase_seconds = round(time.monotonic() - started, 3)
 
         # A deliberately over-attenuated woofer preference can no longer be

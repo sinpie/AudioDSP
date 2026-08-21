@@ -190,13 +190,15 @@ Invoke-RestMethod -Uri 'http://<PI-IP>:8080/api/volume' -Method Put -ContentType
 - maximum transfer ≤ 0 dB
 - 개별 sweep 유효 SNR ≥ 6 dB(15 dB 이상 권장), 긴 ESS는 원신호 SNR과 2초 기준 coherent integration 이득을 별도 기록, octave T20 신뢰도 확인
 - `self_validation.overall_pass=true`, target-fit MAE/P90와 actual FIR FFT 확인
-- 선택형 Preview 사후 검증은 실측 L/R을 개별 normalize하지 않고 하나의 공통 기준을 사용하며, target뿐 아니라 계산 예상과의 전체/crossover MAE·P90을 판정한다. SNR 6~15 dB의 경계 초과는 PASS가 아니라 재검증 권장이고, SNR 15 dB 이상 또는 큰 오차에서만 확정 PASS/FAIL로 수락한다.
+- 선택형 Preview 사후 검증은 실측 L/R을 개별 normalize하지 않고 하나의 공통 기준을 사용하며, target뿐 아니라 계산 예상과의 전체/crossover MAE·P90을 판정한다. SNR 6~15 dB에서도 모든 엄격 오차 기준을 만족하면 `PASS · 권장 미달`로 수락한다. 이 구간에서 기준을 근소하게 넘으면 확정 FAIL 대신 재검증을 권장하고, 6 dB 미만 또는 큰 오차만 즉시 차단한다.
 - preview에서 기존/이번 전환, apply 전 profile hash 불변
 - apply 후 backup 생성 및 새 hash 반영
 - restore 기존 튜닝 정상
 - MIMO이면 공통 timing reference 확인 후 네 WAV/manifest/report, 8 convolution, coherence/headroom과 `pass_multichannel_complex_model`을 확인한다. reference가 없으면 생성·활성화가 차단되어야 한다.
 
 2026-08-21 Pi5 Fast 세션의 v21 실제 Preview 검증(-30 dBFS FIR 입력, 14초)은 원래 profile을 자동 복원한 상태에서 다음을 확인했다. FIR 공통 감쇄 약 10 dB 때문에 사후 SNR은 L/R 9.42/7.20 dB로 내려갔다. 전체 Flat target은 L MAE/P90 1.968/4.516 dB, R 1.562/3.265 dB로 PASS했고 예상↔실측도 L 2.058/4.666 dB, R 1.638/3.467 dB였다. 단 L 50~200 Hz 예상 P90 6.170 dB와 target P90 5.482 dB가 5 dB 기준을 근소하게 넘었으므로 낮은 SNR 재검증 대상으로 분류한다. 10/15/20 kHz 실측은 L -0.36/-0.19/-2.23 dB, R -2.14/-0.54/-0.80 dB였다.
+
+같은 위치에서 -25 dBFS FIR 입력과 자동 28초 ESS로 한 번만 재검증한 결과 최소 SNR 14.29 dB에서 전체 PASS했다. 전체 target MAE/P90은 L 1.434/3.102 dB, R 1.475/2.765 dB, 예상↔실측은 L 1.373/3.000 dB, R 1.494/3.049 dB였다. 50~200 Hz target은 L 1.600/3.384 dB, R 1.798/3.367 dB, 예상↔실측은 L 1.389/2.660 dB, R 1.569/3.400 dB였다. 즉 첫 검증의 저역 경계 초과는 낮은 SNR의 변동이었으며, v21 예측과 실제 합산이 크게 다른 현상은 재현되지 않았다. 종료 후 입력과 117/127 U7 볼륨을 복원하고 기존 Speaker FIR SHA-256 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`로 복귀했다.
 
 ## 8. 장시간 성능
 

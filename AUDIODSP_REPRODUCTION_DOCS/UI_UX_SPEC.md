@@ -52,6 +52,8 @@
 - 체크리스트 바로 위에서 MAE를 판정 대역 평균 절대오차, P90을 주파수 지점 90%가 그 값 이내인 오차로 설명한다. 합산 FAIL은 signed median error를 사용해 Target보다 높은지/낮은지와 dB를 밝히고, `Woofer 최종 trim`, `우퍼 과잉 억제`, `Phase 방식`, `Crossover 주파수`의 실제 표시명으로 변경 방향을 안내한다.
 - 결과 카드는 `pass`, `pass_safe_upper_phase_limited`, `pass_safe_sum_phase_limited`, `fail_target`, `fail_upper_guard`를 구분하고, 위상 제한 PASS를 정확한 복소 위상 검증으로 표현하지 않는다.
 - 선택형 사후 검증 뒤 결과 그래프는 20 Hz~20 kHz의 실제 FIR 통과 실측, 계산 예상, 선택 target을 동시에 표시한다. 실측/예상 L/R은 각각 하나의 공통 기준만 사용한다. SNR 6~15 dB에서 경계값을 조금 넘으면 빨간 FAIL 대신 `판정 보류 · SNR 부족`과 실제 메뉴 `검증 초기화`, `검증 sweep 입력 -25 dBFS`를 표시한다. FIR 입력값과 공통 FIR 감쇄 뒤 실제 출력이 다를 수 있음을 control 바로 아래에서 설명한다.
+- 사후 검증 PASS 뒤에는 내부 코드 `pass_measured` 대신 `사후 합산 실측 PASS`, SNR 6~15 dB는 `사용 PASS · 권장 미달`로 표시한다. 완료된 카드에서는 더 이상 Preview 선행을 요구하지 않고 `검증 초기화 → 이번 튜닝` 재실행 순서를 안내한다. 보정 가능성 표의 개발자용 classification/status 코드는 한국어 사용자 용어로 바꾸고, 차트의 범위와 표시 곡선을 SVG 접근성 설명에도 반영한다.
+- 결과의 `최대 상대 보상`과 `최대 룸 감쇄`는 목표 음압이 아니라 FIR 계산의 상한임을 결과 카드 바로 아래에 설명한다. 실제 예상 곡선은 딥 보호·crossover·전체 공통 gain까지 반영한 값이며, 사후 결과는 예상↔실측 MAE/P90으로 비교한다.
 - Pi4/5는 SISO와 MIMO Stereo/2.1/2.2를 구분하되 공통 timing reference가 없으면 MIMO 차단 이유를 표시한다. Pi2는 조건과 무관하게 선택할 수 없다.
 - MIMO 결과는 타깃 MAE, 좌석 편차, 평활 전달함수 기반 impulse-tail proxy, 기존 SISO 저역 레벨 기준 offset, 해 혼합 강도, 제어원 coherence, crossover, 실제 output별 headroom과 전체 보정 가능성 분류표를 보인다. impulse-tail proxy는 RT60/잔향 예측이 아니며 1.5 dB 초과 악화 시 적용을 차단한다.
 - 다운로드와 A/B는 비파괴라고 명시하고, 정식 적용 버튼만 덮어쓰기 경고를 낸다.

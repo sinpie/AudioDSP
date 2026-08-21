@@ -136,7 +136,7 @@ Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니�
 
 브라우저 다운로드와 그래프 확인은 playback을 바꾸지 않는다. Preview는 runtime config만 임시 교체하며 profile WAV/settings는 그대로다. Apply에서 기존 파일을 백업한 뒤 정식 WAV를 교체한다.
 
-선택형 사후 검증은 실제 Preview FIR을 통과한 L+Woofer/R+Woofer를 다시 측정한다. 실측과 계산 예상은 각각 L/R을 합친 500~2,000 Hz 기준 한 번만 적용하며 좌우를 따로 0 dB로 맞추지 않는다. 전체 target MAE/P90, 50~200 Hz crossover MAE/P90뿐 아니라 **계산 예상↔실측** MAE/P90도 별도 저장한다. 신뢰 가능한 복소 합산 모델의 예상 오차는 PASS gate에 포함한다. 6~15 dB의 낮은 SNR에서 기준을 근소하게 넘은 결과는 확정 FAIL이 아니라 `inconclusive_low_snr`로 표시하고, 큰 오차만 즉시 차단한다. 사후 sweep은 FIR 입력 기준이며 현재 bank의 공통 감쇄 뒤 실제 출력은 더 작아질 수 있으므로 28초 ESS와 -25 dBFS 재검증을 안내한다.
+선택형 사후 검증은 실제 Preview FIR을 통과한 L+Woofer/R+Woofer를 다시 측정한다. 실측과 계산 예상은 각각 L/R을 합친 500~2,000 Hz 기준 한 번만 적용하며 좌우를 따로 0 dB로 맞추지 않는다. 전체 target MAE/P90, 50~200 Hz crossover MAE/P90뿐 아니라 **계산 예상↔실측** MAE/P90도 별도 저장한다. 신뢰 가능한 복소 합산 모델의 예상 오차는 PASS gate에 포함한다. SNR 6~15 dB에서도 모든 엄격 오차 기준을 만족하면 품질 권고를 남기고 PASS한다. 이 구간에서 기준을 근소하게 넘은 결과는 확정 FAIL이 아니라 `inconclusive_low_snr`로 표시하고, 큰 오차만 즉시 차단한다. 사후 sweep은 FIR 입력 기준이며 현재 bank의 공통 감쇄 뒤 실제 출력은 더 작아질 수 있으므로 28초 ESS와 -25 dBFS 재검증을 안내한다. `검증 초기화`는 사후 실측 상태만 지우고, component check에서 원래 합산 모델 판정·보고서·UI 상태를 다시 구성하므로 이전 `fail_measured` 문자열이 남지 않는다.
 
 현황/설정에서 표시하는 FIR FFT는 목표 음압 자체가 아니라 측정 응답에 곱하는 보정 전달함수다. 따라서 Harman target의 저역 상승·고역 하강과 같은 모양일 필요가 없다. 목표 달성 여부는 측정·보정 결과의 `effective_target_db`와 실제 FIR FFT 기반 `predicted_db`, 그리고 crossover 사용 시 Front+Woofer 합산 검증으로 판단한다.
 

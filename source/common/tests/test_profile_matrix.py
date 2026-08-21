@@ -939,6 +939,70 @@ def main() -> int:
             require(result_page.count(b'role="tab"') == 6 and result_page.count(b'role="tabpanel"') == 6, "measurement workflow is not a six-tab/six-panel interface")
             require(b'value="headphone"' not in result_page, "speaker-bound result offered the Headphone-jack profile")
             require("Preview FIR 적용 후 합산 실측".encode("utf-8") in result_page and "선택 사항".encode("utf-8") in result_page, "optional post-build acoustic verification is missing or looks mandatory")
+            post_pass_job = copy.deepcopy(browser_job)
+            post_channels = {
+                side: {
+                    "frequency": [20.0, 100.0, 1000.0, 20_000.0],
+                    "measured_sum_db": [0.0, 0.2, -0.1, -3.0],
+                    "predicted_sum_db": [-0.2, 0.0, 0.0, -3.2],
+                    "effective_target_db": [0.0, 0.0, 0.0, 0.0],
+                    "target_mae_db": 1.4,
+                    "target_p90_abs_error_db": 3.1,
+                    "target_pass": True,
+                    "crossover_mae_db": 1.6,
+                    "physical_extension_limit_hz": 20.0,
+                    "prediction_mae_db": 1.3,
+                    "prediction_p90_abs_error_db": 3.0,
+                    "prediction_pass": True,
+                    "crossover_prediction_mae_db": 1.4,
+                }
+                for side in ("left", "right")
+            }
+            post_evaluation = {
+                "channels": post_channels,
+                "overall_pass": True,
+                "inconclusive_low_snr": False,
+                "sweep_seconds": 28,
+                "lr_match": {"median_shape_difference_db": 1.4},
+                "prediction_consistency": {"status": "pass", "pass": True},
+                "snr": {"minimum_db": 14.29, "pass": True, "recommended": False},
+            }
+            post_pass_job["post_filter_validation"] = {
+                "positions_completed": 3,
+                "positions_total": 3,
+                "level_dbfs": -25,
+                "evaluation": post_evaluation,
+            }
+            post_pass_job["result"]["self_validation"]["post_filter_sum"] = post_evaluation
+            post_pass_job["result"]["self_validation"]["crossover_sum"] = {"required": True, "pass": True, "status": "pass_measured"}
+            post_pass_job["result"]["crossover"]["status"] = "pass_measured"
+            post_pass_job["result"]["room_tuning_audit"] = [{
+                "id": "crossover_integration", "label": "메인–우퍼 크로스오버 합산",
+                "classification": "measurement_gate", "status": "pass_premeasured_complex_model",
+                "action": "검증 결과를 확인하세요.",
+            }]
+            (measurements / "current.json").write_text(json.dumps(post_pass_job), encoding="utf-8")
+            post_pass_page = get_bytes(base + "/measure")[0].decode("utf-8")
+            for marker in ("사후 합산 실측 PASS", "사용 PASS · 14.29 dB", "검증을 완료했습니다", "측정 품질", "표시 곡선", "설정 상한과 예상 음압은 다릅니다"):
+                require(marker in post_pass_page, f"post-validation PASS UX marker missing: {marker}")
+            require("pass_measured" not in post_pass_page and "measurement_gate" not in post_pass_page, "developer-only post/audit status leaked into the user UI")
+
+            post_advisory_job = copy.deepcopy(post_pass_job)
+            advisory = post_advisory_job["post_filter_validation"]["evaluation"]
+            advisory.update({"overall_pass": False, "inconclusive_low_snr": True})
+            advisory["prediction_consistency"] = {"status": "inconclusive_low_snr", "pass": False}
+            for values in advisory["channels"].values():
+                values["target_pass"] = False
+                values["prediction_pass"] = False
+            post_advisory_job["result"]["self_validation"]["post_filter_sum"] = advisory
+            post_advisory_job["result"]["self_validation"]["crossover_sum"] = {"required": True, "pass": True, "status": "warning_post_measurement_low_snr"}
+            post_advisory_job["result"]["crossover"]["status"] = "warning_post_measurement_low_snr"
+            (measurements / "current.json").write_text(json.dumps(post_advisory_job), encoding="utf-8")
+            advisory_page = get_bytes(base + "/measure")[0].decode("utf-8")
+            advisory_section = advisory_page.split('class="post-validation-card"', 1)[1].split("</section>", 1)[0]
+            require("판정 보류 · SNR 부족" in advisory_section and 'pill neutral' in advisory_section and 'diagnostic-warning' in advisory_section, "low-SNR post validation is not presented as an advisory")
+            require('pill error' not in advisory_section and 'validation-fail' not in advisory_section, "low-SNR advisory is still styled as a conclusive failure")
+            (measurements / "current.json").write_text(json.dumps(browser_job), encoding="utf-8")
             stale_job = copy.deepcopy(browser_job)
             stale_job["result"].pop("algorithm_revision")
             (measurements / "current.json").write_text(json.dumps(stale_job), encoding="utf-8")
@@ -1332,6 +1396,7 @@ def main() -> int:
                 "latest_rollback_download": True,
                 "session_resume_note_delete": True,
                 "mimo_failure_menu_guidance": True,
+                "post_validation_status_ux": True,
             }
         finally:
             server.terminate()

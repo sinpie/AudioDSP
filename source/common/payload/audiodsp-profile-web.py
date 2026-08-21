@@ -53,6 +53,44 @@ U7_MIXER = environment("U7_MIXER", "hw:U7")
 BACKUP_SCHEMA_VERSION = 2
 QUICK_SWEEP_PASS_SNR_DB = 6.0
 MEASUREMENT_RECOMMENDED_SNR_DB = 15.0
+CROSSOVER_STATUS_LABELS = {
+    "pass_measured": "사후 합산 실측 PASS",
+    "warning_post_measurement_low_snr": "사후 합산 판정 보류 · SNR 부족",
+    "fail_measured": "사후 합산 실측 FAIL",
+    "fail_premeasured_sum_snr": "정밀 합산 측정 SNR 부족",
+    "fail_premeasured_sum_phase_reference": "시간·위상 기준 부족",
+    "fail_premeasured_complex_sum": "실측 합산 오차 초과",
+    "limited_unverified_phase": "위상 미검증",
+    "pass_safe_upper_phase_limited": "합산 안전성 PASS · 위상 정밀도 제한",
+    "pass_safe_sum_phase_limited": "정밀 합산 안전성 PASS · 위상 정밀도 제한",
+    "pass_premeasured_complex_sum": "정밀 합산 검증 PASS",
+    "pass_premeasured_complex_model": "정밀 합산 검증 PASS",
+    "pass_independent_complex_model": "독립 응답 합산 검증 PASS",
+    "pass": "합산 검증 PASS",
+    "fail_target": "합산 타깃 오차 초과",
+    "fail_upper_guard": "합산 안전 상한 초과",
+}
+AUDIT_CLASSIFICATION_LABELS = {
+    "measurement_gate": "측정 품질",
+    "fir_correctable": "FIR 보정 가능",
+    "limited_fir": "FIR 부분 개선",
+    "mimo_correctable": "MIMO 보정 가능",
+    "limited_mimo": "MIMO 부분 개선",
+    "diagnostic_placement": "배치 진단",
+    "physical_treatment": "물리 처리 필요",
+    "runtime_validation": "실기 확인 필요",
+    "not_measured": "미측정",
+    "not_certified": "비인증",
+}
+AUDIT_STATUS_LABELS = {
+    "pass": "PASS",
+    "evaluated": "평가 완료",
+    "insufficient_data": "데이터 부족",
+    "diagnostic_only": "진단 전용",
+    "not_available": "확인 불가",
+    "requires_runtime_test": "실기 확인 필요",
+    **CROSSOVER_STATUS_LABELS,
+}
 
 
 def measurement_algorithm_revision() -> str:
@@ -1870,10 +1908,19 @@ def measurement_panel(job: dict, preview: dict) -> str:
         decay_html = "".join(decay_cards)
         warnings = diagnostics.get("warnings") or []
         warning_html = "".join(f'<li>{html.escape(str(item))}</li>' for item in warnings) or "<li>자동 진단에서 큰 위험 신호가 발견되지 않았습니다.</li>"
-        audit_rows = "".join(
-            f'<tr><td><b>{html.escape(str(item.get("label", item.get("id", ""))))}</b></td><td><code>{html.escape(str(item.get("classification", "")))}</code></td><td>{html.escape(str(item.get("status", "")))}</td><td>{html.escape(str(item.get("action", "")))}</td></tr>'
-            for item in result.get("room_tuning_audit", [])
-        )
+        audit_rows_parts = []
+        for item in result.get("room_tuning_audit", []):
+            classification = str(item.get("classification", ""))
+            raw_status = str(item.get("status", ""))
+            if item.get("id") == "crossover_integration":
+                raw_status = str((result.get("crossover") or {}).get("status") or raw_status)
+            audit_rows_parts.append(
+                f'<tr><td><b>{html.escape(str(item.get("label", item.get("id", ""))))}</b></td>'
+                f'<td>{html.escape(AUDIT_CLASSIFICATION_LABELS.get(classification, classification))}</td>'
+                f'<td>{html.escape(AUDIT_STATUS_LABELS.get(raw_status, raw_status))}</td>'
+                f'<td>{html.escape(str(item.get("action", "")))}</td></tr>'
+            )
+        audit_rows = "".join(audit_rows_parts)
         audit_html = f'<details class="audit-report" open><summary>보정 가능 / 한계 / 미측정 전체 분류</summary><div class="table-scroll"><table><thead><tr><th>요소</th><th>분류</th><th>상태</th><th>해석·조치</th></tr></thead><tbody>{audit_rows}</tbody></table></div></details>' if audit_rows else ""
         limits = result.get("correction_limits", {})
         bank_normalization = result.get("filter_bank_normalization", {})
@@ -2079,7 +2126,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
                     crossover_detail = "합산 안전성 PASS · 절대 위상 정밀도 제한 · 감쇄 전용 상한 사용"
                     crossover_guide = "정식 적용은 가능합니다. 더 정확한 확인이 필요하면 5 · A/B 검토에서 이번 튜닝을 듣고 선택적으로 합산 실측을 실행하세요."
                 else:
-                    crossover_detail = crossover_status or "합산 판정"
+                    crossover_detail = CROSSOVER_STATUS_LABELS.get(crossover_status, crossover_status or "합산 판정")
                     signed_errors = [
                         values.get("complex_target_median_error_db")
                         if isinstance(values.get("complex_target_median_error_db"), (int, float))
@@ -2179,20 +2226,11 @@ def measurement_panel(job: dict, preview: dict) -> str:
             )
         else:
             phase_alignment_card = '<div><small>우퍼 복소합 정렬</small><b>자동 정렬 미사용</b><span>‘위상 방식’이 음량만이거나 직접음 위상 신뢰도가 부족합니다.</span></div>'
-        crossover_status_text = {
-            "fail_premeasured_sum_snr": "정밀 합산 측정 SNR 부족",
-            "fail_premeasured_sum_phase_reference": "시간·위상 기준 부족",
-            "fail_premeasured_complex_sum": "실측 합산 오차 초과",
-            "limited_unverified_phase": "위상 미검증",
-            "pass_safe_upper_phase_limited": "합산 안전성 통과 · 위상 정밀도 제한",
-            "pass_safe_sum_phase_limited": "정밀 합산 안전성 통과 · 위상 정밀도 제한",
-            "pass_premeasured_complex_sum": "정밀 합산 검증 통과",
-            "pass_premeasured_complex_model": "정밀 합산 검증 통과",
-            "pass_independent_complex_model": "독립 응답 합산 검증 통과",
-            "pass": "합산 검증 통과",
-            "fail_target": "합산 타깃 오차 초과",
-            "fail_upper_guard": "합산 안전 상한 초과",
-        }.get(str(crossover.get("status", "")), str(crossover.get("status", "판정 없음")))
+        raw_crossover_status = str(crossover.get("status", ""))
+        crossover_status_text = CROSSOVER_STATUS_LABELS.get(
+            raw_crossover_status,
+            raw_crossover_status or "판정 없음",
+        )
         crossover_label = (
             f'{crossover.get("frequency_hz", "?")} Hz · FIR 내장 · 추가 블록 지연 {crossover.get("additional_block_latency_samples", 0)} 샘플 · {crossover_status_text}'
             if crossover.get("enabled") else
@@ -2252,14 +2290,14 @@ def measurement_panel(job: dict, preview: dict) -> str:
             post_evaluation = post.get("evaluation") or self_validation.get("post_filter_sum") or {}
             if post_evaluation:
                 post_channels = post_evaluation.get("channels", {})
+                inconclusive_post = bool(post_evaluation.get("inconclusive_low_snr"))
                 post_metrics = ''.join(
-                    f'<div class="{"validation-fail" if values.get("target_pass") is False else ""}"><small>{"L" if side == "left" else "R"}+우퍼 실측↔타깃</small><b>MAE {values.get("target_mae_db", "?")} / P90 {values.get("target_p90_abs_error_db", "?")} dB</b><span>크로스오버 MAE {values.get("crossover_mae_db", "?")} dB · 물리 한계 {values.get("physical_extension_limit_hz", "?")} Hz</span></div>'
-                    f'<div class="{"validation-fail" if values.get("prediction_pass") is False else ""}"><small>{"L" if side == "left" else "R"}+우퍼 예상↔실측</small><b>MAE {values.get("prediction_mae_db", "?")} / P90 {values.get("prediction_p90_abs_error_db", "?")} dB</b><span>크로스오버 MAE {values.get("crossover_prediction_mae_db", "?")} dB · 채널별 0 dB 재정규화 없음</span></div>'
+                    f'<div class="{"validation-fail" if values.get("target_pass") is False and not inconclusive_post else "diagnostic-warning" if values.get("target_pass") is False else ""}"><small>{"L" if side == "left" else "R"}+우퍼 실측↔타깃</small><b>MAE {values.get("target_mae_db", "?")} / P90 {values.get("target_p90_abs_error_db", "?")} dB</b><span>크로스오버 MAE {values.get("crossover_mae_db", "?")} dB · 물리 한계 {values.get("physical_extension_limit_hz", "?")} Hz</span></div>'
+                    f'<div class="{"validation-fail" if values.get("prediction_pass") is False and not inconclusive_post else "diagnostic-warning" if values.get("prediction_pass") is False else ""}"><small>{"L" if side == "left" else "R"}+우퍼 예상↔실측</small><b>MAE {values.get("prediction_mae_db", "?")} / P90 {values.get("prediction_p90_abs_error_db", "?")} dB</b><span>크로스오버 MAE {values.get("crossover_prediction_mae_db", "?")} dB · 채널별 0 dB 재정규화 없음</span></div>'
                     for side, values in post_channels.items()
                 )
                 prediction_consistency = post_evaluation.get("prediction_consistency") or {}
                 prediction_status = {"pass": "PASS", "fail": "FAIL", "inconclusive_low_snr": "판정 보류 · SNR 부족", "warning_phase_limited": "권장 · 위상 제한"}.get(str(prediction_consistency.get("status")), "판정 없음")
-                inconclusive_post = bool(post_evaluation.get("inconclusive_low_snr"))
                 post_failure_guide = "" if post_evaluation.get("overall_pass") else (
                     f'<p class="diagnostic-note"><b>판정 보류 · SNR 부족</b> · {html.escape(str((post_evaluation.get("recommended_retry") or {}).get("action", "5 · 적용 전 검토에서 ‘검증 초기화’ 후 ‘검증 sweep 입력 -25 dBFS’로 다시 측정하세요.")))}</p>'
                     if inconclusive_post else
@@ -2267,13 +2305,24 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 )
                 post_verdict_label = "PASS" if post_evaluation.get("overall_pass") else "판정 보류 · SNR 부족" if inconclusive_post else "FAIL"
                 post_verdict_class = "success" if post_evaluation.get("overall_pass") else "diagnostic-note" if inconclusive_post else "failure"
-                post_result = f'<div class="diagnostic-grid post-validation-metrics">{post_metrics}<div><small>L/R 일치</small><b>{post_evaluation.get("lr_match", {}).get("median_shape_difference_db", "?")} dB</b></div><div><small>예상 모델 일치</small><b>{prediction_status}</b><span>신뢰 가능한 합산 위상은 정식 PASS에 포함</span></div><div><small>사후 SNR 최소</small><b>{post_evaluation.get("snr", {}).get("minimum_db", "?")} dB</b><span>권장 ≥15 dB · 현재 {post_evaluation.get("sweep_seconds", "?")}초 ESS</span></div></div><p class="{post_verdict_class}"><b>{post_verdict_label}</b> · 실제 Preview FIR을 통과한 합산 음압 판정</p>{post_failure_guide}'
+                post_snr = post_evaluation.get("snr") or {}
+                post_snr_minimum = post_snr.get("minimum_db")
+                post_snr_recommended = bool(post_snr.get("recommended"))
+                post_snr_label = (
+                    f"권장 PASS · {post_snr_minimum} dB" if post_snr_recommended else
+                    f"사용 PASS · {post_snr_minimum} dB" if post_snr.get("pass") else
+                    f"FAIL · {post_snr_minimum} dB"
+                )
+                post_snr_class = "" if post_snr_recommended else "diagnostic-warning" if post_snr.get("pass") else "validation-fail"
+                post_result = f'<div class="diagnostic-grid post-validation-metrics">{post_metrics}<div><small>L/R 일치</small><b>{post_evaluation.get("lr_match", {}).get("median_shape_difference_db", "?")} dB</b></div><div><small>예상 모델 일치</small><b>{prediction_status}</b><span>신뢰 가능한 합산 위상은 정식 PASS에 포함</span></div><div class="{post_snr_class}"><small>사후 SNR 최소</small><b>{post_snr_label}</b><span>사용 최소 6 dB · 권장 ≥15 dB · 현재 {post_evaluation.get("sweep_seconds", "?")}초 ESS</span></div></div><p class="{post_verdict_class}"><b>{post_verdict_label}</b> · 실제 Preview FIR을 통과한 합산 음압 판정</p>{post_failure_guide}'
             else:
                 post_result = '<p class="muted">아직 실제 FIR을 통과한 합산 음압 결과가 없습니다.</p>'
             next_position = min(post_total, post_completed + 1)
             post_button_disabled = " disabled" if not preview_active or busy or post_completed >= post_total else ""
             post_action_note = (
-                "먼저 위의 ‘이번 튜닝 테스트’를 눌러 Preview를 적용하세요."
+                "검증을 완료했습니다. 다시 측정하려면 ‘검증 초기화’를 누른 뒤 ‘이번 튜닝’을 적용하세요."
+                if post_completed >= post_total else
+                "먼저 위의 ‘이번 튜닝’을 눌러 Preview를 적용하세요."
                 if not preview_active else
                 f"마이크를 {'기준점' if post_total == 1 else f'검증 위치 {next_position}/{post_total}'}에 놓고 실행하세요. 원측정과 생성 FIR은 지워지지 않습니다."
             )
@@ -2284,9 +2333,10 @@ def measurement_panel(job: dict, preview: dict) -> str:
             post_reset_control = ""
             if post_completed:
                 post_reset_control = '''<form method="post" action="/measurement/reset-post-validation" onsubmit="return confirm('사후 합산 검증 진행값만 초기화합니다. 원측정과 생성 FIR은 유지됩니다. 계속할까요?')"><button class="secondary">검증 초기화</button></form>'''
+            post_pill_class = "" if post_evaluation.get("overall_pass") else "neutral" if post_evaluation.get("inconclusive_low_snr") else "error" if post_evaluation else ""
             post_validation_html = f'''
             <section class="post-validation-card" aria-labelledby="post-validation-title">
-              <div class="section-head"><div><h4 id="post-validation-title">선택 사항 · Preview FIR 적용 후 합산 실측</h4><p class="muted">실제 스테레오 입력 → 현재 프런트/우퍼 FIR → U7 4채널 → 방 → UMIK-1 경로를 측정합니다. 정식 적용 필수 단계가 아니며 원측정과 생성 FIR은 유지됩니다.</p></div><span class="pill {'error' if post_evaluation and not post_evaluation.get('overall_pass') else ''}">{post_completed}/{post_total} 위치</span></div>
+              <div class="section-head"><div><h4 id="post-validation-title">선택 사항 · Preview FIR 적용 후 합산 실측</h4><p class="muted">실제 스테레오 입력 → 현재 프런트/우퍼 FIR → U7 4채널 → 방 → UMIK-1 경로를 측정합니다. 정식 적용 필수 단계가 아니며 원측정과 생성 FIR은 유지됩니다.</p></div><span class="pill {post_pill_class}">{post_completed}/{post_total} 위치</span></div>
               <form method="post" action="/measurement/post-validation" class="measure-form" onsubmit="return confirm('현재 Preview FIR을 통과한 L+우퍼/R+우퍼 검증 스윕을 재생합니다. 원측정과 생성 FIR은 유지됩니다. 시작할까요?')">
                 <label>검증 sweep 입력<select name="level_dbfs"{' disabled' if post_completed else ''}>{level_options}</select>{post_level_hidden}<span>U7 청취 볼륨과 무관한 FIR 입력 기준입니다. 현재 FIR의 공통 감쇄는 {common_attenuation_label}이므로 대부분의 실제 출력은 선택값보다 그만큼 낮을 수 있습니다. 입력 OFF → PCM 0 dB → 28초 ESS → 원래 볼륨 복원 → 입력 복귀 순서로 실행합니다.</span></label>
               <button{post_button_disabled}>위치 {next_position}/{post_total} 합산 측정</button>
@@ -2302,6 +2352,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
           <p><b>{html.escape(dict(target_labels).get(str(result.get('target')), str(result.get('target'))))}</b> · {html.escape(dict((('none', '추가 억제 없음'), ('primus360', 'Primus 360 수준'), ('strong', 'T5S 강한 억제'))).get(str(result.get('preset')), str(result.get('preset'))))} · {result.get('taps')}탭 · 프런트 피크 {left.get('peak_tap', '?')}탭 ({left.get('peak_delay_ms', '?')} ms)</p>
           <p><code>{html.escape(str(result.get('front_sha256', '')))}</code></p>
           <div class="diagnostic-grid"><div><small>측정 범위</small><b>{'빠른 측정 · 1위치' if int(result.get('measurement_coverage', {}).get('positions', total)) == 1 else '표준 측정 · 3위치'}</b></div><div><small>공간 평균</small><b>{html.escape(str(result.get('spatial_mode', 'equal')))}</b></div><div><small>룸보정 범위</small><b>{limits.get('low_hz', '?')}–{limits.get('high_hz', '?')} Hz</b></div><div><small>최대 상대 보상</small><b>{limits.get('max_relative_compensation_db', limits.get('max_room_boost_db', '?'))} dB</b><small>신뢰 가능한 넓은 roll-off의 상한 · 좁은 딥은 최대 3 dB</small></div><div><small>상대 보상의 음량 비용</small><b>전체 {common_attenuation_label}</b><small>가장 큰 FIR 보정점을 0 dB로 유지하기 위해 L/R/우퍼를 함께 내린 값</small></div><div class="{'diagnostic-warning' if high_frequency_ceiling_reached and isinstance(high_frequency_residual_db, (int, float)) and high_frequency_residual_db > 3 else ''}"><small>15–20 kHz 잔여 오차</small><b>{high_frequency_residual_label}</b><small>{'상대 보상 상한을 모두 사용함' if high_frequency_ceiling_reached else '선택한 보상 한도 안에서 계산됨'}</small></div><div><small>공통 0 dB 기준</small><b>{common_scope_label} · 공통 gain {common_gain_label}</b><small>채널별 정규화 없음 · 상대레벨 보존</small></div><div class="{'validation-fail' if crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if crossover_failed else '실측 대기 · ' if crossover_pending else ''}{html.escape(crossover_label)}</b></div>{phase_alignment_card}<div><small>추가 취향</small><b>저음 {preference.get('bass_db_at_20_hz', 0):+} / 고음 {preference.get('treble_db_at_20_khz', 0):+} dB</b></div><div><small>L/R 중앙값 차이</small><b>{diagnostics.get('lr_median_difference_db', '?')} dB</b></div><div><small>공간 편차 중앙값</small><b>{diagnostics.get('spatial_std_median_db', '?')} dB</b></div><div><small>측정 SNR 최소/중앙</small><b>{diagnostics.get('measurement_snr_min_db', '?')} / {diagnostics.get('measurement_snr_median_db', '?')} dB</b></div><div class="{'validation-fail' if validation_failed else ''}"><small>FIR 셀프검증</small><b>{validation_label}</b></div><div><small>우퍼 최종 트림</small><b>{result.get('woofer_trim_db', 0):+} dB</b></div><div><small>측정 시 우퍼 감쇄</small><b>{job.get('woofer_measurement_attenuation_db', -9):+} dB · 응답에서 복원됨</b></div></div>
+          <p class="diagnostic-note"><b>설정 상한과 예상 음압은 다릅니다.</b> ‘최대 상대 보상’과 ‘최대 룸 감쇄’는 FIR이 사용할 수 있는 범위의 제한값입니다. 아래 예상 곡선은 측정 응답, 좁은 딥 보호, 크로스오버 합산과 전체 공통 gain을 모두 적용한 계산 결과이며, 사후 실측과의 일치도는 ‘예상↔실측’ MAE/P90으로 판단합니다.</p>
             <div class="graph-toolbar"><div><b>응답 비교</b><small>전체 대역이 기본이며 저역 확대에서 크로스오버 딥을 확인합니다.</small></div><div role="group" aria-label="그래프 주파수 범위"><button type="button" class="secondary selected" data-result-range="full" aria-pressed="true">전체</button><button type="button" class="secondary" data-result-range="bass" aria-pressed="false">저역</button></div></div>
           <svg id="measurement-result-graph" data-result-target="{html.escape(str(result.get('target', 'harman')))}" viewBox="0 0 760 250" role="img" aria-label="보정 전후 및 합산 주파수 응답"></svg>
           <p id="measurement-result-summary" class="muted" aria-live="polite"></p>
@@ -2864,9 +2915,12 @@ const paintResult=()=>{{
   if(!values.length)return;
   const minY=Math.floor((Math.min(-10,...values)-2)/5)*5;
   const maxY=Math.ceil((Math.max(10,...values)+2)/5)*5;
-  draw(document.getElementById('measurement-result-graph'),resultCurves,minY,maxY,range);
+  const graph=document.getElementById('measurement-result-graph');
+  draw(graph,resultCurves,minY,maxY,range);
   const summary=document.getElementById('measurement-result-summary');
-  if(summary)summary.textContent=resultRange==='bass'?'20–250 Hz 확대 · L/R+우퍼 실측·예상과 크로스오버 딥':'20 Hz–20 kHz 전체 · 사후 검증 후에는 실측과 계산 예상값을 같은 공통 기준으로 비교';
+  const summaryText=resultRange==='bass'?'20–250 Hz 확대 · L/R+우퍼 실측·예상과 크로스오버 딥':'20 Hz–20 kHz 전체 · 사후 검증 후에는 실측과 계산 예상값을 같은 공통 기준으로 비교';
+  if(summary)summary.textContent=summaryText;
+  if(graph)graph.setAttribute('aria-label',`${{summaryText}}. 표시 곡선: ${{resultCurves.map(curve=>curve.name).join(', ')}}`);
 }};
 document.querySelectorAll('[data-result-range]').forEach(button=>button.addEventListener('click',()=>{{
   resultRange=button.dataset.resultRange;

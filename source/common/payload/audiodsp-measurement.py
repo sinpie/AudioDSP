@@ -5232,19 +5232,47 @@ def reset_post_filter_validation() -> dict[str, Any]:
             )
         )
         if crossover_required:
-            prediction_pass = bool(
-                state["result"].get("crossover", {}).get("safe_deploy_pass")
-                or state["result"].get("crossover", {}).get("overall_acoustic_prediction_pass")
-                or state["result"].get("crossover", {}).get("model_prediction_pass")
-            )
+            crossover = state["result"].setdefault("crossover", {})
+            # Post-FIR verification deliberately replaces the visible crossover
+            # status with pass_measured/fail_measured.  Reconstruct the immutable
+            # premeasurement model verdict from its component checks instead of
+            # reading that overwritten status back during Reset.
+            safe_deploy_value = crossover.get("safe_deploy_pass")
+            if isinstance(safe_deploy_value, bool):
+                prediction_pass = safe_deploy_value
+            else:
+                prediction_pass = bool(
+                    crossover.get("model_prediction_pass")
+                    or crossover.get("overall_acoustic_prediction_pass")
+                )
+            phase_status = str(crossover.get("phase_verification_status") or "limited")
+            if prediction_pass:
+                model_prediction_status = (
+                    "pass" if phase_status == "pass" else "pass_safe_upper_phase_limited"
+                )
+            else:
+                coherent_guard = crossover.get("coherent_upper_guard_pass")
+                model_prediction_status = (
+                    "fail_upper_guard" if coherent_guard is False else "fail_target"
+                )
             if state.get("mode") in PREMEASURED_SUM_MODES:
                 premeasured = self_validation.get("premeasured_sum_model") or {}
                 restored_pass = bool(premeasured.get("pass") and prediction_pass)
+                precise_phase_pass = bool(
+                    restored_pass
+                    and premeasured.get("phase_verification_status") == "pass"
+                    and phase_status == "pass"
+                )
+                restored_status = (
+                    "pass_premeasured_complex_model" if precise_phase_pass else
+                    "pass_safe_sum_phase_limited" if restored_pass else
+                    str(premeasured.get("status") or model_prediction_status)
+                )
                 self_validation["crossover_sum"] = {
                     "required": True,
                     "pass": restored_pass,
-                    "status": "pass_premeasured_model" if restored_pass else str(premeasured.get("status") or "fail_model"),
-                    "prediction_status": state["result"].get("crossover", {}).get("status"),
+                    "status": restored_status,
+                    "prediction_status": model_prediction_status,
                     "verification": "premeasured_complex_model",
                 }
                 core_pass = all(bool(value) for value in (self_validation.get("core_checks") or {}).values())
@@ -5254,16 +5282,17 @@ def reset_post_filter_validation() -> dict[str, Any]:
                     for item in (self_validation.get("target_fit") or {}).values()
                 )
                 self_validation["overall_pass"] = core_pass and independent_pass and required_target_pass and restored_pass
-                restored_status = "pass_premeasured_model" if restored_pass else str(premeasured.get("status") or "fail_model")
             else:
-                model_status = "pass_independent_complex_model" if prediction_pass else str(
-                    state["result"].get("crossover", {}).get("status") or "fail_model"
+                restored_status = (
+                    "pass_independent_complex_model" if prediction_pass and phase_status == "pass" else
+                    "pass_safe_upper_phase_limited" if prediction_pass else
+                    model_prediction_status
                 )
                 self_validation["crossover_sum"] = {
                     "required": True,
                     "pass": prediction_pass,
-                    "status": model_status,
-                    "prediction_status": model_status,
+                    "status": restored_status,
+                    "prediction_status": model_prediction_status,
                     "verification": "independent_same_clock_complex_model",
                 }
                 core_pass = all(bool(value) for value in (self_validation.get("core_checks") or {}).values())
@@ -5273,13 +5302,22 @@ def reset_post_filter_validation() -> dict[str, Any]:
                     for item in (self_validation.get("target_fit") or {}).values()
                 )
                 self_validation["overall_pass"] = core_pass and independent_pass and required_target_pass and prediction_pass
-                restored_status = model_status
-            state["result"]["crossover"].pop("post_filter_measurement", None)
-            state["result"]["crossover"]["status"] = restored_status
+            crossover.pop("post_filter_measurement", None)
+            crossover["status"] = model_prediction_status
+            crossover["overall_acoustic_prediction_pass"] = bool(
+                prediction_pass and phase_status == "pass"
+            )
             sync_mimo_manifest_validation(Path(state["session_dir"]), state["result"])
         state["stage"] = "사후 합산 검증만 초기화했습니다. 원측정과 생성 FIR은 유지됩니다."
+        directory = Path(state["session_dir"])
+        report_json = state["result"].get("report_json")
+        report_md = state["result"].get("report_md")
+        if isinstance(report_json, str) and Path(report_json).name == report_json:
+            atomic_json(directory / report_json, state["result"])
+        if isinstance(report_md, str) and Path(report_md).name == report_md:
+            write_room_tuning_report(directory / report_md, state, state["result"])
         save_current(state)
-        atomic_json(Path(state["session_dir"]) / "session.json", state)
+        atomic_json(directory / "session.json", state)
         return state
 
 
