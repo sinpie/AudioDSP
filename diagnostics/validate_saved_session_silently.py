@@ -16,6 +16,27 @@ import types
 from typing import Any
 
 
+def graph_samples(graph: dict[str, Any] | None) -> dict[str, dict[str, float | None]]:
+    """Return compact high-frequency evidence without retaining a large result graph."""
+    graph = graph or {}
+    frequencies = list(graph.get("frequency") or ())
+    if not frequencies:
+        return {}
+    fields = (
+        "before_db", "predicted_db", "target_db", "requested_correction_db",
+        "actual_correction_db", "measurement_confidence",
+    )
+    result: dict[str, dict[str, float | None]] = {}
+    for requested_hz in (10_000, 15_000, 20_000):
+        index = min(range(len(frequencies)), key=lambda item: abs(float(frequencies[item]) - requested_hz))
+        sample: dict[str, float | None] = {"frequency_hz": round(float(frequencies[index]), 2)}
+        for field in fields:
+            values = list(graph.get(field) or ())
+            sample[field] = round(float(values[index]), 4) if index < len(values) else None
+        result[str(requested_hz)] = sample
+    return result
+
+
 def load_engine(path: Path):
     if os.name == "nt" and "fcntl" not in sys.modules:
         stub = types.ModuleType("fcntl")
@@ -152,6 +173,7 @@ def main() -> int:
             built = engine.load_current()["result"]
             validation = built["self_validation"]
             target_fit = validation.get("target_fit") or {}
+            graphs = built.get("graphs") or {}
             reports.append({
                 "name": name, "options": options,
                 "overall_pass": validation.get("overall_pass"),
@@ -168,6 +190,9 @@ def main() -> int:
                 "crossover_phase_reliable": built.get("crossover", {}).get("phase_alignment_reliable"),
                 "common_level_reference": built.get("common_level_reference"),
                 "filter_bank_normalization": built.get("filter_bank_normalization"),
+                "high_frequency_response": {
+                    side: graph_samples(graphs.get(side)) for side in ("left", "right")
+                },
                 "front_sha256": built.get("front_sha256"),
                 "rear_sha256": built.get("rear_sha256"),
             })
@@ -234,6 +259,13 @@ def main() -> int:
                         "relative_branch_gain_preserved": (
                             report.get("filter_bank_normalization") or {}
                         ).get("relative_branch_gain_preserved"),
+                        "common_attenuation_db": (
+                            report.get("filter_bank_normalization") or {}
+                        ).get("common_attenuation_db"),
+                        "peak_transfer_after_db": (
+                            report.get("filter_bank_normalization") or {}
+                        ).get("peak_transfer_after_db"),
+                        "maximum_relative_compensation_db": report["options"].get("max_boost_db"),
                         "independent_positions_pass": (
                             report.get("independent_positions") or {}
                         ).get("pass"),
@@ -249,6 +281,7 @@ def main() -> int:
                         "woofer_target_pass": (
                             report.get("target_fit", {}).get("woofer") or {}
                         ).get("pass"),
+                        "high_frequency_response": report.get("high_frequency_response"),
                     }
                     for report in reports
                 ],

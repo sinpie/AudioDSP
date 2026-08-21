@@ -5,6 +5,11 @@
 - L/R 각각과 Woofer를 따로 0 dB로 맞추지 않고 L/R 500~2,000 Hz median으로 하나의 측정·타깃 기준을 만든 뒤 L/R/Woofer 전체 결과와 판정에 동일 적용
 - 완성된 4채널 FIR bank의 최대 전달값으로 common gain 한 번만 적용하고, branch별 적용 전/후 peak와 상대레벨 보존 오차를 영구 metadata 및 자동 core check로 추가
 - `최대 룸 부스트`를 실제 동작에 맞는 `최대 상대 보상`으로 바꾸고 0/3/6/9/10 dB, 기본 10 dB를 제공; 가장 큰 신뢰 보상을 0 dB로 두고 전체 bank를 같은 값만큼 감쇄해 양의 FIR 이득과 preamp를 만들지 않음
+- 양쪽 Front에 공통인 완만한 10–20 kHz roll-off는 edge SNR을 두 번 곱하지 않고 선택한 상대 보상 상한을 실제 ceiling으로 사용; 저장 실측 session에서 15 kHz는 L −0.51/R +0.01 dB까지 개선되고 20 kHz 잔여 L −3.38/R −4.54 dB는 10 dB 상한 한계로 명시
+- 결과 UI와 보고 데이터에 전체 bank 공통 감쇄(`상대 보상의 음량 비용`)와 15–20 kHz 잔여 오차를 추가해, 더 평탄한 응답과 전체 재생 레벨 손실의 trade-off를 숨기지 않음
+- 사후 FIR 검증이 L/R을 각각 0 dB로 재정규화하고 계산 예상과 직접 비교하지 않던 오류를 수정; 측정/예상 각각 하나의 공통 L/R 기준, 전체·crossover 예상↔실측 MAE/P90과 20 Hz~20 kHz 세 곡선 비교를 추가
+- Pi5 실제 v21 사후 검증에서 전체 Flat target과 예상 일치는 PASS였으나 낮은 SNR의 L 50~200 Hz만 경계 초과함을 분리 확인; FIR 공통 감쇄 뒤 실제 검증음이 낮아지는 점을 UI에 명시하고 28초 ESS/-25 dBFS 재검증과 `inconclusive_low_snr` 상태를 추가
+- 오래 열린/부분 폼이 `max_cut_db`를 누락해 400을 내던 문제를 마지막 저장 설정 fallback으로 수정하고, 작업 완료 후 POST 경로를 GET해 404가 되던 자동 갱신을 항상 `/measure`로 복귀하도록 수정
 - 양쪽 Front에서 공통으로 나타나는 2~20 kHz 광대역 감쇄만 제한적으로 보상하고, 한 채널의 좁은 deep/null은 양쪽 ±1/6 octave 형상과 공간 신뢰도로 억제해 최대 3 dB를 넘지 않도록 수정
 - 새 결과의 자동 검증에 `하나의 L/R/우퍼 레벨 기준`, `완성 bank common gain`, `branch 상대레벨 보존`, `최대 상대 보상`, `좁은 null boost 보호`를 추가하고 UI 오류 안내를 `4 · FIR 계산`의 실제 메뉴명과 조치 순서로 통일
 - L/R/W를 한 녹음에서 같은 주파수로 분리하는 4상태 Walsh 기준을 추가하고 각 상태의 시작·끝 guard를 제외한 4회 반복만 평균; 별도 ESS clock drift를 거리로 쓰지 않으면서 L/R/W 상대위상·극성·지연과 L+W/R+W cross-term을 결합

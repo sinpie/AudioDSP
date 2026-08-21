@@ -43,7 +43,7 @@
 - Target을 바꾸면 1 kHz 기준 곡선과 bass/treble preference를 즉시 SVG에 반영한다.
 - L/R/Woofer와 sub MIMO에서는 디지털 crossover를 주요 옵션으로 표시하고 기본 ON/100 Hz로 둔다. 설명은 Front LR4 HPF, Woofer LR4 LPF, 32768탭 WAV 내장, 추가 block latency 0을 함께 말한다. 합산 L/R 모드에서는 숨은 OFF 값과 독립 branch가 없다는 이유를 표시한다.
 - 결과 그래프는 각 채널의 측정 전 ±공간 편차, 적용 후 예상, target을 구분한다.
-- `최대 상대 보상`은 0/3/6/9/10 dB로 표시하고 기본 10 dB다. 도움말은 “신뢰되는 최고 보상을 0 dB로 두고 L/R/Woofer 전체를 같은 값만큼 낮춤”과 “좁은 deep은 최대 3 dB”를 함께 설명한다. `최대 부스트`나 채널별 0 dB처럼 실제 동작과 다른 용어를 사용하지 않는다.
+- `최대 상대 보상`은 0/3/6/9/10 dB로 표시하고 기본 10 dB다. 도움말은 “신뢰되는 최고 보상을 0 dB로 두고 L/R/Woofer 전체를 같은 값만큼 낮춤”과 “좁은 deep은 최대 3 dB”를 함께 설명한다. 결과 카드에는 실제 `상대 보상의 음량 비용`과 `15–20 kHz 잔여 오차`를 표시하고, 상한을 모두 써도 남는 slope는 amber 경고와 실제 메뉴명 기반 가이드로 설명한다. `최대 부스트`나 채널별 0 dB처럼 실제 동작과 다른 용어를 사용하지 않는다.
 - 결과 요약은 `L/R/Woofer 공통 0 dB 기준`, 공통 FIR gain, 채널별 독립 정규화 없음, branch 상대레벨 보존을 한 카드에서 보여준다. 그래프도 L/R 500~2,000 Hz 하나의 기준을 사용했다는 설명을 legend 가까이에 둔다.
 - 결과의 `Woofer 최종 trim`은 FIR 계산 옵션을, `측정 시 Woofer 감쇄`는 sweep SNR 확보용 측정 조건을 별도 항목으로 표시한다.
 - 결과에 기록된 `algorithm_revision`이 현재 엔진과 다르면 측정 원본은 보존하되 이전 계산임을 경고하고 4단계 FIR 재계산 전 Preview/Apply를 차단한다.
@@ -51,6 +51,7 @@
 - 자동 검증 체크리스트는 모든 core/FIR, 독립 3위치, L/R/Woofer target-fit, crossover 합산, SNR 판정을 `PASS`, `FAIL`, `대기`, `해당 없음`으로 표시한다. FAIL 행은 빨간색과 함께 실제 화면의 `1 · 연결·Cal`, `2 · 레벨 확인`, `3 · 위치 측정`, `4 · FIR 계산`, `5 · 검토·A/B` 단계명과 실제 select/button 문구를 사용한 직접 행동 지침을 제공한다. 안내에 언급된 단계는 바로 여는 버튼도 함께 만들며, 탭 이동만으로 측정값은 바뀌지 않는다. 실행할 수 없는 사후 측정을 해결 방법으로 쓰지 않는다.
 - 체크리스트 바로 위에서 MAE를 판정 대역 평균 절대오차, P90을 주파수 지점 90%가 그 값 이내인 오차로 설명한다. 합산 FAIL은 signed median error를 사용해 Target보다 높은지/낮은지와 dB를 밝히고, `Woofer 최종 trim`, `우퍼 과잉 억제`, `Phase 방식`, `Crossover 주파수`의 실제 표시명으로 변경 방향을 안내한다.
 - 결과 카드는 `pass`, `pass_safe_upper_phase_limited`, `pass_safe_sum_phase_limited`, `fail_target`, `fail_upper_guard`를 구분하고, 위상 제한 PASS를 정확한 복소 위상 검증으로 표현하지 않는다.
+- 선택형 사후 검증 뒤 결과 그래프는 20 Hz~20 kHz의 실제 FIR 통과 실측, 계산 예상, 선택 target을 동시에 표시한다. 실측/예상 L/R은 각각 하나의 공통 기준만 사용한다. SNR 6~15 dB에서 경계값을 조금 넘으면 빨간 FAIL 대신 `판정 보류 · SNR 부족`과 실제 메뉴 `검증 초기화`, `검증 sweep 입력 -25 dBFS`를 표시한다. FIR 입력값과 공통 FIR 감쇄 뒤 실제 출력이 다를 수 있음을 control 바로 아래에서 설명한다.
 - Pi4/5는 SISO와 MIMO Stereo/2.1/2.2를 구분하되 공통 timing reference가 없으면 MIMO 차단 이유를 표시한다. Pi2는 조건과 무관하게 선택할 수 없다.
 - MIMO 결과는 타깃 MAE, 좌석 편차, 평활 전달함수 기반 impulse-tail proxy, 기존 SISO 저역 레벨 기준 offset, 해 혼합 강도, 제어원 coherence, crossover, 실제 output별 headroom과 전체 보정 가능성 분류표를 보인다. impulse-tail proxy는 RT60/잔향 예측이 아니며 1.5 dB 초과 악화 시 적용을 차단한다.
 - 다운로드와 A/B는 비파괴라고 명시하고, 정식 적용 버튼만 덮어쓰기 경고를 낸다.

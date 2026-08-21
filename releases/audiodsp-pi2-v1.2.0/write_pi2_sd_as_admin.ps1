@@ -310,8 +310,8 @@ function Assert-FinalBundle {
         $webText -notmatch 'summary::after' -or
         $webText -notmatch 'room_tuning_audit' -or
         $webText -notmatch 'output-level-warning' -or
-        $webText -notmatch '기본 −42 dBFS' -or
-        $webText -notmatch '출력별 2초 빠른 검사' -or
+        $webText -notmatch 'value="-42"' -or
+        $webText -notmatch '모든 출력 조합을 각 2초씩' -or
         $webText -notmatch '저역 late/early' -or
         $webText -notmatch 'ThreadingHTTPServer\(\(WEB_HOST, WEB_PORT\)' -or
         $webText -notmatch 'active-profile' -or
@@ -336,7 +336,8 @@ function Assert-FinalBundle {
         'TAPS = 32_768',
         'run_direct_capture',
         'hw:CARD=UMIK1,DEV=0',
-        '"Line", "nocap"',
+        '_set_u7_capture("Line", False)',
+        '_set_u7_capture("Mic", False)',
         'spatial_std_db',
         'Generated_Front_LR_32768.wav',
         'maximum_transfer_db',

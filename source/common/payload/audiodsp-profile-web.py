@@ -475,6 +475,33 @@ def measurement_status() -> dict:
         return MEASUREMENT_DEFAULT
 
 
+def correction_build_arguments(fields: dict[str, str]) -> list[str]:
+    """Merge a partial/stale browser form with the last saved correction values.
+
+    A calculation can finish while a browser still holds the pre-refresh form.
+    Missing advanced controls must not become a raw KeyError such as
+    ``max_cut_db``; preserve their last saved values and let the measurement
+    CLI perform the authoritative allowed-value validation.
+    """
+    saved = measurement_status().get("correction_preferences") or {}
+    values = dict(DEFAULT_CORRECTION_PREFERENCES)
+    if isinstance(saved, dict):
+        values.update({key: saved[key] for key in DEFAULT_CORRECTION_PREFERENCES if key in saved})
+    values.update({key: fields[key] for key in DEFAULT_CORRECTION_PREFERENCES if key in fields})
+    crossover_enabled = values["crossover_enabled"]
+    if isinstance(crossover_enabled, bool):
+        crossover_enabled = "on" if crossover_enabled else "off"
+    ordered = (
+        "target", "preset", "woofer_trim_db", "phase_mode", "phase_cutoff",
+        "spatial_mode", "bass_tilt_db", "treble_tilt_db", "correction_low_hz",
+        "correction_high_hz", "max_boost_db", "max_cut_db", "mimo_high_hz",
+        "mimo_strength", "mimo_support_penalty_db",
+    )
+    return [str(values[key]) for key in ordered] + [
+        str(crossover_enabled), str(values["crossover_frequency_hz"]),
+    ]
+
+
 def stage_path(profile: str, band: str) -> Path:
     if profile not in ("speaker", "headphone") or band not in ("front", "rear"):
         raise ValueError("Invalid staged profile or band")
@@ -1853,6 +1880,14 @@ def measurement_panel(job: dict, preview: dict) -> str:
         common_reference = result.get("common_level_reference", {})
         common_gain_db = bank_normalization.get("applied_common_gain_db")
         common_gain_label = f"{float(common_gain_db):+.2f} dB" if isinstance(common_gain_db, (int, float)) else "?"
+        common_attenuation_db = bank_normalization.get("common_attenuation_db")
+        if not isinstance(common_attenuation_db, (int, float)) and isinstance(common_gain_db, (int, float)):
+            common_attenuation_db = max(0.0, -float(common_gain_db))
+        common_attenuation_label = f"−{float(common_attenuation_db):.2f} dB" if isinstance(common_attenuation_db, (int, float)) else "?"
+        high_frequency_compensation = result.get("high_frequency_compensation", {})
+        high_frequency_residual_db = high_frequency_compensation.get("worst_abs_residual_db_15_20khz")
+        high_frequency_residual_label = f"{float(high_frequency_residual_db):.2f} dB" if isinstance(high_frequency_residual_db, (int, float)) else "이전 계산 · 재계산 필요"
+        high_frequency_ceiling_reached = bool(high_frequency_compensation.get("ceiling_reached"))
         bank_scope = str(bank_normalization.get("scope", ""))
         common_scope_label = "L/R/우퍼 전체" if "woofer" in bank_scope or "mimo" in bank_scope else "L/R 전체"
         preference = result.get("preference", {})
@@ -1942,6 +1977,8 @@ def measurement_panel(job: dict, preview: dict) -> str:
             "predicted_target_and_spatial_non_regression": ("MIMO 타겟·좌석 편차 비악화", "4 · FIR 계산 > ‘고급 보정 설정’에서 먼저 ‘MIMO 강도’를 ‘Safe · 높은 안정성’으로 바꾸고, 계속 FAIL이면 ‘MIMO 공동제어 상한’을 한 단계 낮추거나 ‘지원 제어원 제한’을 한 단계 높인 뒤 고급 설정을 접고 ‘설정으로 32768탭 FIR 생성’을 누르세요. 그래도 실패하면 이 측정에서는 MIMO가 SISO보다 낫지 않으므로 1 · 연결·Cal > ‘측정 구성’에서 SISO 구성을 선택하고 ‘측정 구성 변경 적용’을 누르세요."),
             "predicted_modal_tail_non_regression": ("MIMO 저역 임펄스 꼬리 비악화", "4 · FIR 계산에서 ‘기준 음색 타깃’=‘Flat’, ‘우퍼 과잉 억제’=‘추가 억제 없음 · 타깃 기준’, ‘우퍼 최종 트림’=‘0 dB’로 되돌리세요. 이어 ‘고급 보정 설정’에서 ‘MIMO 강도’=‘Balanced · 권장’, ‘MIMO 공동제어 상한’=‘150 Hz’, ‘지원 제어원 제한’=‘6 dB’로 바꾸고, 본문의 ‘크로스오버 주파수’=‘100 Hz’로 설정한 뒤 ‘FIR 계산’을 누르세요. 기준 조합이 PASS하면 원하는 음색 값을 한 번에 하나씩 다시 바꾸세요. 기준도 실패하면 우퍼 위치를 바꿔 3 · 위치 측정의 ‘3위치 처음부터 재측정’을 실행하거나 SISO 구성을 사용하세요."),
         }
+
+
         for key, value in (self_validation.get("core_checks") or {}).items():
             label, guide = core_labels.get(str(key), (str(key).replace("_", " ").title(), "4 · FIR 계산에서 각 항목의 권장 기본값으로 되돌린 뒤 ‘FIR 계산’을 누르세요."))
             add_validation_row(label, "pass" if bool(value) else "fail", "내보낸 FIR 파일 자체의 무결성 검사", guide)
@@ -2204,19 +2241,33 @@ def measurement_panel(job: dict, preview: dict) -> str:
             post = job.get("post_filter_validation") or {}
             post_completed = int(post.get("positions_completed", 0))
             post_total = int(post.get("positions_total", total))
-            post_level = int(post.get("level_dbfs", max(-48, min(-24, int(job.get("level_dbfs", -42))))))
+            post_level_choices = (-48, -42, -36, -30, -25, -24, -18, -12)
+            requested_post_default = max(-48, min(-25, int(job.get("level_dbfs", -42))))
+            default_post_level = min(post_level_choices, key=lambda value: abs(value - requested_post_default))
+            post_level = int(post.get("level_dbfs", default_post_level))
             level_options = ''.join(
                 f'<option value="{value}" {"selected" if value == post_level else ""}>{value} dBFS</option>'
-                for value in (-48, -42, -36, -30, -24, -18, -12)
+                for value in post_level_choices
             )
             post_evaluation = post.get("evaluation") or self_validation.get("post_filter_sum") or {}
             if post_evaluation:
                 post_channels = post_evaluation.get("channels", {})
                 post_metrics = ''.join(
-                    f'<div><small>{"L" if side == "left" else "R"}+우퍼 실측 타깃</small><b>MAE {values.get("target_mae_db", "?")} / P90 {values.get("target_p90_abs_error_db", "?")} dB</b><span>크로스오버 MAE {values.get("crossover_mae_db", "?")} dB · 물리 한계 {values.get("physical_extension_limit_hz", "?")} Hz</span></div>'
+                    f'<div class="{"validation-fail" if values.get("target_pass") is False else ""}"><small>{"L" if side == "left" else "R"}+우퍼 실측↔타깃</small><b>MAE {values.get("target_mae_db", "?")} / P90 {values.get("target_p90_abs_error_db", "?")} dB</b><span>크로스오버 MAE {values.get("crossover_mae_db", "?")} dB · 물리 한계 {values.get("physical_extension_limit_hz", "?")} Hz</span></div>'
+                    f'<div class="{"validation-fail" if values.get("prediction_pass") is False else ""}"><small>{"L" if side == "left" else "R"}+우퍼 예상↔실측</small><b>MAE {values.get("prediction_mae_db", "?")} / P90 {values.get("prediction_p90_abs_error_db", "?")} dB</b><span>크로스오버 MAE {values.get("crossover_prediction_mae_db", "?")} dB · 채널별 0 dB 재정규화 없음</span></div>'
                     for side, values in post_channels.items()
                 )
-                post_result = f'<div class="diagnostic-grid post-validation-metrics">{post_metrics}<div><small>L/R 일치</small><b>{post_evaluation.get("lr_match", {}).get("median_shape_difference_db", "?")} dB</b></div><div><small>사후 SNR 최소</small><b>{post_evaluation.get("snr", {}).get("minimum_db", "?")} dB</b></div></div><p class="{"success" if post_evaluation.get("overall_pass") else "failure"}"><b>{"PASS" if post_evaluation.get("overall_pass") else "FAIL"}</b> · 실제 Preview FIR을 통과한 합산 음압 판정</p>'
+                prediction_consistency = post_evaluation.get("prediction_consistency") or {}
+                prediction_status = {"pass": "PASS", "fail": "FAIL", "inconclusive_low_snr": "판정 보류 · SNR 부족", "warning_phase_limited": "권장 · 위상 제한"}.get(str(prediction_consistency.get("status")), "판정 없음")
+                inconclusive_post = bool(post_evaluation.get("inconclusive_low_snr"))
+                post_failure_guide = "" if post_evaluation.get("overall_pass") else (
+                    f'<p class="diagnostic-note"><b>판정 보류 · SNR 부족</b> · {html.escape(str((post_evaluation.get("recommended_retry") or {}).get("action", "5 · 적용 전 검토에서 ‘검증 초기화’ 후 ‘검증 sweep 입력 -25 dBFS’로 다시 측정하세요.")))}</p>'
+                    if inconclusive_post else
+                    '<p class="failure"><b>조치</b> · 먼저 <b>5 · 적용 전 검토 → 기존 튜닝</b>으로 복귀한 뒤 U7 경로·마이크 위치가 원측정과 같은지 확인하세요. 예상↔실측만 FAIL이면 <b>3 · 위치 측정 → 저장 원본 재계산</b> 후 <b>4 · FIR 계산</b>을 다시 실행하세요. 실측↔타깃도 FAIL이면 <b>4 · FIR 계산</b>의 크로스오버·최종 우퍼 트림·추가 억제를 한 항목씩 바꿔 비교하세요.</p>'
+                )
+                post_verdict_label = "PASS" if post_evaluation.get("overall_pass") else "판정 보류 · SNR 부족" if inconclusive_post else "FAIL"
+                post_verdict_class = "success" if post_evaluation.get("overall_pass") else "diagnostic-note" if inconclusive_post else "failure"
+                post_result = f'<div class="diagnostic-grid post-validation-metrics">{post_metrics}<div><small>L/R 일치</small><b>{post_evaluation.get("lr_match", {}).get("median_shape_difference_db", "?")} dB</b></div><div><small>예상 모델 일치</small><b>{prediction_status}</b><span>신뢰 가능한 합산 위상은 정식 PASS에 포함</span></div><div><small>사후 SNR 최소</small><b>{post_evaluation.get("snr", {}).get("minimum_db", "?")} dB</b><span>권장 ≥15 dB · 현재 {post_evaluation.get("sweep_seconds", "?")}초 ESS</span></div></div><p class="{post_verdict_class}"><b>{post_verdict_label}</b> · 실제 Preview FIR을 통과한 합산 음압 판정</p>{post_failure_guide}'
             else:
                 post_result = '<p class="muted">아직 실제 FIR을 통과한 합산 음압 결과가 없습니다.</p>'
             next_position = min(post_total, post_completed + 1)
@@ -2237,7 +2288,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
             <section class="post-validation-card" aria-labelledby="post-validation-title">
               <div class="section-head"><div><h4 id="post-validation-title">선택 사항 · Preview FIR 적용 후 합산 실측</h4><p class="muted">실제 스테레오 입력 → 현재 프런트/우퍼 FIR → U7 4채널 → 방 → UMIK-1 경로를 측정합니다. 정식 적용 필수 단계가 아니며 원측정과 생성 FIR은 유지됩니다.</p></div><span class="pill {'error' if post_evaluation and not post_evaluation.get('overall_pass') else ''}">{post_completed}/{post_total} 위치</span></div>
               <form method="post" action="/measurement/post-validation" class="measure-form" onsubmit="return confirm('현재 Preview FIR을 통과한 L+우퍼/R+우퍼 검증 스윕을 재생합니다. 원측정과 생성 FIR은 유지됩니다. 시작할까요?')">
-                <label>DAC 기준 검증 출력<select name="level_dbfs"{' disabled' if post_completed else ''}>{level_options}</select>{post_level_hidden}<span>U7 청취 볼륨과 무관한 실제 DAC 기준입니다. 입력 OFF → PCM 0 dB → sweep → 원래 볼륨 복원 → 입력 복귀 순서로 실행하며, dBFS는 역컨볼루션에서 복원되어 타깃 레벨에는 영향을 주지 않습니다.</span></label>
+                <label>검증 sweep 입력<select name="level_dbfs"{' disabled' if post_completed else ''}>{level_options}</select>{post_level_hidden}<span>U7 청취 볼륨과 무관한 FIR 입력 기준입니다. 현재 FIR의 공통 감쇄는 {common_attenuation_label}이므로 대부분의 실제 출력은 선택값보다 그만큼 낮을 수 있습니다. 입력 OFF → PCM 0 dB → 28초 ESS → 원래 볼륨 복원 → 입력 복귀 순서로 실행합니다.</span></label>
               <button{post_button_disabled}>위치 {next_position}/{post_total} 합산 측정</button>
               </form>
               <p class="form-note">{html.escape(post_action_note)}</p>
@@ -2250,7 +2301,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
           {result_path_note}
           <p><b>{html.escape(dict(target_labels).get(str(result.get('target')), str(result.get('target'))))}</b> · {html.escape(dict((('none', '추가 억제 없음'), ('primus360', 'Primus 360 수준'), ('strong', 'T5S 강한 억제'))).get(str(result.get('preset')), str(result.get('preset'))))} · {result.get('taps')}탭 · 프런트 피크 {left.get('peak_tap', '?')}탭 ({left.get('peak_delay_ms', '?')} ms)</p>
           <p><code>{html.escape(str(result.get('front_sha256', '')))}</code></p>
-          <div class="diagnostic-grid"><div><small>측정 범위</small><b>{'빠른 측정 · 1위치' if int(result.get('measurement_coverage', {}).get('positions', total)) == 1 else '표준 측정 · 3위치'}</b></div><div><small>공간 평균</small><b>{html.escape(str(result.get('spatial_mode', 'equal')))}</b></div><div><small>룸보정 범위</small><b>{limits.get('low_hz', '?')}–{limits.get('high_hz', '?')} Hz</b></div><div><small>최대 상대 보상</small><b>{limits.get('max_relative_compensation_db', limits.get('max_room_boost_db', '?'))} dB</b><small>좁은 딥은 최대 3 dB로 별도 제한</small></div><div><small>공통 0 dB 기준</small><b>{common_scope_label} · 공통 gain {common_gain_label}</b><small>채널별 정규화 없음 · 상대레벨 보존</small></div><div class="{'validation-fail' if crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if crossover_failed else '실측 대기 · ' if crossover_pending else ''}{html.escape(crossover_label)}</b></div>{phase_alignment_card}<div><small>추가 취향</small><b>저음 {preference.get('bass_db_at_20_hz', 0):+} / 고음 {preference.get('treble_db_at_20_khz', 0):+} dB</b></div><div><small>L/R 중앙값 차이</small><b>{diagnostics.get('lr_median_difference_db', '?')} dB</b></div><div><small>공간 편차 중앙값</small><b>{diagnostics.get('spatial_std_median_db', '?')} dB</b></div><div><small>측정 SNR 최소/중앙</small><b>{diagnostics.get('measurement_snr_min_db', '?')} / {diagnostics.get('measurement_snr_median_db', '?')} dB</b></div><div class="{'validation-fail' if validation_failed else ''}"><small>FIR 셀프검증</small><b>{validation_label}</b></div><div><small>우퍼 최종 트림</small><b>{result.get('woofer_trim_db', 0):+} dB</b></div><div><small>측정 시 우퍼 감쇄</small><b>{job.get('woofer_measurement_attenuation_db', -9):+} dB · 응답에서 복원됨</b></div></div>
+          <div class="diagnostic-grid"><div><small>측정 범위</small><b>{'빠른 측정 · 1위치' if int(result.get('measurement_coverage', {}).get('positions', total)) == 1 else '표준 측정 · 3위치'}</b></div><div><small>공간 평균</small><b>{html.escape(str(result.get('spatial_mode', 'equal')))}</b></div><div><small>룸보정 범위</small><b>{limits.get('low_hz', '?')}–{limits.get('high_hz', '?')} Hz</b></div><div><small>최대 상대 보상</small><b>{limits.get('max_relative_compensation_db', limits.get('max_room_boost_db', '?'))} dB</b><small>신뢰 가능한 넓은 roll-off의 상한 · 좁은 딥은 최대 3 dB</small></div><div><small>상대 보상의 음량 비용</small><b>전체 {common_attenuation_label}</b><small>가장 큰 FIR 보정점을 0 dB로 유지하기 위해 L/R/우퍼를 함께 내린 값</small></div><div class="{'diagnostic-warning' if high_frequency_ceiling_reached and isinstance(high_frequency_residual_db, (int, float)) and high_frequency_residual_db > 3 else ''}"><small>15–20 kHz 잔여 오차</small><b>{high_frequency_residual_label}</b><small>{'상대 보상 상한을 모두 사용함' if high_frequency_ceiling_reached else '선택한 보상 한도 안에서 계산됨'}</small></div><div><small>공통 0 dB 기준</small><b>{common_scope_label} · 공통 gain {common_gain_label}</b><small>채널별 정규화 없음 · 상대레벨 보존</small></div><div class="{'validation-fail' if crossover_failed else ''}"><small>디지털 크로스오버 합산</small><b>{'FAIL · ' if crossover_failed else '실측 대기 · ' if crossover_pending else ''}{html.escape(crossover_label)}</b></div>{phase_alignment_card}<div><small>추가 취향</small><b>저음 {preference.get('bass_db_at_20_hz', 0):+} / 고음 {preference.get('treble_db_at_20_khz', 0):+} dB</b></div><div><small>L/R 중앙값 차이</small><b>{diagnostics.get('lr_median_difference_db', '?')} dB</b></div><div><small>공간 편차 중앙값</small><b>{diagnostics.get('spatial_std_median_db', '?')} dB</b></div><div><small>측정 SNR 최소/중앙</small><b>{diagnostics.get('measurement_snr_min_db', '?')} / {diagnostics.get('measurement_snr_median_db', '?')} dB</b></div><div class="{'validation-fail' if validation_failed else ''}"><small>FIR 셀프검증</small><b>{validation_label}</b></div><div><small>우퍼 최종 트림</small><b>{result.get('woofer_trim_db', 0):+} dB</b></div><div><small>측정 시 우퍼 감쇄</small><b>{job.get('woofer_measurement_attenuation_db', -9):+} dB · 응답에서 복원됨</b></div></div>
             <div class="graph-toolbar"><div><b>응답 비교</b><small>전체 대역이 기본이며 저역 확대에서 크로스오버 딥을 확인합니다.</small></div><div role="group" aria-label="그래프 주파수 범위"><button type="button" class="secondary selected" data-result-range="full" aria-pressed="true">전체</button><button type="button" class="secondary" data-result-range="bass" aria-pressed="false">저역</button></div></div>
           <svg id="measurement-result-graph" data-result-target="{html.escape(str(result.get('target', 'harman')))}" viewBox="0 0 760 250" role="img" aria-label="보정 전후 및 합산 주파수 응답"></svg>
           <p id="measurement-result-summary" class="muted" aria-live="polite"></p>
@@ -2260,7 +2311,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
           {validation_checklist_html}
           <div class="diagnostic-note"><b>추가 자동 진단 메모</b><ul>{warning_html}</ul></div>
           {audit_html}
-          <p class="muted">여기서 타깃과 적용 후 예상은 청취 위치 음압입니다. 모든 곡선은 {common_reference.get('reference_band_hz', [500, 2000])[0]}–{common_reference.get('reference_band_hz', [500, 2000])[1]} Hz의 하나의 L/R/우퍼 공통 기준으로 표시·판정하며, 채널별로 다시 0 dB를 맞추지 않습니다. 현황/설정의 FIR 그래프는 이 목표를 만들기 위한 보정 전달함수이므로 타깃 모양과 같지 않습니다.</p>
+          <p class="muted">여기서 타깃과 적용 후 예상은 청취 위치 음압입니다. 모든 곡선은 {common_reference.get('reference_band_hz', [500, 2000])[0]}–{common_reference.get('reference_band_hz', [500, 2000])[1]} Hz의 하나의 L/R/우퍼 공통 기준으로 표시·판정하며, 채널별로 다시 0 dB를 맞추지 않습니다. 최대 상대 보상보다 큰 원 응답 감쇄는 그래프에 일부 남습니다. 한도를 올리면 더 평탄해지는 대신 같은 양만큼 전체 재생 음량 여유를 사용합니다. 현황/설정의 FIR 그래프는 이 목표를 만들기 위한 보정 전달함수이므로 타깃 모양과 같지 않습니다.</p>
           <div class="measure-actions"><a class="button" download href="/api/measurement/download/front">프런트 WAV</a>
           {('<a class="button" download href="/api/measurement/download/rear">우퍼 WAV</a>' if result.get('rear') else '')}
           {('<a class="button" download href="/api/measurement/download/all">전체 ZIP</a>' if result.get('rear') else '')}
@@ -2610,7 +2661,7 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
     .workflow{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:3px;margin:18px 0 0;padding:4px;border:1px solid color-mix(in srgb,var(--step-accent) 38%,var(--border));border-radius:14px 14px 0 0;background:color-mix(in srgb,var(--surface-strong) 78%,transparent)}}.flow-step{{display:flex;min-width:0;align-items:center;justify-content:center;gap:7px;min-height:48px;padding:9px 8px;border:0;border-radius:10px;color:var(--muted);background:transparent;box-shadow:none;font-size:.78rem;text-align:center;text-decoration:none}}button.flow-step{{cursor:pointer}}button.flow-step:hover{{color:var(--text);background:var(--step-soft);transform:none}}.flow-step>span{{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;background:var(--border);color:var(--text);font-weight:800}}.flow-step.done{{color:var(--success)}}.flow-step.done>span{{background:var(--success-bg);color:var(--success)}}.flow-step.current:not(.selected){{box-shadow:inset 0 -3px 0 var(--step-accent)}}.flow-step.current>span{{background:var(--step-accent);color:var(--on-step)}}.flow-step.selected{{color:var(--text);background:var(--step-soft);box-shadow:inset 0 -3px 0 var(--step-accent)}}.flow-step.future{{opacity:.66}}.measurement-tab-panels{{border:1px solid color-mix(in srgb,var(--step-accent) 38%,var(--border));border-top:0;border-radius:0 0 14px 14px;background:color-mix(in srgb,var(--surface-strong) 32%,transparent);min-height:240px}}.measurement-panel{{padding:clamp(14px,2.5vw,22px);outline:none}}.measurement-panel[hidden]{{display:none}}.measurement-panel:focus-visible{{outline:3px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:-3px}}.measurement-panel-heading{{display:flex;align-items:center;gap:11px;padding-bottom:12px;border-bottom:1px solid var(--border)}}.measurement-panel-heading>span{{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--step-accent);color:var(--on-step);font-weight:900}}.measurement-panel-heading>div{{display:grid;gap:2px;min-width:0}}.measurement-panel-heading small{{color:var(--muted);line-height:1.35}}.measurement-panel-content{{min-width:0}}.measurement-panel-empty{{margin-top:14px;padding:16px;border:1px dashed var(--border);border-radius:12px;color:var(--muted);background:var(--surface-strong)}}.measurement-step-sources{{display:none}}[id^="measurement-step-"]{{scroll-margin-top:18px}}.form-note{{grid-column:1/-1;margin:0;color:var(--muted);font-size:.8rem;line-height:1.45}}.cal-card{{display:grid;gap:14px;padding:14px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent)}}.cal-head{{display:flex;gap:10px;align-items:center}}.cal-head p,.cal-card p{{margin:5px 0 0}}.cal-slots{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.cal-slot{{display:grid;grid-template-columns:1fr auto;gap:8px 12px;padding:12px;margin:0;border:1px solid var(--border);border-radius:12px;background:var(--surface-strong)}}.cal-slot>div{{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:8px}}.cal-slot>p{{grid-column:1/-1;color:var(--muted);font-size:.82rem}}.cal-slot label{{display:grid;gap:5px;color:var(--muted);font-size:.82rem}}.cal-slot input[type=file]{{margin:0}}.pill.neutral{{background:var(--border);color:var(--muted)}}
     .flow-step.validation-error,.flow-step.validation-error.selected{{border:1px solid var(--danger);background:var(--danger-bg);color:var(--danger);box-shadow:inset 0 -3px 0 var(--danger)}}.flow-step.validation-error>span{{background:var(--danger);color:#fff}}.flow-step>em{{padding:2px 5px;border-radius:999px;background:var(--danger);color:#fff;font-size:.58rem;font-style:normal;font-weight:900;letter-spacing:.04em}}.validation-jumps{{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}}.validation-jump{{min-height:34px;padding:6px 10px;font-size:.76rem}}
     .level-result{{margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:14px}}.level-result.ok{{border-color:var(--success);background:color-mix(in srgb,var(--success-bg) 55%,transparent)}}.level-result.not-ok{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 8%,var(--surface-strong))}}.level-verdict{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}.level-verdict>b{{font-size:1.05rem}}.metric-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-top:12px}}.metric-grid>div{{display:grid;gap:3px;padding:9px;border-radius:10px;background:var(--surface-strong)}}.metric-grid small{{color:var(--muted)}}button:disabled{{cursor:not-allowed;opacity:.45;transform:none;box-shadow:none}}
-    .diagnostic-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:12px 0}}.diagnostic-grid>div{{display:grid;gap:4px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.diagnostic-grid>div.validation-fail{{border-color:var(--danger);background:var(--danger-bg);color:var(--danger);box-shadow:0 0 0 2px color-mix(in srgb,var(--danger) 12%,transparent)}}.diagnostic-grid>div.validation-fail small{{color:var(--danger)}}.diagnostic-grid>div.phase-complex{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 8%,var(--surface-strong))}}.diagnostic-grid>div.phase-complex small{{color:var(--warning)}}.diagnostic-grid small{{color:var(--muted)}}.validation-checklist{{margin:16px 0;padding:14px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent)}}.validation-checklist h4{{margin:0 0 4px;font-size:1rem}}.validation-checklist .section-head+div{{display:grid;gap:7px;margin-top:12px}}.validation-row{{display:grid;grid-template-columns:72px 1fr;gap:10px;align-items:start;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.validation-row.fail{{border-color:var(--danger);background:var(--danger-bg)}}.validation-row.pending{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-strong))}}.validation-row.na{{opacity:.82}}.validation-row>div{{display:grid;gap:3px}}.validation-row small{{color:var(--muted);line-height:1.4}}.validation-row.fail small{{color:color-mix(in srgb,var(--danger) 76%,var(--text))}}.validation-row p{{margin:5px 0 0;padding:8px;border-radius:8px;background:color-mix(in srgb,var(--surface-strong) 68%,transparent);color:var(--danger);font-size:.82rem;line-height:1.5}}.validation-row.pending p{{color:var(--warning)}}.status-badge{{display:inline-grid;place-items:center;min-height:25px;padding:4px 7px;border-radius:999px;font-size:.68rem;font-weight:950;letter-spacing:.04em}}.status-badge.pass{{background:var(--success-bg);color:var(--success)}}.status-badge.fail{{background:var(--danger);color:#fff}}.status-badge.pending{{background:var(--warning);color:#10151e}}.status-badge.na{{background:var(--border);color:var(--muted)}}.pre-sum-card{{margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:14px;background:var(--surface-strong)}}.pre-sum-card.pass{{border-color:var(--success)}}.pre-sum-card.fail{{border-color:var(--danger);background:var(--danger-bg)}}.diagnostic-note{{padding:12px;border-left:4px solid var(--accent);border-radius:8px;background:var(--accent-soft)}}.diagnostic-note ul{{margin:6px 0 0;padding-left:20px}}.target-fit{{margin:10px 0}}.decay-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}}.decay-grid>div{{display:grid;gap:5px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.decay-grid small{{color:var(--muted);font-weight:800}}.decay-grid span{{display:flex;justify-content:space-between;gap:8px;font-size:.82rem}}
+    .diagnostic-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:12px 0}}.diagnostic-grid>div{{display:grid;gap:4px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.diagnostic-grid>div.validation-fail{{border-color:var(--danger);background:var(--danger-bg);color:var(--danger);box-shadow:0 0 0 2px color-mix(in srgb,var(--danger) 12%,transparent)}}.diagnostic-grid>div.validation-fail small{{color:var(--danger)}}.diagnostic-grid>div.diagnostic-warning,.diagnostic-grid>div.phase-complex{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 8%,var(--surface-strong))}}.diagnostic-grid>div.diagnostic-warning small,.diagnostic-grid>div.phase-complex small{{color:var(--warning)}}.diagnostic-grid small{{color:var(--muted)}}.validation-checklist{{margin:16px 0;padding:14px;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--surface-strong) 72%,transparent)}}.validation-checklist h4{{margin:0 0 4px;font-size:1rem}}.validation-checklist .section-head+div{{display:grid;gap:7px;margin-top:12px}}.validation-row{{display:grid;grid-template-columns:72px 1fr;gap:10px;align-items:start;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.validation-row.fail{{border-color:var(--danger);background:var(--danger-bg)}}.validation-row.pending{{border-color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-strong))}}.validation-row.na{{opacity:.82}}.validation-row>div{{display:grid;gap:3px}}.validation-row small{{color:var(--muted);line-height:1.4}}.validation-row.fail small{{color:color-mix(in srgb,var(--danger) 76%,var(--text))}}.validation-row p{{margin:5px 0 0;padding:8px;border-radius:8px;background:color-mix(in srgb,var(--surface-strong) 68%,transparent);color:var(--danger);font-size:.82rem;line-height:1.5}}.validation-row.pending p{{color:var(--warning)}}.status-badge{{display:inline-grid;place-items:center;min-height:25px;padding:4px 7px;border-radius:999px;font-size:.68rem;font-weight:950;letter-spacing:.04em}}.status-badge.pass{{background:var(--success-bg);color:var(--success)}}.status-badge.fail{{background:var(--danger);color:#fff}}.status-badge.pending{{background:var(--warning);color:#10151e}}.status-badge.na{{background:var(--border);color:var(--muted)}}.pre-sum-card{{margin:14px 0;padding:14px;border:1px solid var(--border);border-radius:14px;background:var(--surface-strong)}}.pre-sum-card.pass{{border-color:var(--success)}}.pre-sum-card.fail{{border-color:var(--danger);background:var(--danger-bg)}}.diagnostic-note{{padding:12px;border-left:4px solid var(--accent);border-radius:8px;background:var(--accent-soft)}}.diagnostic-note ul{{margin:6px 0 0;padding-left:20px}}.target-fit{{margin:10px 0}}.decay-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}}.decay-grid>div{{display:grid;gap:5px;padding:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-strong)}}.decay-grid small{{color:var(--muted);font-weight:800}}.decay-grid span{{display:flex;justify-content:space-between;gap:8px;font-size:.82rem}}
     .stage-workflow{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding-top:16px;border-top:1px solid var(--border)}}.stage-step{{display:grid;grid-template-columns:30px 1fr;column-gap:8px;align-items:center;padding:10px;border:1px solid var(--border);border-radius:12px;color:var(--muted)}}.stage-step span{{grid-row:1/3;display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:var(--border);font-weight:900;color:var(--text)}}.stage-step b{{font-size:.88rem;color:var(--text)}}.stage-step small{{font-size:.72rem}}.stage-step.done span{{background:var(--success-bg);color:var(--success)}}.stage-step.current{{border-color:var(--accent);background:var(--accent-soft)}}.stage-step.current span{{background:var(--accent);color:var(--on-accent)}}.stage-summary{{display:flex;align-items:center;gap:12px;padding:14px;margin:12px 0;border-radius:13px;background:color-mix(in srgb,var(--accent-soft) 56%,var(--surface-strong));border:1px solid color-mix(in srgb,var(--accent) 45%,var(--border))}}.stage-summary>div{{flex:1}}.stage-summary p{{margin:4px 0 0;color:var(--muted);font-size:.84rem;line-height:1.45}}.staged-compare h3{{margin:18px 0 4px;font-size:1rem}}.stage-actions{{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:14px;margin-top:12px;border:1px solid var(--border);border-radius:13px;background:color-mix(in srgb,var(--surface-strong) 70%,transparent)}}.stage-actions p{{margin:4px 0 0}}.stage-actions.final{{border-color:color-mix(in srgb,var(--success) 52%,var(--border));background:color-mix(in srgb,var(--success-bg) 35%,var(--surface-strong))}}
     .backup-actions{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}}.backup-actions>div,.backup-actions>form{{display:grid;align-content:start;gap:8px;padding:14px;margin:0;border:1px solid var(--border);border-radius:13px;background:var(--surface-strong)}}.backup-actions p{{margin:0;color:var(--muted);font-size:.84rem}}.backup-actions .button,.backup-actions button{{justify-self:start}}.restore-review{{margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}}
     table{{border-collapse:collapse;width:100%}}td{{padding:9px 6px;border-bottom:1px solid var(--border)}}td:first-child{{color:var(--muted);width:38%}}output,progress,table,code,.metric-grid,.diagnostic-grid{{font-variant-numeric:tabular-nums}}
@@ -2698,6 +2749,7 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
 const panel=document.querySelector('.measurement');
 if(!panel)return;
 let reloading=false;
+const canonicalMeasurementUrl='/measure';
 const initial={{
   state:panel.dataset.jobState,
   position:panel.dataset.jobPosition,
@@ -2777,6 +2829,33 @@ fetch('/api/targets',{{cache:'no-store'}}).then(r=>r.json()).then(j=>{{catalog=j
 
 let resultCurves=[];
 let resultRange='full';
+const sampleLogCurve=(frequencies,values,frequency)=>{{
+  const count=Math.min(frequencies?.length||0,values?.length||0);
+  if(!count)return NaN;
+  if(frequency<=Number(frequencies[0]))return Number(values[0]);
+  if(frequency>=Number(frequencies[count-1]))return Number(values[count-1]);
+  let lo=0,hi=count-1;
+  while(hi-lo>1){{const mid=(lo+hi)>>1;if(Number(frequencies[mid])<=frequency)lo=mid;else hi=mid;}}
+  const f0=Number(frequencies[lo]),f1=Number(frequencies[hi]);
+  const v0=Number(values[lo]),v1=Number(values[hi]);
+  if(!Number.isFinite(v0)||!Number.isFinite(v1)||!(f1>f0))return NaN;
+  const ratio=Math.log(frequency/f0)/Math.log(f1/f0);
+  return v0+(v1-v0)*ratio;
+}};
+const mergeLowSystemResponse=(front,sumFrequency,sumDb)=>{{
+  if(!front?.frequency?.length)return{{f:sumFrequency||[],d:sumDb||[]}};
+  const frequency=front.frequency.map(Number);
+  const frontDb=(front.predicted_db||[]).map(Number);
+  const count=Math.min(sumFrequency?.length||0,sumDb?.length||0);
+  if(!count)return{{f:frequency,d:frontDb}};
+  const low=Number(sumFrequency[0]),high=Number(sumFrequency[count-1]);
+  const merged=frequency.map((value,index)=>{{
+    if(value<low||value>high)return frontDb[index];
+    const summed=sampleLogCurve(sumFrequency,sumDb,value);
+    return Number.isFinite(summed)?summed:frontDb[index];
+  }});
+  return{{f:frequency,d:merged}};
+}};
 const paintResult=()=>{{
   if(!resultCurves.length)return;
   const range=resultRange==='bass'?[20,250]:[20,20000];
@@ -2787,7 +2866,7 @@ const paintResult=()=>{{
   const maxY=Math.ceil((Math.max(10,...values)+2)/5)*5;
   draw(document.getElementById('measurement-result-graph'),resultCurves,minY,maxY,range);
   const summary=document.getElementById('measurement-result-summary');
-  if(summary)summary.textContent=resultRange==='bass'?'20–250 Hz 확대 · 크로스오버 합산과 딥 진단':'20 Hz–20 kHz 전체 · L/R+우퍼 합산과 선택 타깃';
+  if(summary)summary.textContent=resultRange==='bass'?'20–250 Hz 확대 · L/R+우퍼 실측·예상과 크로스오버 딥':'20 Hz–20 kHz 전체 · 사후 검증 후에는 실측과 계산 예상값을 같은 공통 기준으로 비교';
 }};
 document.querySelectorAll('[data-result-range]').forEach(button=>button.addEventListener('click',()=>{{
   resultRange=button.dataset.resultRange;
@@ -2835,38 +2914,40 @@ const poll=async()=>{{
           window.alert(`위치 ${{completedPositions}} 측정이 완료되었습니다.\n\n마이크를 청취점 근처의 다음 위치 ${{completedPositions+1}}로 옮기고, 천장 방향 90°를 유지하세요.\n\n확인을 누르면 다음 위치 준비 화면으로 이동합니다. 소리는 자동으로 시작되지 않습니다.`);
         }}
         paintLive('결과 반영 중','refreshing');
-        const url=new URL(location.href);url.searchParams.set('updated',String(j.updated_unix||Date.now()));
+        const url=new URL(canonicalMeasurementUrl,location.origin);url.searchParams.set('updated',String(j.updated_unix||Date.now()));
         setTimeout(()=>location.replace(url),150);
         return;
       }}
       if(j.result?.graphs){{
         const curves=[];
+        const graphs=j.result.graphs||{{}};
         const measured=j.result.self_validation?.post_filter_sum?.channels;
         if(measured?.left?.frequency){{
           for(const [name,key,color] of [['L+우퍼 실측','left','var(--curve-l)'],['R+우퍼 실측','right','var(--curve-r)']]){{
             const c=measured[key];
-            if(c)curves.push({{name,f:c.frequency,d:c.measured_sum_db,band:c.spatial_std_db,color,width:2.5}});
+            if(c){{
+              curves.push({{name:name+' · 실제 FIR 통과',f:c.frequency,d:c.measured_sum_db,color,width:2.5}});
+              if(c.predicted_sum_db)curves.push({{name:name.replace('실측','예상'),f:c.frequency,d:c.predicted_sum_db,color,dash:'7 4',width:1.5}});
+            }}
           }}
-          const c=measured.left;
-          if(c)curves.push({{name:'선택 타깃 · 실제 합산 판정',f:c.frequency,d:c.effective_target_db,color:'var(--graph-text)',dash:'2 4',width:1.5}});
         }}else if(j.result.crossover?.sum_guard_enabled&&j.result.crossover?.channels){{
           for(const [name,key,color] of [['L+우퍼 합산 예측','left','var(--curve-l)'],['R+우퍼 합산 예측','right','var(--curve-r)']]){{
             const c=j.result.crossover.channels[key];
             if(c?.frequency){{
               const reliable=Boolean(c.complex_prediction_reliable);
-              curves.push({{name:reliable?name:name.replace('합산 예측','합산 안전 상한 · 위상 제한'),f:c.frequency,d:reliable?c.predicted_complex_db:(c.coherent_upper_db||c.phase_agnostic_energy_db||c.predicted_complex_db),color,width:2.5}});
+              const sumDb=reliable?c.predicted_complex_db:(c.coherent_upper_db||c.phase_agnostic_energy_db||c.predicted_complex_db);
+              const merged=mergeLowSystemResponse(graphs[key],c.frequency,sumDb);
+              curves.push({{name:(reliable?name:name.replace('합산 예측','합산 안전 상한 · 위상 제한'))+' / 프런트 예상 고역',f:merged.f,d:merged.d,color,width:2.5}});
             }}
           }}
-          const c=j.result.crossover.channels.left;
-          if(c?.frequency)curves.push({{name:'선택 타깃 · 합산 기준',f:c.frequency,d:c.target_db,color:'var(--graph-text)',dash:'2 4',width:1.5}});
         }}else{{
-          const g=j.result.graphs;
+          const g=graphs;
           for(const [name,key,color] of [['Left','left','var(--curve-l)'],['Right','right','var(--curve-r)']]){{
             if(g[key]?.frequency)curves.push({{name:name+' · 후(예상)',f:g[key].frequency,d:g[key].predicted_db,color,width:2.5}});
           }}
-          const first=g.left||g.right;
-          if(first?.target_db)curves.push({{name:'적용 타깃',f:first.frequency,d:first.target_db,color:'var(--graph-text)',dash:'2 4',width:1.4}});
         }}
+        const targetGraph=graphs.left||graphs.right;
+        if(targetGraph?.frequency&&targetGraph?.target_db)curves.push({{name:'선택 타깃 · 전체 시스템 기준',f:targetGraph.frequency,d:targetGraph.target_db,color:'var(--graph-text)',dash:'2 4',width:1.4}});
         resultCurves=curves;
         paintResult();
       }}
@@ -3371,7 +3452,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/measurement/build":
                 fields = self.read_urlencoded()
-                measurement("start-build", fields["target"], fields["preset"], fields["woofer_trim_db"], fields["phase_mode"], fields["phase_cutoff"], fields["spatial_mode"], fields["bass_tilt_db"], fields["treble_tilt_db"], fields["correction_low_hz"], fields["correction_high_hz"], fields["max_boost_db"], fields["max_cut_db"], fields["mimo_high_hz"], fields["mimo_strength"], fields["mimo_support_penalty_db"], fields["crossover_enabled"], fields["crossover_frequency_hz"])
+                measurement("start-build", *correction_build_arguments(fields))
                 self.redirect("32768탭 FIR 계산을 시작했습니다.", "/measure")
                 return
             if parsed.path == "/measurement/apply":

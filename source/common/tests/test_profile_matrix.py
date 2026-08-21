@@ -349,6 +349,17 @@ def main() -> int:
         })
         os.environ.update({key: value for key, value in environment.items() if key.startswith("AUDIODSP_")})
         manager = load_module("audiodsp_profile_manager_matrix", args.manager)
+        web_module = load_module("audiodsp_profile_web_matrix", args.web)
+        web_module.measurement_status = lambda: {
+            "correction_preferences": dict(
+                web_module.DEFAULT_CORRECTION_PREFERENCES,
+                correction_low_hz=30,
+                max_cut_db=18,
+            )
+        }
+        partial_build = web_module.correction_build_arguments({"target": "flat", "max_boost_db": "10"})
+        require(partial_build[8] == "30" and partial_build[11] == "18", "partial/stale FIR form did not preserve missing advanced settings")
+        report["partial_build_form"] = {"missing_max_cut_fallback": True, "arguments": len(partial_build)}
 
         sources = {
             "speaker_front": assets / "speaker-front.wav",
@@ -700,8 +711,9 @@ def main() -> int:
             for marker in (b"32768", b"UMIK-1", b"target-graph", b"job-progress", b"workflow", b"cal-card", b"session-overview", b"session-library", b'name="woofer_measurement_attenuation_db"', b'value="-42"', b"measurement-path-lock", b'data-measurement-path="unbound"', "세션 생성".encode("utf-8"), "빠른 검사와 본 측정의 스윕 출력은 2단계".encode("utf-8"), "L+우퍼 / R+우퍼".encode("utf-8"), "정밀 분리+합산".encode("utf-8"), "L/R/우퍼/L+우퍼/R+우퍼".encode("utf-8"), "프런트 L → 프런트 R → 우퍼 → L+우퍼 → R+우퍼 → L+R+우퍼 동시 위상".encode("utf-8"), "90° · 천장 방향".encode("utf-8"), "0° · 마이크 정면".encode("utf-8"), "빠른 측정 · 기준점 1위치".encode("utf-8"), "표준 측정 · 중앙+좌우 3위치".encode("utf-8"), "활성 세션 없음".encode("utf-8")):
                 require(marker in measure_page, f"Measurement-page marker missing: {marker!r}")
             web_source = args.web.read_text(encoding="utf-8")
-            for marker in ("본 측정과 같은 15 Hz–22 kHz 스윕·라우팅·SNR 계산", "빠른 검사 저장 원본", "/measurement/reprocess-level", "저역 late/early", "저역 기준 레벨 고정", "L/R 동일 기준", "1.5 dB 넘게 악화", "실제 RT60/잔향 예측이 아니며", "디지털 크로스오버", "LR4 HPF", "additional_block_latency_samples", "set-session-note", "load-session", "build-fieldset", "validation-checklist", "음색 시작점", "타깃 그대로", "맑은 고음", "따뜻한 균형", "야간 균형", "최대 상대 보상", "공통 0 dB 기준", "one_common_level_reference", "premeasured_sum_validation", "필터 전 합산 교차항 확인", "합산 안전 상한", "sum_guard_enabled&&j.result.crossover?.channels", "소리는 자동으로 시작되지 않습니다", "--step-accent", "summary::after", "details[open]>summary::after"):
+            for marker in ("본 측정과 같은 15 Hz–22 kHz 스윕·라우팅·SNR 계산", "빠른 검사 저장 원본", "/measurement/reprocess-level", "저역 late/early", "저역 기준 레벨 고정", "L/R 동일 기준", "1.5 dB 넘게 악화", "실제 RT60/잔향 예측이 아니며", "디지털 크로스오버", "LR4 HPF", "additional_block_latency_samples", "set-session-note", "load-session", "build-fieldset", "validation-checklist", "음색 시작점", "타깃 그대로", "맑은 고음", "따뜻한 균형", "야간 균형", "최대 상대 보상", "상대 보상의 음량 비용", "15–20 kHz 잔여 오차", "공통 0 dB 기준", "one_common_level_reference", "premeasured_sum_validation", "필터 전 합산 교차항 확인", "합산 안전 상한", "sum_guard_enabled&&j.result.crossover?.channels", "mergeLowSystemResponse", "사후 검증 후에는 실측과 계산 예상값을 같은 공통 기준으로 비교", "predicted_sum_db", "inconclusive_low_snr", "검증 sweep 입력", "28초 ESS", "canonicalMeasurementUrl='/measure'", "소리는 자동으로 시작되지 않습니다", "--step-accent", "summary::after", "details[open]>summary::after"):
                 require(marker in web_source, f"Measurement/MIMO safety UI source marker missing: {marker}")
+            require("new URL(location.href);url.searchParams.set('updated'" not in web_source, "measurement completion still reloads a POST-only route")
             require(b'role="tab" class="flow-step current"' in measure_page, "current measurement step is not an accessible non-destructive tab")
             require(b'aria-current="step"' in measure_page, "current measurement step lacks accessible state")
             require("<title>측정 · 보정 · AudioDSP</title>".encode("utf-8") in measure_page, "measurement page title is not contextual")
@@ -922,7 +934,7 @@ def main() -> int:
                 "measurement status is not strict browser-compatible JSON",
             )
             result_page, _ = get_bytes(base + "/measure")
-            for marker in ("프런트 WAV".encode("utf-8"), "우퍼 WAV".encode("utf-8"), "전체 ZIP".encode("utf-8"), b"measurement-result-graph", b'data-result-range="full"', b'data-result-range="bass"', "A/B 청취 비교".encode("utf-8"), "자동 백업".encode("utf-8"), b'action="/measurement/apply"', "정식 적용".encode("utf-8"), b'data-measurement-path="speaker"', "이 결과의 전용 경로".encode("utf-8"), "U7 스피커 출력".encode("utf-8"), b'role="tablist"', b'role="tabpanel"', b"non_destructive_measurement_tabs", "우퍼 최종 트림".encode("utf-8"), "측정 시 우퍼 감쇄".encode("utf-8"), "자동 검증".encode("utf-8"), "MAE는 평균 절대오차".encode("utf-8"), b"status-badge na", b"resultToken"):
+            for marker in ("프런트 WAV".encode("utf-8"), "우퍼 WAV".encode("utf-8"), "전체 ZIP".encode("utf-8"), b"measurement-result-graph", b'data-result-range="full"', b'data-result-range="bass"', "A/B 청취 비교".encode("utf-8"), "자동 백업".encode("utf-8"), b'action="/measurement/apply"', "정식 적용".encode("utf-8"), b'data-measurement-path="speaker"', "이 결과의 전용 경로".encode("utf-8"), "U7 스피커 출력".encode("utf-8"), b'role="tablist"', b'role="tabpanel"', b"non_destructive_measurement_tabs", "우퍼 최종 트림".encode("utf-8"), "측정 시 우퍼 감쇄".encode("utf-8"), "상대 보상의 음량 비용".encode("utf-8"), "자동 검증".encode("utf-8"), "MAE는 평균 절대오차".encode("utf-8"), b"status-badge na", b"resultToken"):
                 require(marker in result_page, f"generated-result Web marker missing: {marker!r}")
             require(result_page.count(b'role="tab"') == 6 and result_page.count(b'role="tabpanel"') == 6, "measurement workflow is not a six-tab/six-panel interface")
             require(b'value="headphone"' not in result_page, "speaker-bound result offered the Headphone-jack profile")

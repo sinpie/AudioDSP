@@ -86,9 +86,9 @@ Preset은 boost를 만들지 않으며 Front에는 350 Hz 이하, Woofer에는 �
 
 - L/R의 500~2,000 Hz 측정·타깃 median으로 **하나의 공통 0 dB 기준**을 만든다. 이 기준을 L/R/Woofer의 설계, 결과 그래프, 자동 판정에 그대로 사용하며 Woofer나 좌우를 따로 0 dB로 맞추지 않는다. Woofer SNR의 50~120 Hz 계열 적응형 판정 대역은 측정 품질용일 뿐 레벨 정규화 기준이 아니다.
 - 반 octave median 응답이 기준보다 10 dB 내려간 지점으로 자연 usable band를 추정한다.
-- 두 Front가 2~20 kHz에서 같은 방향으로 감쇄되고 서로 4 dB 안에서 일치하면 스피커/마이크의 공통 광대역 roll-off로 간주해 보상 신뢰도를 제한적으로 회복한다. 한 채널만의 딥이나 약 1/3 octave보다 좁은 null은 이 예외를 받지 않는다.
+- 두 Front가 2~20 kHz에서 같은 방향으로 감쇄되고 서로 4 dB 안에서 일치하면 스피커/마이크의 공통 광대역 roll-off로 간주한다. 이 경우 edge SNR 신뢰도를 다시 correction 크기에 곱하지 않고 공간편차·local-shape regularization 뒤 사용자가 선택한 상대 보상 상한까지 허용한다. 한 채널만의 딥이나 약 1/3 octave보다 좁은 null은 이 예외를 받지 않는다.
 - 공간 표준편차가 3 dB면 boost 신뢰도를 절반 수준으로 낮추는 soft regularization을 쓴다.
-- `최대 상대 보상`은 0/3/6/9/10 dB이며 기본 10 dB다. 신뢰되는 가장 큰 positive correction을 0 dB로 만들기 위해 전체 L/R/Woofer bank를 같은 값만큼 낮춘다. 따라서 디지털 preamp나 양의 FIR 전달 이득 없이 넓은 고역 roll-off도 상대 보상할 수 있다.
+- `최대 상대 보상`은 0/3/6/9/10 dB이며 기본 10 dB다. 신뢰되는 가장 큰 positive correction을 0 dB로 만들기 위해 전체 L/R/Woofer bank를 같은 값만큼 낮춘다. 따라서 디지털 preamp나 양의 FIR 전달 이득 없이 넓은 고역 roll-off도 상대 보상할 수 있다. 원 응답 감쇄가 선택 상한보다 크면 남은 slope를 억지로 숨기지 않으며, 15/20 kHz 잔여 오차와 공통 음량 감쇄를 결과/UI/보고서에 명시한다.
 - 좁고 깊은 null은 공간 평균과 양쪽 ±1/6 octave 이웃으로 판별하며 최대 3 dB만 허용한다. 한 deep을 채우려고 나머지 전 대역을 과도하게 낮추지 않는다.
 - cut은 사용자 최대 6/9/12/18/24 dB에서 제한한다.
 - Woofer correction은 20~180 Hz에서 cut-only다.
@@ -135,6 +135,8 @@ Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니�
 - crossover 결과는 `result.crossover`에 내장 여부, 주파수, 추가 runtime filter/block latency(모두 0), 상한 guard, 복소합 target, phase 신뢰도와 상태를 저장한다.
 
 브라우저 다운로드와 그래프 확인은 playback을 바꾸지 않는다. Preview는 runtime config만 임시 교체하며 profile WAV/settings는 그대로다. Apply에서 기존 파일을 백업한 뒤 정식 WAV를 교체한다.
+
+선택형 사후 검증은 실제 Preview FIR을 통과한 L+Woofer/R+Woofer를 다시 측정한다. 실측과 계산 예상은 각각 L/R을 합친 500~2,000 Hz 기준 한 번만 적용하며 좌우를 따로 0 dB로 맞추지 않는다. 전체 target MAE/P90, 50~200 Hz crossover MAE/P90뿐 아니라 **계산 예상↔실측** MAE/P90도 별도 저장한다. 신뢰 가능한 복소 합산 모델의 예상 오차는 PASS gate에 포함한다. 6~15 dB의 낮은 SNR에서 기준을 근소하게 넘은 결과는 확정 FAIL이 아니라 `inconclusive_low_snr`로 표시하고, 큰 오차만 즉시 차단한다. 사후 sweep은 FIR 입력 기준이며 현재 bank의 공통 감쇄 뒤 실제 출력은 더 작아질 수 있으므로 28초 ESS와 -25 dBFS 재검증을 안내한다.
 
 현황/설정에서 표시하는 FIR FFT는 목표 음압 자체가 아니라 측정 응답에 곱하는 보정 전달함수다. 따라서 Harman target의 저역 상승·고역 하강과 같은 모양일 필요가 없다. 목표 달성 여부는 측정·보정 결과의 `effective_target_db`와 실제 FIR FFT 기반 `predicted_db`, 그리고 crossover 사용 시 Front+Woofer 합산 검증으로 판단한다.
 

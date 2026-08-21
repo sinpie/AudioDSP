@@ -505,8 +505,8 @@ def main() -> int:
             [20.0, 20_000.0], [0.0, 0.0], 0.0, 0.0,
         )
         upper_index = min(range(len(reliability_f)), key=lambda index: abs(reliability_f[index] - 16_000.0))
-        require(left_confidence[upper_index] >= 0.25 and right_confidence[upper_index] >= 0.25, "independent L/R broad roll-off did not raise confidence")
-        require(left_rolloff_floor[upper_index] >= 0.25 and right_rolloff_floor[upper_index] >= 0.25, "broad roll-off evidence was not separated from raw SNR confidence")
+        require(left_confidence[upper_index] >= 0.50 and right_confidence[upper_index] >= 0.50, "independent L/R broad roll-off did not raise confidence enough to use the selected relative ceiling")
+        require(left_rolloff_floor[upper_index] >= 0.50 and right_rolloff_floor[upper_index] >= 0.50, "broad roll-off evidence was not separated from raw SNR confidence")
         require(rolloff_summary["narrow_null_guard_remains_enabled"], "stereo roll-off inference disabled the null guard")
         rolloff_ir, rolloff_graph = engine.design_channel(
             reliability_f, broad_left, [0.2] * len(reliability_f), [0.0] * len(reliability_f),
@@ -518,7 +518,7 @@ def main() -> int:
             max_boost_db=10, fft=fft_backend,
         )
         rolloff_graph_index = min(range(len(rolloff_graph["frequency"])), key=lambda index: abs(rolloff_graph["frequency"][index] - 16_000.0))
-        require(rolloff_graph["requested_correction_db"][rolloff_graph_index] > 1.0, "trusted broad high-frequency roll-off was left completely uncorrected")
+        require(4.0 < rolloff_graph["requested_correction_db"][rolloff_graph_index] <= 10.0, "trusted broad high-frequency roll-off did not use the selected relative ceiling")
         deep_ir, deep_graph = engine.design_channel(
             reliability_f, notch_db, [0.2] * len(reliability_f), [0.0] * len(reliability_f),
             "flat", "none", woofer=False, woofer_trim_db=0,
@@ -725,7 +725,7 @@ def main() -> int:
         # the target gate; same-recording relative phase drives the joint sum
         # guard and a later post-FIR capture remains optional evidence.
         baseline_started = time.monotonic()
-        engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 6, 18, crossover_enabled=True, crossover_frequency_hz=100)
+        engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 10, 18, crossover_enabled=True, crossover_frequency_hz=100)
         baseline_state = engine.load_current()
         baseline_result = validate_result(engine, baseline_state, phase=True)
         baseline_validation = baseline_state["result"]["self_validation"]
@@ -734,6 +734,11 @@ def main() -> int:
         require(baseline_target_fit["woofer"]["applicable"] is False and baseline_target_fit["woofer"]["pass"] is None, "Flat/none/0 incorrectly grades an isolated LPF Woofer against the full-system target")
         require(baseline_validation["overall_pass"] and baseline_validation["crossover_sum"]["status"] == "pass_independent_complex_model", "Flat/none/0 did not pass the same-recording L/R/W sum guard")
         require(baseline_state["result"]["crossover"]["safe_deploy_pass"] and baseline_state["result"]["crossover"]["complex_sum_target_pass"] is True, "Flat/none/0 did not use reliable relative phase")
+        high_frequency = baseline_state["result"]["high_frequency_compensation"]
+        require(high_frequency["maximum_relative_compensation_db"] == 10, "default maximum relative compensation was not recorded")
+        require(high_frequency["common_attenuation_db"] == baseline_state["result"]["filter_bank_normalization"]["common_attenuation_db"], "high-frequency diagnostic lost the common bank attenuation")
+        require(all(set(high_frequency["channels"][side]) == {"10000", "15000", "20000"} for side in ("left", "right")), "high-frequency residual diagnostic is incomplete")
+        require(high_frequency["worst_abs_residual_db_15_20khz"] >= 0, "high-frequency residual diagnostic is invalid")
         for side in ("left", "right"):
             crossover_graph = baseline_state["result"]["crossover"]["channels"][side]
             require(crossover_graph["frequency"][0] <= 20.1 and crossover_graph["frequency"][-1] >= 19_000.0, "A/B sum graph is not full range")
@@ -770,7 +775,7 @@ def main() -> int:
             "Standard measurement order is not stable L/R/W/L+W/R+W at every position",
         )
         engine.save_current(precise_state)
-        engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 6, 18, crossover_enabled=True, crossover_frequency_hz=100)
+        engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 10, 18, crossover_enabled=True, crossover_frequency_hz=100)
         precise_built = engine.load_current()
         validate_result(engine, precise_built, phase=True)
         precise_validation = precise_built["result"]["self_validation"]
@@ -783,7 +788,7 @@ def main() -> int:
         require(precise_built["result"]["filter_bank_normalization"]["relative_branch_gain_preserved"], "precision mode did not use one common bank normalization")
 
         engine.save_current(precise_state)
-        engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 6, 18, crossover_enabled=False, crossover_frequency_hz=100)
+        engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 10, 18, crossover_enabled=False, crossover_frequency_hz=100)
         precise_full_range = engine.load_current()
         validate_result(engine, precise_full_range, phase=True)
         require(not precise_full_range["result"]["crossover"]["enabled"], "Crossover OFF unexpectedly embedded LR4 branches")
@@ -791,7 +796,7 @@ def main() -> int:
         require(precise_full_range["result"]["self_validation"]["crossover_sum"]["status"] == "pass_premeasured_complex_model", "Crossover OFF graded Front/Woofer independently instead of validating all six captures")
 
         engine.save_current(precise_state)
-        engine.build_worker("harman", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 6, 18, crossover_enabled=True, crossover_frequency_hz=100)
+        engine.build_worker("harman", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 10, 18, crossover_enabled=True, crossover_frequency_hz=100)
         precise_harman = engine.load_current()
         validate_result(engine, precise_harman, phase=True)
         harman_effective = engine.effective_combined_target(precise_harman["result"], frequencies)
@@ -814,7 +819,7 @@ def main() -> int:
         scaled_state = json.loads(json.dumps(state))
         scaled_state.update({"level_dbfs": -30, "noise_level_dbfs": -36, "woofer_measurement_attenuation_db": -18})
         engine.save_current(scaled_state)
-        engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 6, 18, crossover_enabled=True, crossover_frequency_hz=100)
+        engine.build_worker("flat", "none", 0, "bass", 200, "equal", 0, 0, 20, 20_000, 10, 18, crossover_enabled=True, crossover_frequency_hz=100)
         scaled_result = engine.load_current()["result"]
         require(scaled_result["front_sha256"] == baseline_front_hash and scaled_result["rear_sha256"] == baseline_rear_hash, "measurement dBFS/Woofer attenuation changed the Flat/none/0 FIR")
         engine.save_current(state)
@@ -880,14 +885,17 @@ def main() -> int:
             require(phase_state["result"]["self_validation"]["core_checks"].get(key), f"common-reference automatic validation failed: {key}")
         require(phase_state["result"]["graphs"]["left"]["crossover"]["role"] == "highpass", "Front crossover is not HPF")
         require(phase_state["result"]["graphs"]["woofer"]["crossover"]["role"] == "lowpass", "Woofer crossover is not LPF")
-        effective_target = engine.effective_combined_target(phase_state["result"], frequencies)
+        post_prediction = {
+            side: engine.predicted_combined_response(phase_state["result"], side, frequencies)[0]
+            for side in ("left", "right")
+        }
         for position in range(1, 4):
             for side, side_offset in (("left", 0.15), ("right", -0.15)):
                 response = {
                     "frequencies": frequencies,
                     "db": [
                         value + 68.0 + side_offset + (position - 2) * 0.10
-                        for value in effective_target
+                        for value in post_prediction[side]
                     ],
                     "smoothing": "variable 1/12 octave <200 Hz; 1/6 octave 200-2000 Hz; 1/3 octave >2 kHz",
                     "measurement_quality": {"snr_db": 28.0, "usable": True},
@@ -895,6 +903,39 @@ def main() -> int:
                 (session / f"post_p{position}_{side}_sum_response.json").write_text(json.dumps(response), encoding="utf-8")
         post_evaluation = engine.evaluate_post_filter_sum(session, phase_state, {"level_dbfs": -48})
         require(post_evaluation["overall_pass"] and post_evaluation["target_pass"] and post_evaluation["crossover_pass"], "valid measured post-FIR L+Woofer/R+Woofer sum was rejected")
+        require(post_evaluation["prediction_consistency"]["pass"], "matching post-FIR prediction was rejected")
+        require(post_evaluation["common_level_reference"]["independent_channel_normalization"] is False, "post-FIR measurements were normalized independently")
+        require(abs(post_evaluation["lr_match"]["reference_level_difference_db"] - 0.3) <= 0.02, "shared post-FIR reference did not retain the synthetic L/R level offset")
+        left_post_original = {}
+        for position in range(1, 4):
+            left_post_path = session / f"post_p{position}_left_sum_response.json"
+            left_post_original[position] = left_post_path.read_bytes()
+            mismatched_post = json.loads(left_post_original[position].decode("utf-8"))
+            mismatched_post["db"] = [
+                value + (12.0 if frequency <= 300.0 else 0.0)
+                for frequency, value in zip(mismatched_post["frequencies"], mismatched_post["db"])
+            ]
+            left_post_path.write_text(json.dumps(mismatched_post), encoding="utf-8")
+        mismatched_evaluation = engine.evaluate_post_filter_sum(session, phase_state, {"level_dbfs": -48})
+        require(not mismatched_evaluation["prediction_consistency"]["pass"] and not mismatched_evaluation["overall_pass"], "large predicted-vs-measured mismatch was not blocked")
+        for position, content in left_post_original.items():
+            (session / f"post_p{position}_left_sum_response.json").write_bytes(content)
+        advisory_original = {}
+        for position in range(1, 4):
+            for side in ("left", "right"):
+                path = session / f"post_p{position}_{side}_sum_response.json"
+                advisory_original[(position, side)] = path.read_bytes()
+                response = json.loads(advisory_original[(position, side)].decode("utf-8"))
+                response["db"] = [
+                    value + (6.0 if 80.0 <= frequency <= 120.0 else 0.0)
+                    for frequency, value in zip(response["frequencies"], response["db"])
+                ]
+                response["measurement_quality"]["snr_db"] = 8.0
+                path.write_text(json.dumps(response), encoding="utf-8")
+        advisory_evaluation = engine.evaluate_post_filter_sum(session, phase_state, {"level_dbfs": -48, "sweep_seconds": 14})
+        require(advisory_evaluation["inconclusive_low_snr"] and not advisory_evaluation["application_blocking"] and not advisory_evaluation["overall_pass"], "marginal low-SNR post-FIR mismatch was mislabeled PASS or conclusive FAIL")
+        for (position, side), content in advisory_original.items():
+            (session / f"post_p{position}_{side}_sum_response.json").write_bytes(content)
         phase_seconds = round(time.monotonic() - started, 3)
 
         # A deliberately over-attenuated woofer preference can no longer be
