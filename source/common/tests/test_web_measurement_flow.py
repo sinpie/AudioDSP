@@ -60,6 +60,13 @@ def main() -> int:
     os.environ["AUDIODSP_MEASUREMENT"] = str(arguments.measurement.resolve())
     module = load(arguments.web.resolve())
     module.measurement = lambda *args: {"sessions": []} if args == ("list-sessions",) else {}
+    require(module.cpu_used_percent_from_samples((100.0, 20.0), (150.0, 30.0)) == 80.0, "CPU percentage delta calculation is wrong")
+    require(module.cpu_used_percent_from_samples((100.0, 20.0), (100.0, 20.0)) is None, "invalid CPU sample delta was accepted")
+    web_source = arguments.web.read_text(encoding="utf-8")
+    require("Math.round(Number(h.cpu_used_percent))" in web_source, "CPU usage is not rendered as an integer percentage")
+    require("CPU ${{h.load[0].toFixed(2)}}" not in web_source, "load average is still mislabeled as CPU usage")
+    require('query.get("woofer", ["1"])' in web_source, "current FIR graph does not show Woofer by default")
+    require('--graph-bg:#f8fafc;--graph-grid:#cbd5e1;--graph-text:#334155' in web_source, "Light-theme FIR graph contrast palette is missing")
 
     mimo_html = module.measurement_panel(job(module, "mimo_one_sub"), {})
     require(mimo_html.count('role="tab"') == 7, "measurement workflow must have seven tabs")
@@ -78,7 +85,57 @@ def main() -> int:
     require("L/R/우퍼/L+우퍼/R+우퍼" in siso_html, "SISO acquisition sequence is missing")
     require("전 대역의 유일한 절대 감쇄 상한" in siso_html, "maximum room-cut semantics are not visible beside the setting")
     require("숨은 3/6 dB 고역 제한은 없으며" in siso_html, "removed high-frequency cut caps are not documented in the algorithm panel")
-    print("PASS: 7-tab measurement flow, MIMO-only controls, and SISO/MIMO explanations")
+    require(siso_html.count("<select ") == siso_html.count("</select>"), "measurement UI contains an unclosed select element")
+    max_boost_start = siso_html.index('<select name="max_boost_db">')
+    max_boost_label_end = siso_html.index("</label>", max_boost_start)
+    require("</select><span>" in siso_html[max_boost_start:max_boost_label_end], "maximum relative compensation helper text is nested inside its select")
+
+    built = job(module, "lrw_sum")
+    built.update({
+        "state": "built",
+        "stage": "FIR 계산 완료",
+        "measurement_profile": "headphone",
+        "measurement_output_match": False,
+        "output_selector": {"profile": "speaker", "stale": False},
+        "result_revision_status": {"stale": False},
+        "result": {
+            "target": "flat",
+            "preset": "none",
+            "taps": 32768,
+            "front": "/tmp/front.wav",
+            "rear": "/tmp/rear.wav",
+            "front_sha256": "test",
+            "measurement_coverage": {"positions": 3},
+            "correction_limits": {},
+            "filter_bank_normalization": {},
+            "common_level_reference": {},
+            "front_metrics": {"left": {}},
+            "diagnostics": {},
+            "preference": {},
+            "crossover": {"enabled": False},
+            "self_validation": {
+                "overall_pass": True,
+                "core_checks": {},
+                "target_fit": {},
+                "crossover_sum": {"required": False},
+            },
+        },
+    })
+    blocked_html = module.measurement_panel(built, {})
+    require("A/B 대기 · 출력 경로 불일치" in blocked_html, "A/B path mismatch reason is not visible")
+    require("현재 <b>스피커 출력</b>" in blocked_html, "current U7 path is not shown beside disabled A/B")
+    require("필요 <b>헤드폰 잭</b>" in blocked_html, "required measurement path is not shown beside disabled A/B")
+    require("약 1.5초 안에 감지" in blocked_html, "automatic A/B re-enable timing is not explained")
+    require(">출력 경로 대기</button>" in blocked_html, "disabled A/B action has an ambiguous label")
+    require('action="/measurement/preview"' not in blocked_html, "A/B preview is unsafe while U7 path differs")
+
+    matching = dict(built)
+    matching["measurement_output_match"] = True
+    matching["output_selector"] = {"profile": "headphone", "stale": False}
+    matching_html = module.measurement_panel(matching, {})
+    require('action="/measurement/preview"' in matching_html, "A/B preview does not re-enable when U7 path matches")
+    require('name="profile" value="headphone"' in matching_html, "A/B preview does not retain the measured path")
+    print("PASS: measurement flow, CPU/graph UI, select structure, and path-safe A/B activation")
     return 0
 
 

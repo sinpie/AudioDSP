@@ -6,6 +6,11 @@
 - 500 Hz 이상 peak 감쇄는 SNR·위치 편차·국소 peak 폭·독립 L/R 타깃 초과 일치도를 연속 신뢰도로 곱해 넓은 공통 peak는 충분히 줄이고 좁은/한쪽 peak만 완화하도록 변경; 결과 JSON과 Web 도움말에 정책을 기록
 - U7 상단 버튼 이벤트 값 Headphone `0x30`/Speaker `0xA0`와 부팅 안정 `HIDIOCGINPUT` 값 Headphone `0x88`/Speaker `0xE0`를 분리 해석해 첫 부팅의 실제 출력 경로가 `unknown`으로 남던 문제를 수정
 - U7 현재 상태 조회는 hidraw를 `O_RDONLY`로 열고 GET_REPORT만 사용하며 output/feature report를 쓰지 않는 전용 무음 회귀를 추가
+- `최대 상대 보상` select의 누락된 닫기 태그 때문에 뒤의 `최대 룸 감쇄` 선택값이 드롭다운 밖에 노출되던 Web UI 오류를 수정하고 전체 select 태그 균형 회귀검사를 추가
+- FIR 결과의 측정 출력 경로와 현재 U7 물리 출력이 다를 때 A/B 버튼이 비활성화되는 이유, 현재/필요 경로, U7 전환 방법과 자동 활성화 시점을 버튼 바로 아래에 표시
+- 실제 측정 경로가 잘못 분류된 완료 세션을 음향 데이터/FIR 변경 없이 교정하는 `correct-output-profile` 관리 명령을 추가; 현재·세션·보고서 JSON을 함께 갱신하고 원본과 raw U7 selector 근거를 백업/감사 기록으로 보존
+- Web 상태줄이 1분 load average 소수값을 CPU로 잘못 표시하던 문제를 수정; `/proc/stat` 차분 기반 실제 CPU 사용률을 계산하고 화면에는 읽기 쉬운 정수 `%`로 표시
+- 현황의 `현재 FIR 보정 전달함수`에서 우퍼 곡선을 기본 표시하고, Light 테마 그래프를 밝은 배경·진한 축/범례 글자·고대비 L/R/우퍼 색상으로 수정
 
 ## 2026-08-21 · v24 MIMO 수학 안정화·측정 UI 연속성
 

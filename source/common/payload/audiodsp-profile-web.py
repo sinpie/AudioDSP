@@ -177,6 +177,8 @@ STATUS_LOCK = threading.Lock()
 STATUS_CACHE: dict[str, object] = {"signature": None, "value": None}
 VOLUME_LOCK = threading.Lock()
 VOLUME_CACHE: dict[str, object] = {"expires": 0.0, "value": None}
+CPU_SAMPLE_LOCK = threading.Lock()
+CPU_SAMPLE: tuple[float, float] | None = None
 VOLUME_MIN_DB = -60
 VOLUME_MAX_DB = 0
 MEASUREMENT_DEFAULT: dict | None = None
@@ -959,6 +961,36 @@ def _apply_restore_staging() -> dict:
     return result
 
 
+def cpu_used_percent_from_samples(previous: tuple[float, float], current: tuple[float, float]) -> float | None:
+    """Calculate aggregate busy CPU time from two ``(total, idle)`` samples."""
+    total_delta = float(current[0]) - float(previous[0])
+    idle_delta = float(current[1]) - float(previous[1])
+    if total_delta <= 0.0 or idle_delta < 0.0:
+        return None
+    return max(0.0, min(100.0, 100.0 * (total_delta - idle_delta) / total_delta))
+
+
+def sampled_cpu_used_percent() -> float | None:
+    """Read /proc/stat without blocking; the next health poll supplies the delta."""
+    global CPU_SAMPLE
+    stat_path = Path("/proc/stat")
+    if not stat_path.is_file():
+        return None
+    lines = stat_path.read_text(encoding="ascii", errors="ignore").splitlines()
+    fields = lines[0].split() if lines else []
+    if not fields or fields[0] != "cpu" or len(fields) < 5:
+        return None
+    try:
+        values = [float(value) for value in fields[1:]]
+    except ValueError:
+        return None
+    current = (sum(values), values[3] + (values[4] if len(values) > 4 else 0.0))
+    with CPU_SAMPLE_LOCK:
+        previous = CPU_SAMPLE
+        CPU_SAMPLE = current
+    return None if previous is None else cpu_used_percent_from_samples(previous, current)
+
+
 def system_health() -> dict:
     load = [float(value) for value in Path("/proc/loadavg").read_text().split()[:3]]
     memory = {}
@@ -969,8 +1001,10 @@ def system_health() -> dict:
     temperature_path = Path("/sys/class/thermal/thermal_zone0/temp")
     temperature = round(int(temperature_path.read_text()) / 1000.0, 1) if temperature_path.is_file() else None
     cards = Path("/proc/asound/cards").read_text(errors="ignore") if Path("/proc/asound/cards").is_file() else ""
+    cpu_used = sampled_cpu_used_percent()
     return {
         "load": load,
+        "cpu_used_percent": None if cpu_used is None else round(cpu_used, 1),
         "memory_used_percent": round(100.0 * (memory.get("MemTotal", 1) - memory.get("MemAvailable", 0)) / memory.get("MemTotal", 1), 1),
         "temperature_c": temperature,
         "camilladsp": service_active("camilladsp.service"),
@@ -2005,7 +2039,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
                 <label>추가 고음 경사<select name="treble_tilt_db">""" + "".join(f'<option value="{value}" {"selected" if value == preferences.get("treble_tilt_db", 0) else ""}>{value:+d} dB @ 20 kHz</option>' for value in range(-6, 3)) + """</select></label>
                 <label>룸보정 하한<select name="correction_low_hz">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("correction_low_hz", 20) else ""}>{value} Hz</option>' for value in (20, 30, 40, 60, 80)) + """</select></label>
                 <label>룸보정 상한<select name="correction_high_hz">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("correction_high_hz", 20000) else ""}>{value // 1000 if value >= 1000 else value}{" kHz" if value >= 1000 else " Hz"}{" · 자연 고역 권장" if value == 5000 else " · 전대역" if value == 20000 else ""}</option>' for value in (300, 500, 1000, 5000, 20000)) + """</select></label>
-                <label>최대 상대 보상<select name="max_boost_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("max_boost_db", 10) else ""}>+{value} dB</option>' for value in (0, 3, 6, 9, 10)) + """<span>신뢰 가능한 가장 큰 보정점을 0 dB로 두고 L/R/우퍼 전체를 같은 양만큼 내립니다. 기본 10 dB이며 좁고 깊은 딥은 별도 보호되어 이 한도를 그대로 채우지 않습니다.</span></label>
+                <label>최대 상대 보상<select name="max_boost_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("max_boost_db", 10) else ""}>+{value} dB</option>' for value in (0, 3, 6, 9, 10)) + """</select><span>신뢰 가능한 가장 큰 보정점을 0 dB로 두고 L/R/우퍼 전체를 같은 양만큼 내립니다. 기본 10 dB이며 좁고 깊은 딥은 별도 보호되어 이 한도를 그대로 채우지 않습니다.</span></label>
                 <label>최대 룸 감쇄<select name="max_cut_db">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("max_cut_db", 18) else ""}>−{value} dB</option>' for value in (6, 9, 12, 18, 24)) + """</select><span>전 대역의 유일한 절대 감쇄 상한입니다. 별도 3/6 dB 제한은 없으며, 500 Hz 이상 좁은 피크·L/R 불일치·위치 편차·낮은 측정 신뢰도만 연속적으로 감쇄량을 줄입니다.</span></label>
                 <label>저역 위상 상한<select name="phase_cutoff">""" + ''.join(f'<option value="{value}" {"selected" if value == preferences.get("phase_cutoff", 200) else ""}>{value} Hz</option>' for value in (80, 120, 160, 200, 250)) + """</select></label>
               </div><p class="muted"><b>공통 기준:</b> L/R/우퍼를 따로 0 dB로 맞추지 않습니다. 전체 FIR 묶음에서 하나의 공통 이득만 적용해 상대레벨과 크로스오버 합산을 보존합니다. 위치별 편차가 크거나 좁고 깊은 딥은 ‘최대 상대 보상’보다 우선하여 제한됩니다.</p></details></fieldset>
@@ -2427,13 +2461,33 @@ def measurement_panel(job: dict, preview: dict) -> str:
             '<p class="diagnostic-note"><b>위상 정밀도 제한 그래프</b> · 개별 측정의 시간 기준 신뢰도가 부족해 복소 합산 딥을 사실로 표시하지 않습니다. 현재 그래프는 프런트와 우퍼가 최대로 더해질 때의 안전 상한을 표시합니다. 이전에 보인 약 150 Hz 딥은 검증된 실측 딥이 아닙니다.</p>'
             if phase_unverified else ""
         )
-        preview_block_reason = (
-            "현재 FIR 계산 또는 측정 작업이 끝난 뒤 미리들을 수 있습니다." if busy else
-            "U7 상단 버튼으로 이 세션을 측정한 출력 경로를 다시 선택하세요." if measured_profile in PROFILE_UI and path_match is not True else
-            ""
-        )
+        preview_block_reason = ""
+        preview_block_notice = ""
+        preview_block_label = "이번 튜닝"
+        if busy:
+            preview_block_reason = "현재 FIR 계산 또는 측정 작업이 끝난 뒤 미리들을 수 있습니다."
+            preview_block_label = "작업 완료 대기"
+            preview_block_notice = (
+                '<p class="action-blocker ab-blocker" role="status"><b>A/B 대기 · 작업 진행 중</b> · '
+                '현재 FIR 계산 또는 측정이 끝나면 이 화면이 자동 갱신되고 버튼이 활성화됩니다.</p>'
+            )
+        elif measured_profile in PROFILE_UI and path_match is not True:
+            required_path = PROFILE_UI[measured_profile]
+            current_path_label = current_path_ui["short"] if current_path_ui else "감지 대기"
+            preview_block_reason = (
+                f"현재 U7은 {current_path_label}, 이 결과는 {required_path['short']}에서 측정되었습니다. "
+                f"U7 상단 다이얼을 눌러 {required_path['short']}으로 바꾸세요."
+            )
+            preview_block_label = "출력 경로 대기"
+            preview_block_notice = (
+                '<p class="action-blocker ab-blocker" role="status">'
+                f'<b>A/B 대기 · 출력 경로 불일치</b> · 현재 <b>{html.escape(current_path_label)}</b>, '
+                f'필요 <b>{html.escape(required_path["short"])}</b>입니다. '
+                f'U7 상단 다이얼을 눌러 {html.escape(required_path["short"])}으로 바꾸면 '
+                '약 1.5초 안에 감지해 이 화면을 자동 갱신하고 버튼을 활성화합니다.</p>'
+            )
         preview_disabled_action = (
-            f'<button disabled title="{html.escape(preview_block_reason, quote=True)}">이번 튜닝</button>'
+            f'<button disabled title="{html.escape(preview_block_reason, quote=True)}">{html.escape(preview_block_label)}</button>'
             if preview_block_reason else ""
         )
         apply_busy_action = '<button disabled title="현재 작업이 끝난 뒤 정식 적용할 수 있습니다.">작업 완료 대기</button>'
@@ -2457,6 +2511,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
         if stale_result:
             stale_result_notice = '<div class="failure" role="alert"><b>이전 알고리즘으로 계산된 결과</b><br>측정 원본은 유지되어 있습니다. 4단계에서 FIR 계산만 다시 실행해야 미리듣기와 정식 적용을 사용할 수 있습니다.</div>'
             preview_actions = '<button disabled>A/B 대기</button>'
+            preview_block_notice = ""
             apply_actions = '<button disabled>적용 대기</button>'
         elif crossover_pending and not validation_failed:
             stale_result_notice = '<div class="diagnostic-note" role="status"><b>이전 합산 판정 · FIR 재계산 필요</b><br>4 · FIR 계산에서 현재 설정으로 다시 계산하세요. 새 계산은 모든 필수 측정을 3단계에서 끝내며, FIR 생성 뒤 추가 스윕을 요구하지 않습니다.</div>'
@@ -2575,7 +2630,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
           {('<a class="button secondary" download href="/api/measurement/download/report-json">결과 JSON</a>' if result.get('report_json') else '')}</div>
           <div class="result-box ab-review-group"><b>A/B 미리듣기</b><p class="muted">현재 상태: <span class="pill">{preview_label}</span> · 미리듣기는 프로필 WAV와 저장 설정을 바꾸지 않습니다.</p><div class="measure-actions">
           {preview_actions}
-          {result_restore_action}</div></div>
+          {result_restore_action}</div>{preview_block_notice}</div>
           {post_validation_html}
           <section class="final-apply-card" id="measurement-step-6" data-measurement-step-content="6"><div><h4>검토한 결과를 정식 프로필에 적용</h4><p><b>현재 판정: {validation_label}</b><br>대상: {html.escape(final_apply_target)}<br>적용 직전 기존 FIR을 자동 백업하며, A/B 미리듣기와 달리 이 단계에서만 프로필 WAV를 교체합니다.</p></div><div class="measure-actions">{apply_actions}</div></section>
         </div>"""
@@ -2649,7 +2704,7 @@ def measurement_panel(job: dict, preview: dict) -> str:
               {validation_checklist_html}<div class="diagnostic-note"><b>추가 자동 진단 메모</b><ul>{warning_html}</ul></div>{audit_html}
               <p class="muted">실선은 세 위치의 가중 평균, 가는 점선은 세 위치 예상 범위입니다. 평균이 좋아져도 어느 한 측정 위치의 타깃 MAE가 0.75 dB 넘게 악화되거나 조건수가 허용값을 넘으면 적용을 차단합니다. 이는 미측정 위치를 보장하지 않으므로 5단계의 A/B 미리듣기와 선택적 합산 실측으로 실제 결과를 확인하세요.</p>
               <div class="measure-actions"><a class="button" download href="/api/measurement/download/all">MIMO WAV 4개 + 보고서 ZIP</a><a class="button secondary" download href="/api/measurement/download/report-md">한계 포함 보고서 MD</a><a class="button secondary" download href="/api/measurement/download/report-json">전체 결과 JSON</a></div>
-              <div class="result-box ab-review-group"><b>A/B 미리듣기</b><p class="muted">현재 상태: <span class="pill">{preview_label}</span> · MIMO는 실제 4채널 스피커 출력 전용입니다.</p><div class="measure-actions">{mimo_preview_actions}{result_restore_action}</div></div>
+              <div class="result-box ab-review-group"><b>A/B 미리듣기</b><p class="muted">현재 상태: <span class="pill">{preview_label}</span> · MIMO는 실제 4채널 스피커 출력 전용입니다.</p><div class="measure-actions">{mimo_preview_actions}{result_restore_action}</div>{preview_block_notice}</div>
               {post_validation_html}
               <section class="final-apply-card" id="measurement-step-6" data-measurement-step-content="6"><div><h4>MIMO FIR 묶음 정식 적용</h4><p><b>현재 판정: {mimo_validation_label}</b><br>대상: 스피커 4채널 출력 · 32768탭 · 컨볼루션 8경로<br>적용 직전 기존 MIMO FIR 묶음과 설정을 자동 백업합니다.</p></div><div class="measure-actions">{mimo_apply_actions}</div></section>
             </div>"""
@@ -2935,7 +2990,7 @@ def render_page(status: dict, message: str = "", error: str = "", show_woofer: b
     body = f"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
     <title>{page_title}</title>
     <script>(()=>{{const t=localStorage.getItem('audiodsp-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t;}})();</script><style>
-    :root{{--bg:#f3f6fb;--bg-glow:#dbeafe;--surface:rgba(255,255,255,.88);--surface-strong:#fff;--text:#13213a;--muted:#61708a;--border:#d8e0eb;--accent:#2563eb;--accent-hover:#1d4ed8;--accent-soft:#dbeafe;--on-accent:#fff;--step-accent:#7c3aed;--step-soft:#ede9fe;--on-step:#fff;--success:#047857;--success-bg:#d1fae5;--danger:#b42318;--danger-bg:#fee4e2;--warning:#a15c00;--warning-bg:#fff4d6;--shadow:0 18px 45px rgba(32,55,92,.10);--graph-bg:#111827;--graph-grid:#334155;--graph-text:#94a3b8;--curve-l:#0284c7;--curve-r:#e11d48;--curve-w:#d97706;color-scheme:light}}
+    :root,:root[data-theme="light"]{{--bg:#f3f6fb;--bg-glow:#dbeafe;--surface:rgba(255,255,255,.88);--surface-strong:#fff;--text:#13213a;--muted:#61708a;--border:#d8e0eb;--accent:#2563eb;--accent-hover:#1d4ed8;--accent-soft:#dbeafe;--on-accent:#fff;--step-accent:#7c3aed;--step-soft:#ede9fe;--on-step:#fff;--success:#047857;--success-bg:#d1fae5;--danger:#b42318;--danger-bg:#fee4e2;--warning:#a15c00;--warning-bg:#fff4d6;--shadow:0 18px 45px rgba(32,55,92,.10);--graph-bg:#f8fafc;--graph-grid:#cbd5e1;--graph-text:#334155;--curve-l:#0369a1;--curve-r:#be123c;--curve-w:#b45309;color-scheme:light}}
     :root[data-theme="dark"]{{--bg:#080d18;--bg-glow:#172554;--surface:rgba(19,29,48,.90);--surface-strong:#151f33;--text:#e8eef8;--muted:#9babc2;--border:#2b3a54;--accent:#38bdf8;--accent-hover:#7dd3fc;--accent-soft:#0c4a6e;--on-accent:#0f172a;--step-accent:#c4b5fd;--step-soft:#312e57;--on-step:#171126;--success:#5eead4;--success-bg:#123f3a;--danger:#fda4af;--danger-bg:#4c1720;--warning:#fbbf24;--warning-bg:#493514;--shadow:0 22px 55px rgba(0,0,0,.30);--graph-bg:#090f1c;--graph-grid:#2b3a54;--graph-text:#9babc2;--curve-l:#38bdf8;--curve-r:#fb7185;--curve-w:#fbbf24;color-scheme:dark}}
     @media(prefers-color-scheme:dark){{:root:not([data-theme="light"]){{--bg:#080d18;--bg-glow:#172554;--surface:rgba(19,29,48,.90);--surface-strong:#151f33;--text:#e8eef8;--muted:#9babc2;--border:#2b3a54;--accent:#38bdf8;--accent-hover:#7dd3fc;--accent-soft:#0c4a6e;--on-accent:#0f172a;--step-accent:#c4b5fd;--step-soft:#312e57;--on-step:#171126;--success:#5eead4;--success-bg:#123f3a;--danger:#fda4af;--danger-bg:#4c1720;--warning:#fbbf24;--warning-bg:#493514;--shadow:0 22px 55px rgba(0,0,0,.30);--graph-bg:#090f1c;--graph-grid:#2b3a54;--graph-text:#9babc2;--curve-l:#38bdf8;--curve-r:#fb7185;--curve-w:#fbbf24;color-scheme:dark}}}}
     *{{box-sizing:border-box}}html{{min-height:100%;overflow-x:hidden;scroll-padding-top:18px}}body{{margin:0;min-height:100%;overflow-x:hidden;background:radial-gradient(circle at 12% -10%,var(--bg-glow),transparent 34rem),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI','Malgun Gothic',sans-serif;transition:background .25s,color .25s}}
@@ -3311,7 +3366,7 @@ const poll=async()=>{{
 document.addEventListener('visibilitychange',()=>{{if(!document.hidden)poll();}});
 poll();
 }})();</script>
-    <script>(()=>{{const paint=async()=>{{try{{const h=await fetch('/api/health',{{cache:'no-store'}}).then(r=>r.json());const e=document.getElementById('system-health');if(e)e.textContent=`CPU ${{h.load[0].toFixed(2)}} · ${{h.temperature_c??'?'}}°C · 메모리 ${{h.memory_used_percent}}% · U7 ${{h.xonar_u7?'연결':'없음'}} · UMIK ${{h.umik1?'연결':'없음'}}`;}}catch(_e){{}}}};paint();setInterval(()=>{{if(!document.hidden)paint();}},5000);}})();</script>
+    <script>(()=>{{const paint=async()=>{{try{{const h=await fetch('/api/health',{{cache:'no-store'}}).then(r=>r.json());const e=document.getElementById('system-health');const cpu=h.cpu_used_percent!=null&&Number.isFinite(Number(h.cpu_used_percent))?`${{Math.round(Number(h.cpu_used_percent))}}%`:'계산 중';if(e)e.textContent=`CPU ${{cpu}} · ${{h.temperature_c??'?'}}°C · 메모리 ${{h.memory_used_percent}}% · U7 ${{h.xonar_u7?'연결':'없음'}} · UMIK ${{h.umik1?'연결':'없음'}}`;}}catch(_e){{}}}};paint();setInterval(()=>{{if(!document.hidden)paint();}},5000);}})();</script>
     <script>(()=>{{/* non_destructive_measurement_tabs */
       const root=document.querySelector('.measurement');
       if(!root)return;
@@ -3679,7 +3734,7 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         try:
             status = cached_status()
-            body = render_page(status, message=query.get("message", [""])[-1], show_woofer=query.get("woofer", ["0"])[-1] == "1", view=views[parsed.path])
+            body = render_page(status, message=query.get("message", [""])[-1], show_woofer=query.get("woofer", ["1"])[-1] == "1", view=views[parsed.path])
             self.send_bytes(body)
         except Exception as exc:
             self.send_bytes(f"AudioDSP UI error: {html.escape(str(exc))}".encode(), status=500)

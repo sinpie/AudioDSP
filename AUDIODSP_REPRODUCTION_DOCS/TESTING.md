@@ -34,6 +34,18 @@ python3 /tmp/test_u7_profile_monitor.py \
 버튼 이벤트와 부팅 안정 report의 서로 다른 byte 표, `O_RDONLY` HID open,
 HID output/feature report 쓰기 부재를 짧게 검증한다.
 
+출력 경로 metadata 정정과 Web 측정 흐름 무음 회귀(Windows/repository에서 실행):
+
+```powershell
+python .\source\common\tests\test_output_profile_correction.py `
+  --engine .\source\common\payload\audiodsp-measurement.py
+python .\source\common\tests\test_web_measurement_flow.py `
+  --web .\source\common\payload\audiodsp-profile-web.py `
+  --measurement .\source\common\payload\audiodsp-measurement.py
+```
+
+첫 시험은 임시 완료 세션에서 current/session/report metadata 일치, 변경 전 백업, raw selector 증거 보존, 중복 실행의 안전성을 검사한다. 두 번째 시험은 HTML select 균형, 출력 경로 불일치 A/B 안내와 일치 후 활성화, `/proc/stat` CPU 계산과 정수 UI, 현재 FIR 그래프의 Woofer 기본 표시, Light theme 그래프 대비 marker를 검사한다. 두 시험은 측정음과 실제 profile/FIR 변경을 만들지 않는다.
+
 ## 2. Profile matrix
 
 이 시험은 임시 디렉터리와 fake ALSA/systemd helper를 사용해 실제 profile/settings를 변경하지 않는다.
@@ -258,6 +270,8 @@ MIMO 8-path는 공통 timing reference를 갖춘 Pi4/5에서 chunksize 1024 이�
 - 390 CSS px에서 document `scrollWidth == clientWidth`; 700 px FIR graph만 자체 `.graph-scroll` 안에서 좌우 이동해야 한다.
 - 390 CSS px에서 주요 button/select/navigation과 summary 높이는 44 px 이상이어야 한다. 1440 px PC 화면에서는 카드·표·단계 흐름이 겹치거나 잘리지 않아야 한다.
 - dark theme의 `--on-accent`/`--accent` 대비는 WCAG AA(일반 텍스트 4.5:1) 이상이어야 한다.
+- light theme의 현재 FIR 그래프에서 plot 배경, grid, 축/범례 글자와 L/R/Woofer 곡선이 서로 구분되어야 하고 Woofer는 최초 진입 시 표시되어야 한다.
+- 현황 CPU는 첫 표본에서 `계산 중`, 다음 표본부터 정수 `%`여야 한다. `/proc/loadavg` 소수점 값을 CPU로 표시하면 실패다.
 - 측정 경로가 아직 `null`인 idle 화면을 3초 이상 열어도 document navigation/reload가 발생하지 않아야 한다.
 - `algorithm_revision`이 없거나 다른 이전 결과는 재계산 경고와 disabled Preview/Apply를 보이고 두 POST를 엔진도 거부해야 한다.
 - 최신 결과라도 `self_validation.overall_pass=false`이면 Preview는 가능하지만 정식 Apply POST는 거부해야 한다.

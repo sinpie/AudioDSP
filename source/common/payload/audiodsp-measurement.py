@@ -821,6 +821,116 @@ def update_current(**changes: Any) -> dict[str, Any]:
         return state
 
 
+def correct_measurement_output_profile(profile: str, reason: str) -> dict[str, Any]:
+    """Correct a misclassified physical output without touching acoustic data.
+
+    This is an explicit operator repair for a completed session.  It updates
+    every persisted path label that controls Preview/Apply, records the old raw
+    selector evidence, and creates recoverable copies before any replacement.
+    """
+    if profile not in OUTPUT_PROFILE_LABELS:
+        raise MeasurementError("수정할 출력 프로필이 잘못되었습니다.")
+    normalized_reason = str(reason).strip()
+    if not normalized_reason:
+        raise MeasurementError("출력 경로 수정 사유가 필요합니다.")
+    if len(normalized_reason) > 300:
+        raise MeasurementError("출력 경로 수정 사유는 300자까지 입력할 수 있습니다.")
+    with LOCK.open("w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        state = load_current()
+        if state.get("state") in ("running", "processing", "cancelling"):
+            raise MeasurementError("측정 또는 FIR 계산 중에는 출력 경로 기록을 수정할 수 없습니다.")
+        if not state.get("session_id") or not state.get("session_dir"):
+            raise MeasurementError("수정할 현재 측정 Session이 없습니다.")
+        directory = session_directory(str(state["session_id"]))
+        if directory != Path(str(state["session_dir"])).resolve():
+            raise MeasurementError("현재 Session 경로가 저장 목록과 일치하지 않습니다.")
+        if directory.is_symlink():
+            raise MeasurementError("symbolic link인 Session은 출력 경로 기록을 수정하지 않습니다.")
+        session_path = directory / "session.json"
+        if not CURRENT.is_file() or CURRENT.is_symlink() or not session_path.is_file() or session_path.is_symlink():
+            raise MeasurementError("현재 또는 저장 Session 상태 파일을 안전하게 수정할 수 없습니다.")
+
+        previous = state.get("measurement_profile")
+        if previous == profile:
+            return {
+                "changed": False,
+                "session_id": state["session_id"],
+                "previous_profile": previous,
+                "measurement_profile": profile,
+                "message": "이미 요청한 출력 경로로 기록되어 있습니다.",
+            }
+
+        corrected_unix = time.time()
+        correction = {
+            "previous_profile": previous,
+            "corrected_profile": profile,
+            "reason": normalized_reason,
+            "corrected_unix": corrected_unix,
+            "preserved_selector_state_byte": (state.get("measurement_output") or {}).get("state_byte"),
+            "preserved_selector_source": (state.get("measurement_output") or {}).get("source"),
+        }
+        state["measurement_profile"] = profile
+        measurement_output = dict(state.get("measurement_output") or {})
+        measurement_output.update({"profile": profile, "label": OUTPUT_PROFILE_LABELS[profile]})
+        measurement_output["manual_correction"] = correction
+        state["measurement_output"] = measurement_output
+        level_check = state.get("level_check")
+        if isinstance(level_check, dict):
+            level_check = dict(level_check)
+            level_check["measurement_profile"] = profile
+            level_check["measurement_output_label"] = OUTPUT_PROFILE_LABELS[profile]
+            level_check["measurement_output_correction"] = correction
+            state["level_check"] = level_check
+        result = state.get("result")
+        if isinstance(result, dict):
+            result = dict(result)
+            result_output = dict(result.get("measurement_output") or {})
+            result_output.update({
+                "physical_profile": profile,
+                "physical_label": OUTPUT_PROFILE_LABELS[profile],
+                "manual_correction": correction,
+            })
+            result["measurement_output"] = result_output
+            state["result"] = result
+        state["measurement_output_correction"] = correction
+        selector = output_selector_status()
+        state["output_selector"] = selector
+        state["measurement_output_match"] = bool(
+            not selector.get("stale") and selector.get("profile") == profile
+        )
+        state["updated_unix"] = corrected_unix
+
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(corrected_unix))
+        paths = [CURRENT, session_path]
+        report_path = directory / "Room_Tuning_Report.json"
+        if isinstance(state.get("result"), dict) and report_path.is_file() and not report_path.is_symlink():
+            paths.append(report_path)
+        backups: list[str] = []
+        for path in paths:
+            backup = path.with_name(f"{path.name}.backup-output-profile-{stamp}")
+            if backup.exists():
+                raise MeasurementError(f"백업 파일이 이미 있어 수정하지 않았습니다: {backup.name}")
+        for path in paths:
+            backup = path.with_name(f"{path.name}.backup-output-profile-{stamp}")
+            shutil.copy2(path, backup)
+            backups.append(str(backup))
+
+        if report_path in paths:
+            atomic_json(report_path, state["result"])
+        atomic_json(session_path, state)
+        atomic_json(CURRENT, state)
+        return {
+            "changed": True,
+            "session_id": state["session_id"],
+            "previous_profile": previous,
+            "measurement_profile": profile,
+            "measurement_output_match": state["measurement_output_match"],
+            "correction": correction,
+            "backups": backups,
+        }
+
+
 def umik_connected() -> bool:
     cards = Path("/proc/asound/cards")
     return cards.is_file() and "UMIK-1" in cards.read_text(errors="ignore")
@@ -9284,6 +9394,9 @@ def main() -> int:
     load_session_parser.add_argument("session_id")
     delete_session_parser = sub.add_parser("delete-session")
     delete_session_parser.add_argument("session_id")
+    correct_output_parser = sub.add_parser("correct-output-profile")
+    correct_output_parser.add_argument("profile", choices=("speaker", "headphone"))
+    correct_output_parser.add_argument("reason")
     install = sub.add_parser("install-cal")
     install.add_argument("orientation", choices=("0", "90"))
     install.add_argument("source", type=Path)
@@ -9398,6 +9511,8 @@ def main() -> int:
             result = load_session(args.session_id)
         elif args.command == "delete-session":
             result = delete_session(args.session_id)
+        elif args.command == "correct-output-profile":
+            result = correct_measurement_output_profile(args.profile, args.reason)
         elif args.command == "install-cal":
             result = install_calibration(args.source, args.orientation)
             result.pop("frequencies", None)

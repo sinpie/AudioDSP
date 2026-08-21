@@ -69,6 +69,15 @@ cat /var/lib/audiodsp/u7-selector-state.json
 
 물리 상태가 바뀌면 웹은 약 1.5초 polling으로 요청/유효 profile을 갱신하고 필요한 경우 새 화면을 한 번 reload한다.
 
+완료 세션이 실제로 Speaker에서 측정됐지만 과거 selector 오판으로 Headphone이라고 기록된 것처럼, 운영자가 실제 경로를 확실히 확인한 경우에는 다음 명령으로 metadata만 정정한다.
+
+```bash
+sudo /usr/bin/python3 /usr/local/bin/audiodsp-measurement.py \
+  correct-output-profile speaker "operator-confirmed measurement path"
+```
+
+`speaker` 대신 `headphone`을 사용할 수 있다. 명령은 idle 상태의 완료된 현재 세션에서만 동작하고 `current.json`, `session.json`, `Room_Tuning_Report.json`의 변경 전 사본을 각각 `backup-output-profile-*`로 남긴다. 측정 WAV, 생성 FIR, raw selector byte/source는 감사 증거로 보존한다. 이것은 Speaker용 필터를 Headphone용으로 변환하는 명령이 아니므로 실제 측정 경로를 추측해서 실행하지 않는다.
+
 ## UMIK/측정 오류
 
 ```bash
@@ -96,6 +105,8 @@ free -h
 ```
 
 기존 Pi 2 실기에서 CamillaDSP는 대략 CPU 36%, Web은 약 0.7~1.1% 수준이었으나 source, topology, chunksize에 따라 달라진다.
+
+Web 현황의 CPU는 `/proc/stat`의 연속 표본으로 계산한 시스템 전체 실제 사용률이다. 첫 조회의 `계산 중`은 정상이며, `/proc/loadavg`의 소수점 값은 CPU가 아니라 run queue 진단값이다.
 
 ## 최초 부팅
 

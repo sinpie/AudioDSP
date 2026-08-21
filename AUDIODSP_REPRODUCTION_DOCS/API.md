@@ -12,7 +12,11 @@ A/B Preview가 활성 상태이면 `settings`는 저장된 설정을 유지하�
 
 ### `GET /api/health`
 
-load average, 온도, 메모리, Xonar U7/UMIK 연결 여부를 반환한다.
+CPU 사용률, load average, 온도, 메모리, Xonar U7/UMIK 연결 여부를 반환한다.
+`cpu_used_percent`는 `/proc/stat`의 두 표본 사이에서 계산한 시스템 전체 실제 사용률이며
+첫 표본에는 `null`일 수 있다. `load_1m`, `load_5m`, `load_15m`은 작업 대기열을 나타내는
+load average이므로 CPU 사용률로 표시하거나 해석하지 않는다. Web UI는 CPU 사용률을
+정수 `%`로, 메모리는 소수점 한 자리로 표시한다.
 
 ### `GET /api/volume`
 
@@ -95,7 +99,7 @@ MIMO 결과의 `/download/all`은 네 MIMO WAV, MIMO manifest, JSON/Markdown 보
 
 측정 실행은 현재 HTML form POST 경로를 사용한다: `/measurement/new`, `/configure`, `/configure-level`, `/session-note`, `/load-session`, `/delete-session`, `/level`, `/position`, `/restart-positions`, `/validation`, `/post-validation`, `/reset-post-validation`, `/build`, `/preview`, `/restore`, `/apply`, `/cancel`, `/calibration`. 세션은 자동 저장되며 `/session-note`는 진행 상태를 건드리지 않고 최대 500자 주석만 저장한다. `/load-session`은 저장 artifact 무결성을 확인하고 완료된 1–6 checkpoint를 복원한다. `/delete-session`은 정확한 ID와 내부 symbolic link 부재를 확인한 뒤 그 세션의 측정 원본/생성물만 삭제하며 정식 프로필 FIR은 건드리지 않는다. 현재 세션을 삭제하면 Preview를 먼저 복구하고 idle 상태로 돌아간다.
 
-내부 measurement CLI에는 `list-sessions`, `set-session-note <text>`, `load-session <id>`, `delete-session <id>`가 있다. Web의 1단계 session 목록은 `list-sessions`의 ID, 완료 위치, 결과 유무와 인접 주석을 사용한다.
+내부 measurement CLI에는 `list-sessions`, `set-session-note <text>`, `load-session <id>`, `delete-session <id>`가 있다. Web의 1단계 session 목록은 `list-sessions`의 ID, 완료 위치, 결과 유무와 인접 주석을 사용한다. 운영자가 완료 세션의 출력 경로 기록이 실제 측정 경로와 다르다는 것을 별도 증거로 확인한 경우에만 privileged `correct-output-profile <speaker|headphone> <reason>`을 사용할 수 있다. 이 명령은 측정/FIR WAV와 raw U7 selector 증거를 바꾸지 않고 session/current/report metadata를 원자적으로 맞추며 변경 전 JSON을 백업한다.
 
 `result`에는 `self_validation`(실제 FIR FFT/target-fit/전달 이득/impulse),
 `room_decay`(채널별 octave T20→RT60), `graphs.*.actual_correction_db`,
