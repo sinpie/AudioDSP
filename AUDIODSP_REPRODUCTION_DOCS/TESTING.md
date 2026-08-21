@@ -41,6 +41,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\releases\audiodsp-pi4-
 - 소리 없는 session 생성/재설정, 보고서 MD/JSON/ZIP download, 측정한 U7 경로 외 Preview/Apply HTTP 400 및 무변경
 - session 주석 저장 전후 level/측정/FIR checkpoint 불변, A→B 생성 뒤 A 주석 포함 목록 표시·불러오기, active session 삭제 후 idle 복귀·정식 FIR 불변·중복 삭제 거부, 완료 artifact 누락 session 거부
 - SISO/MIMO FAIL fixture가 빨간 상태와 함께 화면의 실제 `1 · 연결·Cal`~`5 · 검토·A/B`, `MIMO 강도`, `MIMO 공동제어 상한`, `지원 제어원 제한`, 실행 버튼명을 사용해 조치를 안내
+- 이전 response revision은 원본 WAV 무음 재계산을 제시하고, 새 결과는 평균제곱 공간 통합 방법과 dB 기하평균 대비 변화량을 표시
 - volume 실제 read, API/form write, -60/0, invalid JSON/range/type, 물리 knob divergence
 - 33개 동시 form write 후 JSON/config 유효성
 
@@ -65,6 +66,8 @@ python3 /tmp/test_profile_matrix.py \
 ## 3. Measurement engine 시험
 
 Self-test는 소리를 내지 않는다.
+
+추가 수학 회귀는 음향 응답 power-domain smoothing과 filter-gain dB-domain smoothing을 분리하고, 0/0/+12 dB 세 위치의 weighted mean-square 값, 같은 가중치의 공간 표준편차, metadata가 전혀 없는 초기 파일까지 포함한 이전 response 이중 smoothing 금지, NaN/Inf 거부, shared-clock 환경변수 이름을 exact 값으로 확인한다. L+Woofer/R+Woofer 대표 그래프와 지연 탐색도 같은 위치/SNR 가중을 사용하고 최악 위치 안전 상한은 평균하지 않는지 검사한다.
 
 ```bash
 sudo /usr/local/bin/audiodsp-measurement.py self-test
@@ -123,7 +126,7 @@ python3 /tmp/test_mimo_runtime.py \
   --camilladsp /usr/local/bin/camilladsp
 ```
 
-첫 명령은 Stereo/2.1/2.2 각각 상대 bulk-delay 복원, deployable SISO base-bank 공통 정규화, 기존 SISO 저역 기준 레벨 고정, finite, 인과성, physical output별 최악 상관입력 row sum, 실제 Woofer trim 상한, LR4 FIR-bank 내장, 타깃 MAE·좌석편차·평활 전달함수 impulse-tail proxy 비퇴행과 네 WAV×32768탭을 검사한다. 세 토폴로지의 `Flat + 추가 억제 없음 + trim 0 dB` 모델은 반드시 PASS한다. 이어 MIMO UI 값 19개를 실제 8경로 bank로 만들고 구조 검증은 전부 PASS, acoustic 비퇴행 실패 조합은 `fail_model`로 안전 차단되는지 확인한다. 두 번째는 격리된 임시 config에서 8 Conv와 2→8→4 mixer를 실제 CamillaDSP `--check`로 검사하고 Pi2 enable 거부와 MIMO 백업 임시파일 회수를 확인한다. 둘 다 오디오 장치를 열거나 소리를 내지 않는다.
+첫 명령은 Stereo/2.1/2.2 각각 상대 bulk-delay 복원, 200 Hz 이하 `center`/`equal` 동일 기하 가중, 위치/SNR 가중 solver·그래프·MAE 일치, deployable SISO base-bank 공통 정규화, 기존 SISO 저역 기준 레벨 고정, finite, 인과성, physical output별 최악 상관입력 row sum, 실제 Woofer trim 상한, LR4 FIR-bank 내장, 타깃 MAE·좌석편차·평활 전달함수 impulse-tail proxy 비퇴행과 네 WAV×32768탭을 검사한다. 세 토폴로지의 `Flat + 추가 억제 없음 + trim 0 dB` 모델은 반드시 PASS한다. 이어 MIMO UI 값 19개를 실제 8경로 bank로 만들고 구조 검증은 전부 PASS, acoustic 비퇴행 실패 조합은 `fail_model`로 안전 차단되는지 확인한다. 두 번째는 격리된 임시 config에서 8 Conv와 2→8→4 mixer를 실제 CamillaDSP `--check`로 검사하고 Pi2 enable 거부와 MIMO 백업 임시파일 회수를 확인한다. 둘 다 오디오 장치를 열거나 소리를 내지 않는다.
 
 Pi 5 2 GB와 향후 5.1 worst-case 메모리는 다음 무음 시험으로 고정한다.
 
@@ -190,7 +193,7 @@ Invoke-RestMethod -Uri 'http://<PI-IP>:8080/api/volume' -Method Put -ContentType
 - maximum transfer ≤ 0 dB
 - 개별 sweep 유효 SNR ≥ 6 dB(15 dB 이상 권장), 긴 ESS는 원신호 SNR과 2초 기준 coherent integration 이득을 별도 기록, octave T20 신뢰도 확인
 - `self_validation.overall_pass=true`, target-fit MAE/P90와 actual FIR FFT 확인
-- 선택형 Preview 사후 검증은 실측 L/R을 개별 normalize하지 않고 하나의 공통 기준을 사용하며, target뿐 아니라 계산 예상과의 전체/crossover MAE·P90을 판정한다. SNR 6~15 dB에서도 모든 엄격 오차 기준을 만족하면 `PASS · 권장 미달`로 수락한다. 이 구간에서 기준을 근소하게 넘으면 확정 FAIL 대신 재검증을 권장하고, 6 dB 미만 또는 큰 오차만 즉시 차단한다.
+- 선택형 Preview 사후 검증은 실측 L/R을 개별 normalize하지 않고 하나의 공통 기준을 사용하며, target뿐 아니라 계산 예상과의 전체/crossover MAE·P90을 판정한다. SNR 6~15 dB에서도 모든 엄격 오차 기준을 만족하면 `PASS · 권장 미달`로 수락한다. 이 구간에서 기준을 근소하게 넘으면 확정 FAIL 대신 재검증을 권장하고, 6 dB 미만 또는 큰 오차만 즉시 차단한다. sweep 전/후 noise floor가 4 dB 이상 다른 것만으로 PASS 응답을 버리지 않는다. active sweep transient가 검출되거나 noise floor 불일치와 응답 FAIL이 함께 있을 때만 `판정 보류 · 출력 전환 감지`로 두며, 완료 응답은 `저장 결과 재판정`으로 소리 없이 다시 계산할 수 있어야 한다.
 - preview에서 기존/이번 전환, apply 전 profile hash 불변
 - apply 후 backup 생성 및 새 hash 반영
 - restore 기존 튜닝 정상
@@ -199,6 +202,10 @@ Invoke-RestMethod -Uri 'http://<PI-IP>:8080/api/volume' -Method Put -ContentType
 2026-08-21 Pi5 Fast 세션의 v21 실제 Preview 검증(-30 dBFS FIR 입력, 14초)은 원래 profile을 자동 복원한 상태에서 다음을 확인했다. FIR 공통 감쇄 약 10 dB 때문에 사후 SNR은 L/R 9.42/7.20 dB로 내려갔다. 전체 Flat target은 L MAE/P90 1.968/4.516 dB, R 1.562/3.265 dB로 PASS했고 예상↔실측도 L 2.058/4.666 dB, R 1.638/3.467 dB였다. 단 L 50~200 Hz 예상 P90 6.170 dB와 target P90 5.482 dB가 5 dB 기준을 근소하게 넘었으므로 낮은 SNR 재검증 대상으로 분류한다. 10/15/20 kHz 실측은 L -0.36/-0.19/-2.23 dB, R -2.14/-0.54/-0.80 dB였다.
 
 같은 위치에서 -25 dBFS FIR 입력과 자동 28초 ESS로 한 번만 재검증한 결과 최소 SNR 14.29 dB에서 전체 PASS했다. 전체 target MAE/P90은 L 1.434/3.102 dB, R 1.475/2.765 dB, 예상↔실측은 L 1.373/3.000 dB, R 1.494/3.049 dB였다. 50~200 Hz target은 L 1.600/3.384 dB, R 1.798/3.367 dB, 예상↔실측은 L 1.389/2.660 dB, R 1.569/3.400 dB였다. 즉 첫 검증의 저역 경계 초과는 낮은 SNR의 변동이었으며, v21 예측과 실제 합산이 크게 다른 현상은 재현되지 않았다. 종료 후 입력과 117/127 U7 볼륨을 복원하고 기존 Speaker FIR SHA-256 `8a8a3b2fc31a080a6bc40205f29ea6471df95adf357618b2025bdd193ef45c99`로 복귀했다.
+
+v22 재계산 결과를 -30 dBFS/28초로 검증했을 때 R은 target MAE/P90 1.541/3.626 dB로 정상이나 첫 L은 4.034/13.914 dB로 실패했다. 입력 WAV와 FIR FFT는 좌우 대칭이었지만 L 녹음의 첫 0.4초는 약 -47 dBFS에서 감쇠했고 sweep 전/후 noise 추정치가 -50.0/-75.93 dBFS로 25.93 dB 벌어졌다. 이 stream-start 오염이 30/40/50/60/80/100/130 Hz를 예상보다 각각 약 +18.3/+16.3/+14.6/+14.7/+10.1/+7.5/+5.1 dB 올린 원인이므로 v23은 2초 무음 lead와 판정 보류를 적용한다. 이 시험 뒤에도 기존 Speaker FIR SHA와 -10 dB 볼륨, 입력 복귀를 확인했다.
+
+v23을 -25 dBFS/28초와 2초 무음 lead로 검증한 결과 최소 SNR은 18.54 dB였다. target MAE/P90은 L 1.388/3.337 dB, R 1.340/2.953 dB, crossover MAE/P90은 L 1.748/3.978 dB, R 1.990/4.409 dB, 예상↔실측 MAE/P90은 L 1.318/2.885 dB, R 1.278/2.706 dB로 전부 PASS했다. L sweep 전/후 noise 차이는 1.50 dB, R은 5.19 dB였으나 두 active sweep transient 검출은 false였고 R 음향 지표도 모두 PASS였다. 따라서 전·후 stationary floor 차이만으로 유효 응답을 폐기하지 않는 판정식이 필요함을 실제 데이터로 확인했다. 시험 뒤 기존 Speaker FIR SHA, -10 dB 볼륨, U7 입력과 세 service를 복원했다.
 
 ## 8. 장시간 성능
 

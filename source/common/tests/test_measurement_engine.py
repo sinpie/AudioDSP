@@ -454,6 +454,7 @@ def main() -> int:
         engine_source = args.engine.read_text(encoding="utf-8")
         require(engine_source.count('ARECORD, "-q", "--fatal-errors"') == 4, "one or more UMIK capture paths do not fail closed on ALSA overrun")
         require('/var/lib/audiodsp/u7-selector-state.json' in engine_source, "measurement selector default differs from monitor/manager state path")
+        require('environment("PHASE_CLOCK_SHARED", "0")' in engine_source and 'environment("AUDIODSP_PHASE_CLOCK_SHARED"' not in engine_source, "shared-clock environment suffix is double-prefixed")
         require(engine.DEFAULT_SWEEP_LEVEL_DBFS == -42 and engine.DEFAULT_NOISE_LEVEL_DBFS == -42, "night-safe default output is not -42 dBFS")
         require(fft_test["taps"] == 32_768 and fft_test["result"] == "PASS", "engine self-test failed")
         estimates = engine.platform_capabilities().get("offline_estimates_seconds", {})
@@ -465,10 +466,69 @@ def main() -> int:
         for frequency in (20.0, 40.0, 63.0, 96.0, 140.0, 300.0, 1000.0):
             require(engine.bass_modifier_db(frequency, "primus360") <= 1e-6, "Primus mode contains boost")
             require(engine.bass_modifier_db(frequency, "strong") <= 1e-6, "Strong mode contains boost")
+        frequency_grid = [20.0 * (1000.0 ** (index / 511.0)) for index in range(512)]
         raw = [0.0] * 512
         raw[100] = 12.0
-        smoothed = engine.variable_smooth([20.0 * (1000.0 ** (index / 511.0)) for index in range(512)], raw)
-        require(smoothed[100] < 12.0 and max(smoothed) <= 12.0, "variable smoothing failed")
+        db_smoothed = engine.variable_smooth(frequency_grid, raw)
+        power_smoothed = engine.variable_power_smooth(frequency_grid, raw)
+        require(db_smoothed[100] < power_smoothed[100] < 12.0 and max(power_smoothed) <= 12.0, "power-domain response smoothing failed")
+        cut_curve = [0.0] * 512
+        cut_curve[100] = -12.0
+        cut_db_smoothed = engine.variable_smooth(frequency_grid, cut_curve)
+        cut_power_smoothed = engine.variable_power_smooth(frequency_grid, cut_curve)
+        require(cut_db_smoothed[100] < cut_power_smoothed[100] <= 0.0, "cut-only guard was weakened by response power smoothing")
+        equal_power = engine.weighted_power_mean_db([0.0, 0.0, 12.0], [1.0, 1.0, 1.0])
+        expected_equal_power = 10.0 * math.log10((1.0 + 1.0 + 10.0 ** 1.2) / 3.0)
+        require(abs(equal_power - expected_equal_power) <= 1.0e-12 and equal_power > 4.0, "weighted mean-square response is not exact")
+        equal_spread = engine.weighted_std_db([0.0, 0.0, 12.0], [1.0, 1.0, 1.0])
+        require(abs(equal_spread - math.sqrt(32.0)) <= 1.0e-12, "weighted spatial dB spread is not exact")
+
+        aggregation_dir = root / "power-aggregation"
+        aggregation_dir.mkdir()
+        aggregation_frequencies = [100.0, 1_000.0, 10_000.0]
+        for position, level in enumerate((0.0, 0.0, 12.0), start=1):
+            (aggregation_dir / f"p{position}_left_response.json").write_text(json.dumps({
+                "frequencies": aggregation_frequencies,
+                "db": [level] * len(aggregation_frequencies),
+                "phase_rad": [0.0] * len(aggregation_frequencies),
+                "bulk_delay_samples": 0,
+                "bulk_delay_reliable": True,
+                "response_algorithm_revision": engine.RESPONSE_ALGORITHM_REVISION,
+                "smoothing": engine.SMOOTHING_NAME,
+                "frequency_quality": {"confidence": [1.0] * len(aggregation_frequencies)},
+            }), encoding="utf-8")
+        aggregation = engine.load_average_response(aggregation_dir, "left", "equal", 3)
+        require(max(abs(value - expected_equal_power) for value in aggregation["average_db"]) <= 1.0e-12, "spatial prototype is not a weighted power mean")
+        require(aggregation["spatial_aggregation"]["legacy_response_count"] == 0, "current response was marked legacy")
+        require(abs(aggregation["spatial_aggregation"]["median_power_mean_lift_db"] - (expected_equal_power - 4.0)) <= 1.0e-4, "power/geometric mean diagnostic is wrong")
+
+        legacy_dir = root / "legacy-aggregation"
+        legacy_dir.mkdir()
+        legacy_curve = [0.0, 12.0, 0.0]
+        (legacy_dir / "p1_left_response.json").write_text(json.dumps({
+            "frequencies": aggregation_frequencies,
+            "db": legacy_curve,
+            "phase_rad": [0.0] * len(aggregation_frequencies),
+            "smoothing": next(iter(engine.LEGACY_SMOOTHING_NAMES)),
+        }), encoding="utf-8")
+        legacy = engine.load_average_response(legacy_dir, "left", "equal", 1)
+        require(legacy["average_db"] == legacy_curve, "stored legacy response was smoothed a second time")
+        require(legacy["spatial_aggregation"]["raw_reprocess_recommended"], "legacy response did not request silent raw reprocessing")
+        no_metadata_dir = root / "legacy-no-metadata"
+        no_metadata_dir.mkdir()
+        (no_metadata_dir / "p1_left_response.json").write_text(json.dumps({
+            "frequencies": aggregation_frequencies,
+            "db": legacy_curve,
+            "phase_rad": [0.0] * len(aggregation_frequencies),
+        }), encoding="utf-8")
+        no_metadata = engine.load_average_response(no_metadata_dir, "left", "equal", 1)
+        require(no_metadata["average_db"] == legacy_curve, "metadata-free legacy response was smoothed a second time")
+        try:
+            engine.weighted_power_mean_db([0.0, float("nan")], [1.0, 1.0])
+        except engine.MeasurementError:
+            pass
+        else:
+            raise AssertionError("non-finite spatial response was not rejected")
         require(abs(engine.preference_modifier_db(20.0, 4, -3) - 4.0) < 1e-6, "bass preference anchor failed")
         require(abs(engine.preference_modifier_db(20_000.0, 4, -3) + 3.0) < 1e-6, "treble preference anchor failed")
         for frequency in (20.0, 60.0, 80.0, 100.0, 120.0, 200.0, 1000.0):
@@ -476,6 +536,10 @@ def main() -> int:
             lowpass = engine.linkwitz_riley_4_magnitude(frequency, 100.0, "lowpass")
             require(abs(highpass + lowpass - 1.0) < 1e-12, "LR4 acoustic branch magnitudes are not complementary")
         require(abs(engine.crossover_transfer_db(100.0, 100, "highpass") + 6.020599913) < 1e-5, "LR4 highpass is not -6.02 dB at crossover")
+        branch_band_f = [20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0, 250.0, 315.0, 400.0, 500.0, 630.0, 800.0, 1_000.0, 2_000.0, 4_000.0]
+        branch_band_db = [-18.0 * abs(math.log2(frequency / 80.0)) for frequency in branch_band_f]
+        branch_low, branch_high = engine.natural_usable_band(branch_band_f, branch_band_db, 0.0)
+        require(40.0 <= branch_low <= 80.0 and 80.0 <= branch_high < 250.0, "woofer-like natural usable band was falsely extended to the front-speaker range")
         require(engine.DEFAULT_CORRECTION_PREFERENCES["crossover_enabled"] is True and engine.DEFAULT_CORRECTION_PREFERENCES["crossover_frequency_hz"] == 100, "digital crossover is not default ON at 100 Hz")
         require(engine.DEFAULT_CORRECTION_PREFERENCES["max_boost_db"] == 10, "maximum relative compensation default is not 10 dB")
 
@@ -601,8 +665,22 @@ def main() -> int:
         require(abs(woofer_peak / front_peak - expected_scale) < 1e-5, "woofer sweep/reference attenuation mismatch")
         adjustable_reference = engine.write_sweep(root / "woofer-adjustable.wav", "woofer", -30, 2, woofer_attenuation_db=-6)
         require(abs(max(map(abs, adjustable_reference)) / (10.0 ** (-30 / 20.0)) - 10.0 ** (-6 / 20.0)) < 1e-4, "adjustable woofer attenuation mismatch")
+        quick_front_reference = engine.write_sweep(root / "quick-front.wav", "left", -30, 2, level_check=True)
+        quick_woofer_reference = engine.write_sweep(root / "quick-woofer.wav", "woofer", -30, 2, level_check=True, woofer_attenuation_db=-6)
+        require(
+            quick_front_reference == engine.reference_sweep_for_source("left", -30, 2, level_check=True)
+            and quick_woofer_reference == engine.reference_sweep_for_source("woofer", -30, 2, level_check=True, woofer_attenuation_db=-6),
+            "saved quick-sweep reanalysis does not reconstruct the source-specific band, tail, and Woofer attenuation",
+        )
         combined_reference = engine.write_sweep(root / "combined-left.wav", "left_woofer", -30, 2, woofer_attenuation_db=-9)
         require(abs(max(map(abs, combined_reference)) / (10.0 ** (-30 / 20.0)) - 1.0) < 1e-4, "combined L+Woofer reference must preserve input level")
+        post_reference = engine.write_filtered_stereo_sweep(root / "post-left.wav", "left", -30, 2)
+        post_active = [index for index, value in enumerate(post_reference) if abs(value) > 1.0e-12]
+        require(
+            post_active[0] >= round(engine.POST_VALIDATION_SILENT_LEAD_SECONDS * engine.RATE)
+            and all(abs(value) <= 1.0e-12 for value in post_reference[:round(engine.POST_VALIDATION_SILENT_LEAD_SECONDS * engine.RATE)]),
+            "post-FIR sweep does not keep U7/CamillaDSP startup inside a two-second silent lead",
+        )
         require(engine.SOURCES["lr"] == ("left_woofer", "right_woofer"), "L/R shared-filter mode is not explicit L+Woofer / R+Woofer")
 
         # A subwoofer is silent during the high-frequency majority of a full
@@ -689,6 +767,8 @@ def main() -> int:
             for source in ("left", "right", "woofer"):
                 response_name = f"p{position}_{source}_response.json"
                 response = synthetic_response(frequencies, source, position)
+                response["response_algorithm_revision"] = engine.RESPONSE_ALGORITHM_REVISION
+                response["smoothing"] = engine.SMOOTHING_NAME
                 (session / response_name).write_text(json.dumps(response), encoding="utf-8")
                 measurements_index.append({"position": position, "source": source, "response": response_name})
         phase_index = write_synthetic_phase_references(engine, session, 3)
@@ -744,6 +824,11 @@ def main() -> int:
             require(crossover_graph["frequency"][0] <= 20.1 and crossover_graph["frequency"][-1] >= 19_000.0, "A/B sum graph is not full range")
             require(crossover_graph["metric_range_hz"][1] <= 300.0, "crossover target metric escaped its guarded low-frequency band")
             require(len(crossover_graph["phase_agnostic_energy_db"]) == len(crossover_graph["frequency"]), "phase-agnostic graph fallback is incomplete")
+            require(
+                crossover_graph["spatial_aggregation"]["method"]
+                == "frequency-dependent spatial/SNR-weighted mean-square transfer power",
+                "Front+Woofer graph does not use the same spatial power prototype as FIR design",
+            )
         flat_target = engine.effective_combined_target(baseline_state["result"], frequencies)
         require(max(abs(value) for value in flat_target) <= 1.0e-6, "Flat/none/0 effective system target is not 0 dB")
         baseline_front_hash = baseline_state["result"]["front_sha256"]
@@ -870,6 +955,12 @@ def main() -> int:
         crossover = phase_state["result"]["crossover"]
         require(crossover.get("enabled") and crossover.get("embedded_in_fir") and crossover.get("frequency_hz") == 100, "default digital crossover was not embedded in FIR")
         require(crossover.get("additional_runtime_filters") == 0 and crossover.get("additional_block_latency_samples") == 0, "embedded crossover incorrectly adds runtime/block latency")
+        phase_search = crossover.get("relative_phase_optimization", {})
+        require(
+            phase_search.get("cancellation_deficit_p90_db", 999.0)
+            <= phase_search.get("baseline_cancellation_deficit_p90_db", -999.0) + 0.251,
+            "relative delay search improved target by introducing a deeper destructive crossover notch",
+        )
         require(crossover.get("coherent_upper_guard_pass"), "joint Front+Woofer constructive-sum guard failed")
         require(crossover.get("safe_deploy_pass") and crossover.get("complex_sum_target_pass") is True, "joint Front+Woofer relative-phase target guard failed")
         bank_normalization = phase_state["result"]["filter_bank_normalization"]
@@ -918,8 +1009,47 @@ def main() -> int:
             left_post_path.write_text(json.dumps(mismatched_post), encoding="utf-8")
         mismatched_evaluation = engine.evaluate_post_filter_sum(session, phase_state, {"level_dbfs": -48})
         require(not mismatched_evaluation["prediction_consistency"]["pass"] and not mismatched_evaluation["overall_pass"], "large predicted-vs-measured mismatch was not blocked")
+        for position in range(1, 4):
+            left_post_path = session / f"post_p{position}_left_sum_response.json"
+            transient_post = json.loads(left_post_path.read_text(encoding="utf-8"))
+            transient_post["measurement_quality"]["switching_transient_suspected"] = True
+            transient_post["measurement_quality"]["noise_side_spread_db"] = 18.0
+            left_post_path.write_text(json.dumps(transient_post), encoding="utf-8")
+        transient_evaluation = engine.evaluate_post_filter_sum(session, phase_state, {"level_dbfs": -48})
+        require(
+            transient_evaluation["inconclusive_switching_transient"]
+            and not transient_evaluation["application_blocking"]
+            and not transient_evaluation["overall_pass"]
+            and transient_evaluation["recommended_retry"]["level_dbfs"] == -48,
+            "stream-start contamination was mislabeled PASS or a conclusive DSP failure",
+        )
         for position, content in left_post_original.items():
             (session / f"post_p{position}_left_sum_response.json").write_bytes(content)
+        clean_transient_path = session / "post_p1_left_sum_response.json"
+        clean_transient_original = clean_transient_path.read_bytes()
+        clean_transient = json.loads(clean_transient_original.decode("utf-8"))
+        clean_transient["measurement_quality"]["switching_transient_suspected"] = True
+        clean_transient["measurement_quality"]["noise_side_spread_db"] = 8.0
+        clean_transient_path.write_text(json.dumps(clean_transient), encoding="utf-8")
+        clean_transient_evaluation = engine.evaluate_post_filter_sum(session, phase_state, {"level_dbfs": -48})
+        require(
+            clean_transient_evaluation["overall_pass"]
+            and not clean_transient_evaluation["inconclusive_switching_transient"]
+            and clean_transient_evaluation["prediction_consistency"]["pass"]
+            and clean_transient_evaluation["switching_transient"]["suspected"]
+            and not clean_transient_evaluation["switching_transient"]["affected_verdict"],
+            "stationary pre/post floor change incorrectly demoted an otherwise passing acoustic transfer",
+        )
+        clean_transient["measurement_quality"].setdefault("frequency_noise", {})["transient_contamination_detected"] = True
+        clean_transient_path.write_text(json.dumps(clean_transient), encoding="utf-8")
+        active_transient_evaluation = engine.evaluate_post_filter_sum(session, phase_state, {"level_dbfs": -48})
+        require(
+            active_transient_evaluation["inconclusive_switching_transient"]
+            and not active_transient_evaluation["overall_pass"]
+            and active_transient_evaluation["switching_transient"]["active_sweep_transient_suspected"],
+            "transient detected inside the active sweep was incorrectly accepted",
+        )
+        clean_transient_path.write_bytes(clean_transient_original)
         advisory_original = {}
         for position in range(1, 4):
             for side in ("left", "right"):
@@ -936,6 +1066,27 @@ def main() -> int:
         require(advisory_evaluation["inconclusive_low_snr"] and not advisory_evaluation["application_blocking"] and not advisory_evaluation["overall_pass"], "marginal low-SNR post-FIR mismatch was mislabeled PASS or conclusive FAIL")
         for (position, side), content in advisory_original.items():
             (session / f"post_p{position}_{side}_sum_response.json").write_bytes(content)
+
+        reprocess_state = json.loads(json.dumps(phase_state))
+        reprocess_state["state"] = "built"
+        reprocess_state["post_filter_validation"] = {
+            "result_fingerprint": engine.result_fingerprint(reprocess_state["result"]),
+            "profile": "speaker",
+            "level_dbfs": -48,
+            "sweep_seconds": 28,
+            "positions_total": 3,
+            "positions_completed": 3,
+            "measurements": [],
+            "evaluation": {"verification_status": "stale-fixture"},
+        }
+        engine.save_current(reprocess_state)
+        reprocessed_post = engine.reprocess_post_filter_validation()
+        require(
+            reprocessed_post["post_filter_validation"]["evaluation"]["overall_pass"]
+            and reprocessed_post["result"]["crossover"]["status"] == "pass_measured"
+            and reprocessed_post["stage"].endswith("합산 실측 PASS"),
+            "saved post-FIR responses were not re-graded and persisted without replay",
+        )
 
         # Resetting a post-FIR failure must restore the premeasurement model
         # verdict.  The old implementation read the overwritten fail_measured
@@ -1188,6 +1339,39 @@ def main() -> int:
         persisted = json.loads(engine.CURRENT.read_text(encoding="utf-8"))
         require(persisted["state"] == "processing", "status-only stale-worker recovery unexpectedly mutated the session")
 
+        # Starting an explicit raw-WAV reprocess is the point at which every
+        # response-dependent result becomes stale.  The installed production
+        # FIR is outside this isolated state and must not be touched, but the UI
+        # must never continue to offer the previous result for Preview/Apply.
+        prepare_dir = measurements / "prepare-reprocess"
+        prepare_dir.mkdir()
+        for source in ("left", "right"):
+            (prepare_dir / f"p1_{source}_recorded.wav").write_bytes(b"saved raw placeholder")
+        prepare_state = dict(dependency_state)
+        prepare_state.update({
+            "session_id": "prepare-reprocess", "session_dir": str(prepare_dir),
+            "state": "measured", "mode": "lr", "sources": ["left", "right"],
+            "positions_total": 1, "positions_completed": 1,
+            "measurements": [{"position": 1, "source": source} for source in ("left", "right")],
+            "phase_references": [{"position": 1}],
+            "validation": {"pass": True}, "premeasured_sum_validation": {"pass": True},
+            "result": {"front": "stale.wav"}, "post_filter_validation": {"pass": True},
+            "preview_active": False,
+        })
+        engine.save_current(prepare_state)
+        prepared = engine.prepare_saved_reprocess()
+        require(
+            prepared["state"] == "ready"
+            and prepared["positions_completed"] == 0
+            and not prepared["measurements"]
+            and prepared.get("result") is None
+            and prepared.get("post_filter_validation") is None
+            and not prepared.get("phase_references")
+            and prepared.get("premeasured_sum_validation") is None,
+            "raw reprocess retained stale FIR/measurement-dependent state",
+        )
+        engine.save_current(dependency_state)
+
         # A batch raw-WAV recovery must retain its owner PID until the outer
         # worker finishes. Clearing it after each channel made the status API
         # falsely report an interrupted job while Pi 2 was still calculating.
@@ -1206,7 +1390,7 @@ def main() -> int:
         original_helpers = (
             engine.reference_sweep_for_source, engine.read_pcm_wav,
             engine.sweep_capture_quality, engine.response_from_recording,
-            engine.calibration_for,
+            engine.calibration_for, engine.measurement_worker_alive,
         )
         engine.reference_sweep_for_source = lambda *_args, **_kwargs: [0.0, 0.1, -0.1]
         engine.read_pcm_wav = lambda _path: (48_000, 24, [0.0, 0.1, -0.1])
@@ -1216,6 +1400,7 @@ def main() -> int:
             "measurement_quality": {"snr_db": 20.0, "recommended": True},
         }
         engine.calibration_for = lambda _orientation: {}
+        engine.measurement_worker_alive = lambda _state: True
         try:
             engine.inspect_saved_recording(1, "left", reprocess=True, batch_reprocess=True)
             midway = json.loads(engine.CURRENT.read_text(encoding="utf-8"))
@@ -1227,7 +1412,7 @@ def main() -> int:
             (
                 engine.reference_sweep_for_source, engine.read_pcm_wav,
                 engine.sweep_capture_quality, engine.response_from_recording,
-                engine.calibration_for,
+                engine.calibration_for, engine.measurement_worker_alive,
             ) = original_helpers
             engine.save_current(dependency_state)
 
@@ -1238,8 +1423,13 @@ def main() -> int:
             "level_check_offline": True,
             "quick_sweep_pass_snr_db": engine.PREFLIGHT_TARGET_SNR_DB,
             "quick_sweep_recommended_snr_db": engine.RECOMMENDED_SNR_DB,
-            "variable_smoothing": True,
+            "response_power_domain_smoothing": True,
+            "filter_gain_db_domain_smoothing": True,
+            "weighted_power_spatial_prototype": True,
+            "shared_clock_environment_override": "AUDIODSP_PHASE_CLOCK_SHARED",
+            "legacy_response_reprocess_marker": True,
             "natural_rolloff_guard": True,
+            "branch_local_natural_band_guard": True,
             "woofer_measurement_attenuation_db": engine.WOOFER_MEASUREMENT_ATTENUATION_DB,
             "single_authoritative_sweep_level": True,
             "sweep_hardware_unity_independent_of_listening_volume": True,
@@ -1249,10 +1439,13 @@ def main() -> int:
             "woofer_quality_analysis_band": "adaptive sustained -3 dB acoustic passband; 15-300 Hz fallback",
             "capture_then_batch_response_processing": True,
             "batch_reprocess_worker_liveness": True,
+            "raw_reprocess_stale_result_invalidation": True,
             "combined_build_seconds": combined_seconds,
             "combined_single_convolution_then_copy": True,
             "embedded_lr4_crossover_default_on": True,
             "joint_front_woofer_sum_guard": True,
+            "joint_sum_weighted_power_spatial_prototype": True,
+            "relative_phase_destructive_cancellation_guard": True,
             "acoustic_crossover_false_positive_rejected": True,
             "session_checkpoint_resume": True,
             "session_note_non_invalidating": True,
@@ -1272,7 +1465,9 @@ def main() -> int:
             "flat_none_trim0_baseline_build_seconds": baseline_seconds,
             "flat_none_trim0_measurement_level_invariant": True,
             "flat_none_trim0_final_sum_gate": "PASS: clock-safe upper guard plus phase-agnostic target estimate",
-            "precision_premeasured_sum_no_post_sweep": precise_validation["crossover_sum"]["status"] == "pass_safe_sum_phase_limited",
+            "precision_premeasured_sum_no_post_sweep": precise_validation["crossover_sum"]["status"] in (
+                "pass_premeasured_complex_model", "pass_safe_sum_phase_limited",
+            ),
             "magnitude": magnitude,
             "bass_phase": phase_result,
         }

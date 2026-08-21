@@ -1,5 +1,23 @@
 # AudioDSP 계획과 기준선
 
+## 2026-08-21 v22/v23 수학·실측 감사 · 완료
+
+- [x] 저장 응답의 fractional-octave 평활을 dB 산술평균에서 전달 파워 평균으로 수정
+- [x] 3위치 대표 응답을 dB 기하평균이 아닌 SNR 가중 mean-square 전달함수로 수정
+- [x] crossover cut-only 보호 곡선은 dB 영역 평활을 유지해 안전 감쇄가 약해지지 않도록 분리
+- [x] 이전 계산 JSON의 이중 평활을 금지하고 원본 WAV 무음 재계산 경로와 UI 안내 추가
+- [x] 원본 WAV 재계산 시작 시 이전 FIR/위상/합산/사후검증 상태를 즉시 무효화
+- [x] Front+Woofer 지연 탐색에 파괴적 상쇄 penalty와 비악화 gate 추가
+- [x] 응답/결과 알고리즘 revision과 공간 통합 진단값을 영구 결과에 기록
+- [x] MIMO 설계·그래프·자동검증의 위치/SNR 가중을 SISO와 같은 주파수별 정책으로 통일
+- [x] 저장 세션·합성 fixture에서 Flat/없음/trim 0 dB 및 옵션 matrix를 무음 재검증
+- [x] Profile/Web/CamillaDSP 상태 전이, materializer, Pi별 release 구조 회귀시험
+- [x] 검증 결과와 남은 물리 측정 한계를 `ROOM_TUNING_MATH_AUDIT_20260821.md`에 기록
+- [x] Pi5 Preview FIR을 -25 dBFS/28초로 실측해 target/crossover/prediction 전체 PASS 확인 후 기존 FIR·-10 dB·입력·service 복원
+- [x] U7/CamillaDSP stream 전환 오염과 stationary noise floor 변화의 판정을 분리하고 저장 사후 응답 무음 재판정 경로 추가
+
+긴 시험은 대화형 terminal session에 의존하지 않는다. 전용 stdout/stderr/exit-status 파일을 남기는 detached runner만 사용하며, 현재 활성 FIR과 세션 포인터는 변경하지 않는다.
+
 ## 완료된 v1.2 기준선
 
 - Pi 2 armhf/ARMv7과 Pi 4·Pi 5 arm64/aarch64용 독립 SD 작성 번들

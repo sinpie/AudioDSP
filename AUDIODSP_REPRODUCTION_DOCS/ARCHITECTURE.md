@@ -76,6 +76,7 @@ MIMO bank는 `/etc/camilladsp/profiles/mimo`의 manifest와 네 stereo float32 W
 - 관리자 CLI는 `/run/audiodsp-profile-manager.lock`의 `flock`으로 설정·FIR·config 변경을 직렬화한다.
 - 측정은 별도 measurement lock과 audio-exclusive lock을 쓴다.
 - 정밀 분리+합산 session은 L/R/W magnitude로 branch를 설계하고 L+W/R+W의 절대 전달 closure와 same-recording L+R+W Walsh 상대위상을 cross-term 제약으로 사용한다. 합산 응답을 branch로 다시 평균하거나 normalize하지 않는다.
+- 여러 위치의 음향 prototype과 fractional-octave 응답 smoothing은 noise-confidence weighted 평균제곱 전달응답을 사용한다. filter gain과 cut-only 합산 guard는 dB-domain smoothing으로 분리하며 response revision이 다르면 원본 WAV 재계산을 요구한다.
 - L/R의 500~2,000 Hz로 하나의 측정·타깃 0 dB 기준을 만든다. 완성된 Front L/R·Woofer L/R bank에는 한 common gain만 적용하며, 독립 branch normalization은 자동 core check와 matrix test가 차단한다.
 - JSON과 config는 임시 파일 작성 후 `os.replace`로 원자 교체한다.
 - Web은 thread-per-request지만 모든 변경은 관리자 CLI의 프로세스 lock을 통과한다.

@@ -61,6 +61,7 @@ def main() -> int:
     option_matrix = report.get("mimo_option_matrix", [])
     summary = {
         "result": report.get("result"),
+        "spatial_weight_consistency": report.get("spatial_weight_consistency"),
         "topologies": [
             {
                 "mode": item.get("mode"),
@@ -72,6 +73,7 @@ def main() -> int:
                 "headroom": item.get("headroom"),
                 "causality": item.get("causality"),
                 "target_level_normalization": item.get("target_level_normalization"),
+                "spatial_weighting": item.get("spatial_weighting"),
             }
             for item in report.get("topologies", [])
         ],
@@ -100,7 +102,7 @@ def main() -> int:
         "rate": report.get("rate"),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-    if report.get("result") != "PASS" or summary["structural_failures"]:
+    if report.get("result") != "PASS" or not summary["spatial_weight_consistency"] or summary["structural_failures"]:
         raise AssertionError("MIMO algorithm matrix failed")
     return 0
 

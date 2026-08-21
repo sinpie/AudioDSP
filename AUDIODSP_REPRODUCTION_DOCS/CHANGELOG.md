@@ -1,5 +1,33 @@
 # 변경 이력
 
+## 2026-08-21 · v23 사후 검증 출력 안정화
+
+- Pi5 v22 Preview 사후 검증에서 첫 L+Woofer만 30~130 Hz가 예상보다 5~18 dB 높았고 R+Woofer는 정상인 현상을 원본 UMIK 녹음, 입력 WAV, v21/v22 Front/Rear FIR FFT로 분리 분석
+- v21/v22 Rear 좌우 FIR 차이는 20~200 Hz에서 대부분 0~2 dB이고 입력 sweep 좌우 크기도 정확히 같아, FIR 설계·채널 index 오류가 아니라 첫 독립 CamillaDSP stream 전환의 저역 오염임을 확인
+- 문제 녹음의 sweep 전/후 noise floor가 -50.0/-75.93 dBFS로 25.93 dB 벌어졌고 `switching_transient_suspected=true`였는데도 큰 MAE를 확정 DSP FAIL로 처리하던 판정 오류 수정
+- 사후 검증 파일의 시작 무음을 0.35초에서 2초로 늘려 U7/CamillaDSP 전환과 이전 출력의 감쇠를 실제 ESS 저역 시작 전에 끝내고, 추가 가청 sweep 없이 같은 reference로 deconvolution하도록 변경
+- sweep 전/후 noise floor 차이와 실제 active-sweep transient를 분리한다. 전·후 바닥 차이만 있고 target/crossover/prediction이 모두 PASS면 유효 실측을 버리지 않으며, active sweep 오염 또는 바닥 차이와 응답 FAIL이 함께 있을 때만 `판정 보류 · 출력 전환 감지`로 표시한다.
+- 완료된 사후 응답을 다시 소리 내지 않고 최신 판정식으로 계산하는 `reprocess-post-validation` 명령과 `저장 결과 재판정` 버튼을 추가
+- 저장된 빠른 sweep 재분석이 실제 source별 재생 대역 대신 모든 채널에 15 Hz~22 kHz 기준을 쓰던 오류를 수정하고 Front 30 Hz~22 kHz, Woofer 15~320 Hz, 합산 15 Hz~22 kHz 및 측정 시 Woofer 감쇄·짧은 tail을 원 WAV와 정확히 일치시킴
+- 사후 검증 SNR 안내가 별도 `검증 sweep 입력` 대신 본 측정 dBFS를 읽어 저장 세션에서 -30 dBFS를 -29 dBFS로 표시하던 오류를 수정하고, 실제 사후 입력값을 응답 계산·권장 상승 dB에 명시적으로 전달
+
+## 2026-08-21 · v22 수학 감사·강건한 평균제곱 응답
+
+- 다중 위치 결과가 `power-response prototype`이라고 기록되면서 실제로는 dB 산술평균을 사용하던 구현/문서 불일치를 수정하고, 위치·주파수 SNR 가중 평균제곱 전달응답 `10log10(Σw·10^(L/10)/Σw)`으로 변경
+- fractional-octave 측정 응답 smoothing도 평균제곱 방식으로 변경하되, filter gain과 cut-only crossover guard는 dB-domain smoothing으로 분리해 안전 감쇄가 0 dB 쪽으로 약해지는 회귀를 차단
+- 공간 표준편차를 prototype과 같은 center/SNR 가중치로 계산하고, 사후 Preview FIR 위치 통합도 설계와 같은 weighted power 방식으로 통일
+- response estimator revision을 각 JSON에 기록하고 이전 응답은 이중 smoothing 없이 읽되 원본 WAV 무음 재계산을 3단계 UI에서 안내; 1초 UI poll은 mtime/size cache로 response JSON 반복 parse를 피함
+- 공유 clock 환경변수가 `AUDIODSP_AUDIODSP_PHASE_CLOCK_SHARED`로 이중 prefix되어 override를 무시하던 오류를 `AUDIODSP_PHASE_CLOCK_SHARED`로 수정
+- 표식이 전혀 없는 초기 response JSON도 이미 계산된 artifact로 취급해 절대 재평활하지 않고, 새 power-domain 계산은 원본 WAV 명시적 재처리에서만 수행하도록 호환 경로 보강
+- L+Woofer/R+Woofer 대표 그래프·타깃 MAE·상대 지연 탐색을 개별 응답과 같은 위치/SNR 가중 mean-square 기준으로 통일하되, constructive-overlap 안전 guard는 측정 위치 최대값을 유지
+- 상대 지연·극성 탐색이 큰 Woofer를 파괴적 상쇄해 타깃에 맞추는 후보를 선택하지 않도록 에너지합 대비 cancellation deficit P90 penalty와 0.25 dB 비악화 적용 gate 추가
+- 저장 원본 재계산을 실제 시작할 때 이전 FIR 결과·사후검증·위상/합산 결과·완료 checkpoint를 즉시 무효화해 새 응답과 옛 Preview/Apply가 섞이지 않도록 상태 전이 수정
+- MIMO `center` 모드가 150 Hz 이하에서도 중앙 위치를 60%로 고정하던 오류를 수정하고 solver 목표 phase·예측 그래프·공간 편차·MAE가 하나의 주파수별 위치/SNR 가중을 공유하도록 변경
+- response grid 길이/증가성/위치 일치와 NaN/Inf를 계산 전 명시적으로 검증하고, 잘못된 confidence를 0~1로 제한해 조용히 잘못된 FIR을 만드는 경로 차단
+- LR4 문서 식의 `x²` 오기를 실제 표준 4차 branch magnitude인 `x⁴`로 수정
+- 0/0/+12 dB 세 위치의 기하평균 +4 dB와 평균제곱 약 +7.56 dB를 구분하는 exact unit test, 음수 합산 guard smoothing 비약화, 이전 response 재계산 UX 회귀를 추가
+- 전체 SISO 수식, 가정, 자동검증, 적용 한계와 2026년 연구 근거를 `ROOM_TUNING_MATH.md`에 코드 단계와 1:1로 문서화
+
 ## 2026-08-21 · 공통 레벨 기준·광대역 roll-off·Walsh 위상
 
 - L/R 각각과 Woofer를 따로 0 dB로 맞추지 않고 L/R 500~2,000 Hz median으로 하나의 측정·타깃 기준을 만든 뒤 L/R/Woofer 전체 결과와 판정에 동일 적용

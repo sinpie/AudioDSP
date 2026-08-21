@@ -41,7 +41,8 @@
 - bulk acoustic/device delay는 impulse peak에서 구하되 인과적인 0~250 ms 구간 안의 peak만 direct 응답으로 인정한다. 대역 제한 Woofer의 ESS 고조파·잡음 peak가 이 범위를 벗어나면 magnitude는 별도 SNR/통과대역 gate로 계속 사용하고 phase·decay·group delay·Front/Woofer 시간 정렬은 비활성화한다.
 - UMIK calibration magnitude를 log-frequency 보간해 적용한다.
 - ALSA/USB cold-start가 nominal 400 ms 준비 시간을 소비해도 50 ms AC-RMS envelope에서 실제 sweep 길이의 최대에너지 구간을 찾는다. 최대값의 0.5% 안에서는 nominal timing을 우선해 대역 제한 Woofer의 무음 고역 때문에 시작점이 밀리지 않게 하며, 검출한 capture delay를 deconvolution과 noise window에 함께 사용한다.
-- 각 녹음의 검출된 sweep 전/후 noise PSD와 sweep 활성 구간으로 주파수별 SNR·신뢰도를 계산한다. Woofer는 chirp-time 에너지의 지속 -3 dB 통과대역을 자동 검출하고 실패할 때만 15~300 Hz로 되돌아간다. 빠른 검사는 2초를 기준으로 하고, 긴 본 스윕은 matched-filter coherent integration 이득 `10·log10(T/2초)`를 원신호 SNR에 더해 같은 역컨볼루션 품질로 비교한다. 예를 들어 14초 이득은 +8.451 dB다. UI와 결과 JSON은 원신호, 적분 이득, 유효 SNR을 모두 보존한다. 유효 SNR 6 dB 미만은 필터 생성을 막고, 15 dB 미만은 결과에 경고한다. 100 ms envelope 이상치는 생활소음 가능성으로 표시하지만 원본 impulse와 잔향을 잘라내지 않는다.
+- Preview FIR 사후 검증은 독립 CamillaDSP WavFile stream이 열릴 때 U7 전환과 직전 출력의 감쇠가 저역 ESS에 겹치지 않도록 파일 안에 2초 무음 lead를 둔다. sweep 전/후 stationary noise 추정치가 4 dB 이상 벌어지면 `switching_transient_suspected`로 기록하고, 해당 응답은 PASS나 확정 FIR FAIL이 아닌 재측정 판정 보류로 처리한다.
+- 각 녹음의 검출된 sweep 전/후 noise PSD와 sweep 활성 구간으로 주파수별 SNR·신뢰도를 계산한다. Woofer는 chirp-time 에너지의 지속 -3 dB 통과대역을 자동 검출하고 실패할 때만 15~300 Hz로 되돌아간다. 빠른 검사 저장 원본 재분석도 실제 재생과 같은 source별 대역(Front 30 Hz~22 kHz, Woofer 15~320 Hz, 합산 15 Hz~22 kHz), 1초 tail, Woofer 측정 감쇄를 기준 신호에 사용한다. 빠른 검사는 2초를 기준으로 하고, 긴 본 스윕은 matched-filter coherent integration 이득 `10·log10(T/2초)`를 원신호 SNR에 더해 같은 역컨볼루션 품질로 비교한다. 예를 들어 14초 이득은 +8.451 dB다. UI와 결과 JSON은 원신호, 적분 이득, 유효 SNR을 모두 보존한다. 유효 SNR 6 dB 미만은 필터 생성을 막고, 15 dB 미만은 결과에 경고한다. 100 ms envelope 이상치는 생활소음 가능성으로 표시하지만 원본 impulse와 잔향을 잘라내지 않는다.
 
 ## 잔향과 장시간 공진
 
@@ -57,7 +58,9 @@ late reverberation을 FIR로 역보정하지 않는다. 다지점에서 신뢰 �
 - 200~2,000 Hz: 1/6 octave
 - 2 kHz 초과: 1/3 octave
 
-`equal`은 세 위치를 각 1/3로 dB 평균한다. `center`는 저역은 공간 대표성을 유지하고 고역으로 갈수록 중앙 위치 비중을 높인다. 동시에 위치별 표준편차를 저장하고, 편차가 큰 null의 boost 신뢰도를 낮춘다.
+음향 응답 smoothing과 위치 통합은 dB 산술평균이 아니라 평균제곱 전달 파워를 사용한다. `L=20log10|H|`일 때 `10log10(Σw·10^(L/10)/Σw)`이며, `equal`은 세 위치의 기본 가중치를 각 1/3로 둔다. `center`는 200 Hz 이하에서 공간 대표성을 유지하고 2 kHz 이상에서 중앙/좌/우를 0.60/0.20/0.20으로 두며 중간은 log-frequency 보간한다. 두 방식 모두 위치별 주파수 SNR 신뢰도를 추가로 곱한다. 공간 표준편차도 같은 실제 가중치로 계산하고 편차가 큰 null의 boost 신뢰도를 낮춘다.
+
+필터 gain과 cut-only 합산 guard는 별도의 dB-domain smoothing을 사용한다. 음수 감쇄 곡선을 파워 평균해 0 dB 쪽으로 약화시키지 않기 위해서다. 이전 response JSON은 이중 smoothing하지 않고 그대로 읽되, 원본 WAV를 이용한 새 알고리즘 무음 재계산을 UI에서 안내한다. 전체 수식과 변경 근거는 [ROOM_TUNING_MATH.md](ROOM_TUNING_MATH.md)에 고정한다.
 
 ## Target과 취향
 
@@ -152,7 +155,7 @@ Phase 보정은 모든 반사를 완전히 역필터링하는 기능이 아니�
 
 ## 연구 근거와 한계
 
-Pi4/5의 다중 제어원 MIMO, 2026년까지 검토한 연구, 알고리즘 수식, 세 토폴로지, 전체 룸 요소 분류와 의도적으로 보정하지 않는 항목은 [MIMO_ROOM_TUNING.md](MIMO_ROOM_TUNING.md)에 별도로 고정한다. 모든 새 결과는 `Room_Tuning_Report.json/.md`에도 같은 경계를 저장한다.
+SISO 측정·공간 평균·정규화·FIR·검증의 정확한 수식은 [ROOM_TUNING_MATH.md](ROOM_TUNING_MATH.md), Pi4/5의 다중 제어원 MIMO와 세 토폴로지는 [MIMO_ROOM_TUNING.md](MIMO_ROOM_TUNING.md)에 고정한다. 모든 새 결과는 `Room_Tuning_Report.json/.md`에도 같은 경계를 저장한다.
 
 구현은 다지점 응답 결합, smoothing, regularized inversion, boost 제한, 저역 위상 보정이라는 현대적 실내 보정 원칙을 반영한다. 참고 자료는 다음과 같다.
 
